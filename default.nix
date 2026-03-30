@@ -8,7 +8,7 @@
 }:
 
 stdenv.mkDerivation rec {
-  pname = "uefi-xnu-loader";
+  pname = "xnu-loader";
   version = "0.1";
 
   src = ./.;
@@ -21,8 +21,6 @@ stdenv.mkDerivation rec {
     mtools
   ];
 
-  dontConfigure = false;
-
   cmakeFlags = [
     "-DGNU_EFI_DIR=${gnu-efi}"
   ];
@@ -30,19 +28,17 @@ stdenv.mkDerivation rec {
   installPhase = ''
     runHook preInstall
 
-    mkdir -p $out/bin
-    cp xnu-loader.efi $out/bin/xnu-loader.efi
+    mkdir -p $out
+    cp xnu-loader.efi $out/xnu-loader.efi
+
+    mkdir -p $out/img/EFI/BOOT
+    cp xnu-loader.efi $out/img/EFI/BOOT/BOOTX64.EFI
 
     dd if=/dev/zero of=$out/xnu-loader.img bs=1M count=64
     mkfs.vfat -F 32 $out/xnu-loader.img
     mmd -i $out/xnu-loader.img ::EFI
     mmd -i $out/xnu-loader.img ::EFI/BOOT
-
-    mcopy -i $out/xnu-loader.img $out/bin/xnu-loader.efi ::EFI/BOOT/BOOTX64.EFI
-
-    if [ -f kernel ]; then
-      mcopy -i $out/xnu-loader.img kernel ::EFI/BOOT/kernel
-    fi
+    mcopy -i $out/xnu-loader.img $out/img/EFI/BOOT/BOOTX64.EFI ::EFI/BOOT/BOOTX64.EFI
 
     runHook postInstall
   '';

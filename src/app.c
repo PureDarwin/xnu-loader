@@ -2,8 +2,11 @@
 #include "console.h"
 
 EFI_STATUS app_init(AppContext *ctx, EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
-  if (!ctx || !st || st->Hdr.Signature != EFI_SYSTEM_TABLE_SIGNATURE)
+  if (!st)
     return EFI_INVALID_PARAMETER;
+
+  if (!ctx || st->Hdr.Signature != EFI_SYSTEM_TABLE_SIGNATURE)
+    return EFI_ABORTED;
 
   ctx->image_handle = image;
   ctx->st = st;
@@ -11,13 +14,6 @@ EFI_STATUS app_init(AppContext *ctx, EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   ctx->rt = st->RuntimeServices;
 
   InitializeLib(image, st);
-
-  if (!st->BootServices) {
-    log_info(L"No BootServices -> not real UEFI runtime\n");
-    return EFI_INVALID_PARAMETER;
-  }
-
-  log_info(L"UEFI revision: %d.%02d\n", st->Hdr.Revision >> 16, st->Hdr.Revision & 0xffff);
 
   return EFI_SUCCESS;
 }

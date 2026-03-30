@@ -87,3 +87,73 @@ VOID file_free(AppContext *ctx, FileBuffer *buf) {
   buf->data = NULL;
   buf->size = 0;
 }
+
+EFI_STATUS file_read_all_from_any_volume(
+    AppContext *ctx,
+    CONST CHAR16 *path,
+    FileBuffer *out_buf,
+    EFI_HANDLE *out_handle)
+{
+  EFI_STATUS status;
+  EFI_HANDLE *handles = NULL;
+  UINTN handle_count = 0;
+  UINTN i;
+
+  if (!ctx || !path || !out_buf)
+    return EFI_INVALID_PARAMETER;
+
+  out_buf->data = NULL;
+  out_buf->size = 0;
+
+  if (out_handle)
+    *out_handle = NULL;
+
+  status = uefi_call_wrapper(
+      ctx->bs->LocateHandleBuffer,
+      5,
+      ByProtocol,
+      &gEfiSimpleFileSystemProtocolGuid,
+      NULL,
+      &handle_count,
+      &handles);
+  if (EFI_ERROR(status))
+    return status;
+
+  for (i = 0; i < handle_count; i++) {
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = NULL;
+    EFI_FILE_PROTOCOL *root = NULL;
+    EFI_STATUS try_status;
+
+    try_status = uefi_call_wrapper(
+        ctx->bs->HandleProtocol,
+        3,
+        handles[i],
+        &gEfiSimpleFileSystemProtocolGuid,
+        (VOID **)&fs);
+    if (EFI_ERROR(try_status))
+      continue;
+
+    try_status = uefi_call_wrapper(
+        fs->OpenVolume,
+        2,
+        fs,
+        &root);
+    if (EFI_ERROR(try_status))
+      continue;
+
+    try_status = file_read_all(ctx, root, path, out_buf);
+
+    uefi_call_wrapper(root->Close, 1, root);
+
+    if (!EFI_ERROR(try_status)) {
+      if (out_handle)
+        *out_handle = handles[i];
+
+      uefi_call_wrapper(ctx->bs->FreePool, 1, handles);
+      return EFI_SUCCESS;
+    }
+  }
+
+  uefi_call_wrapper(ctx->bs->FreePool, 1, handles);
+  return EFI_NOT_FOUND;
+}

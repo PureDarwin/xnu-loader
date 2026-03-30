@@ -11,6 +11,7 @@
   in {
     packages.${system} = {
       default = pkgs.callPackage ./. {};
+      hello = pkgs.callPackage ./hello.nix {};
     };
   };
 }
