@@ -116,8 +116,13 @@ typedef struct MachoLoadResult {
   MachoLoadedSegment segments[MACHO_MAX_SEGMENTS];
 } MachoLoadResult;
 
-EFI_STATUS macho_parse(VOID *data, UINTN size, MachoImage *out_image);
-EFI_STATUS macho_dump(MachoImage *image);
+EFI_STATUS macho_parse(
+    VOID *data,
+    UINTN size,
+    MachoImage *out_image);
+
+EFI_STATUS macho_dump(
+    MachoImage *image);
 
 EFI_STATUS macho_load_segments(
     AppContext *ctx,

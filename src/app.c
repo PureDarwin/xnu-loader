@@ -61,3 +61,70 @@ VOID app_free_pool(AppContext *ctx, VOID *ptr) {
   if (ptr)
     uefi_call_wrapper(ctx->bs->FreePool, 1, ptr);
 }
+
+uint64_t app_detect_physical_memory_size(AppContext *ctx) {
+  if (!ctx || !ctx->bs)
+    return 0;
+
+  EFI_STATUS status;
+  UINTN map_size = 0;
+  UINTN map_key = 0;
+  UINTN desc_size = 0;
+  UINT32 desc_ver = 0;
+
+  // query required buffer size
+  status = uefi_call_wrapper(
+    ctx->bs->GetMemoryMap,
+    5,
+    &map_size,
+    NULL,
+    &map_key,
+    &desc_size,
+    &desc_ver
+  );
+
+  if (status != EFI_BUFFER_TOO_SMALL)
+    return 0;
+
+  EFI_MEMORY_DESCRIPTOR *map = NULL;
+
+  status = uefi_call_wrapper(
+    ctx->bs->AllocatePool,
+    3,
+    EfiLoaderData,
+    map_size,
+    (void **)&map
+  );
+
+  if (EFI_ERROR(status))
+    return 0;
+
+  // actually fetch memory map
+  status = uefi_call_wrapper(
+    ctx->bs->GetMemoryMap,
+    5,
+    &map_size,
+    map,
+    &map_key,
+    &desc_size,
+    &desc_ver
+  );
+
+  if (EFI_ERROR(status)) {
+    uefi_call_wrapper(ctx->bs->FreePool, 1, map);
+    return 0;
+  }
+
+  uint64_t total = 0;
+  for (UINTN off = 0; off < map_size; off += desc_size) {
+    EFI_MEMORY_DESCRIPTOR *d = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)map + off);
+
+    if (d->Type == EfiConventionalMemory) {
+      total += (uint64_t)d->NumberOfPages * 4096ULL;
+    }
+  }
+
+  uefi_call_wrapper(ctx->bs->FreePool, 1, map);
+
+  return total;
+}

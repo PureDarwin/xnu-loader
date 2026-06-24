@@ -10,12 +10,23 @@
 typedef struct DeviceTreeNode {
   UINT32 nProperties;
   UINT32 nChildren;
+  struct DeviceTreeNodeProperty **properties;
+  struct DeviceTreeNode **children;
 } DeviceTreeNode;
 
 typedef struct DeviceTreeNodeProperty {
-  CHAR8  name[DT_MAX_NAME];
+  CHAR8 name[DT_MAX_NAME];
   UINT32 length;
+  VOID *value; // pointer to the data
 } DeviceTreeNodeProperty;
+
+DeviceTreeNode *dt_create_node(AppContext *ctx);
+DeviceTreeNodeProperty *dt_create_property(AppContext *ctx, const CHAR8 *name, VOID *data, UINT32 len);
+
+VOID dt_add_property(AppContext *ctx, DeviceTreeNode *node, DeviceTreeNodeProperty *prop);
+VOID dt_add_child(AppContext *ctx, DeviceTreeNode *parent, DeviceTreeNode *child);
+
+UINT32 dt_flatten_node(DeviceTreeNode *node, UINT8 *buf);
 
 EFI_STATUS dt_build_minimal(
     AppContext *ctx,

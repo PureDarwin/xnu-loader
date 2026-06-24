@@ -1,26 +1,43 @@
 #include "macho.h"
 #include "console.h"
 
+#define MACHO_NAME_MAX 16
+
 static UINT64 align_up(UINT64 value, UINT64 align) {
   return (value + (align - 1)) & ~(align - 1);
 }
 
-static VOID macho_copy_segname(CHAR16 *out16, CHAR8 *in8) {
+static VOID macho_copy_segname(CHAR16 *out16, const CHAR8 *in8) {
   UINTN i;
-
-  for (i = 0; i < 16; i++)
+  for (i = 0; i < MACHO_NAME_MAX && in8[i] != '\0'; i++)
     out16[i] = (CHAR16)in8[i];
-
-  out16[16] = L'\0';
+  for (; i < MACHO_NAME_MAX; i++)
+    out16[i] = L'\0';
+  out16[MACHO_NAME_MAX] = L'\0';
 }
 
-static VOID macho_copy_segname8(CHAR8 *out8, CHAR8 *in8) {
+static VOID macho_copy_segname8(CHAR8 *out8, const CHAR8 *in8) {
   UINTN i;
-
-  for (i = 0; i < 16; i++)
+  for (i = 0; i < MACHO_NAME_MAX && in8[i] != '\0'; i++)
     out8[i] = in8[i];
+  for (; i < MACHO_NAME_MAX; i++)
+    out8[i] = '\0';
+  out8[MACHO_NAME_MAX] = '\0';
+}
 
-  out8[16] = '\0';
+static VOID macho_copy_name16(CHAR16 *out16, const CHAR8 *in8) {
+  macho_copy_segname(out16, in8);
+}
+
+static BOOLEAN macho_name16_equal(const CHAR8 *a, const CHAR8 *b) {
+  UINTN i;
+  for (i = 0; i < MACHO_NAME_MAX; i++) {
+    if (a[i] != b[i])
+      return FALSE;
+    if (a[i] == '\0' && b[i] == '\0')
+      return TRUE;
+  }
+  return a[MACHO_NAME_MAX - 1] == b[MACHO_NAME_MAX - 1];
 }
 
 static EFI_STATUS macho_validate_load_command(
@@ -29,12 +46,11 @@ static EFI_STATUS macho_validate_load_command(
     macho_load_command **out_lc)
 {
   macho_load_command *lc;
-  UINTN offset;
 
   if (!image || !p || !out_lc)
     return EFI_INVALID_PARAMETER;
 
-  offset = (UINTN)(p - (UINT8 *)image->data);
+  UINT64 offset = (UINT64)(p - (UINT8 *)image->data);
   if (offset + sizeof(macho_load_command) > image->size)
     return EFI_COMPROMISED_DATA;
 
@@ -113,32 +129,6 @@ static EFI_STATUS macho_compute_vm_range(
   *out_lowest = lowest;
   *out_highest = highest;
   return EFI_SUCCESS;
-}
-
-static VOID macho_copy_name16(CHAR16 *out16, CHAR8 *in8) {
-  UINTN i;
-
-  for (i = 0; i < 16; i++)
-    out16[i] = (CHAR16)in8[i];
-
-  out16[16] = L'\0';
-}
-
-static BOOLEAN macho_name16_equal(const CHAR8 *a, const CHAR8 *b) {
-  UINTN i;
-
-  for (i = 0; i < 16; i++) {
-    CHAR8 ca = a[i];
-    CHAR8 cb = b[i];
-
-    if (ca != cb)
-      return FALSE;
-
-    if (ca == '\0')
-      return TRUE;
-  }
-
-  return TRUE;
 }
 
 EFI_STATUS macho_parse(VOID *data, UINTN size, MachoImage *out_image) {
@@ -236,6 +226,7 @@ EFI_STATUS macho_load_segments(
 
   image_size = highest_vmaddr - lowest_vmaddr;
   page_count = (UINTN)(align_up(image_size, EFI_PAGE_SIZE) >> EFI_PAGE_SHIFT);
+
   host_base = 0xFFFFFFFFULL;
 
   status = uefi_call_wrapper(
@@ -250,8 +241,7 @@ EFI_STATUS macho_load_segments(
 
   base_ptr = (UINT8 *)(UINTN)host_base;
 
-  for (j = 0; j < ((UINT64)page_count << EFI_PAGE_SHIFT); j++)
-    base_ptr[j] = 0;
+  SetMem(base_ptr, page_count << EFI_PAGE_SHIFT, 0);
 
   out_result->host_base = host_base;
   out_result->lowest_vmaddr = lowest_vmaddr;
@@ -589,7 +579,7 @@ VOID macho_dump_entry_bytes(
   for (i = 0; i < count; i++) {
     if ((i % 16) == 0)
       log_info(L"\r\n  ");
-    log_info(L"%02x ", p[i]);
+    log_info(L"%02x ", (UINTN)p[i]);
   }
   log_info(L"\r\n");
 }
@@ -687,6 +677,9 @@ EFI_STATUS macho_get_section_host_info(
   if (EFI_ERROR(status))
     return status;
 
+  if (!sec)
+    return EFI_NOT_FOUND;
+
   status = macho_compute_host_address(load_result, sec->addr, &host_addr);
   if (EFI_ERROR(status))
     return status;
@@ -706,7 +699,7 @@ VOID macho_log_section_host_info(
   EFI_STATUS status;
   UINT64 vmaddr = 0;
   UINT64 size = 0;
-  VOID *host_addr;
+  VOID *host_addr = NULL;
   CHAR16 seg16[17];
   CHAR16 sec16[17];
 

@@ -431,3 +431,5 @@ result
 files
 .direnv/*
 output.txt
+esp
+OVMF_VARS.fd

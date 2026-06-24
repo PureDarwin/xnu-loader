@@ -16,14 +16,6 @@ static UINTN boot_ascii_len(const CHAR8 *s) {
   return n;
 }
 
-static VOID boot_fill_physical_memory_size(BootArgsState *state) {
-  if (!state || !state->args)
-    return;
-
-  /* TEMP: hardcode until memmap is trusted */
-  state->args->PhysicalMemorySize = 512ULL * 1024 * 1024; // 512MB
-}
-
 EFI_STATUS boot_collect_memory_map(
     AppContext *ctx,
     BootArgsState *state)
@@ -178,16 +170,15 @@ EFI_STATUS boot_refresh_memory_map(
   }
 }
 
-VOID boot_update_args_memory_map(BootArgsState *state) {
+VOID boot_update_args_memory_map(AppContext *ctx, BootArgsState *state) {
   if (!state || !state->args)
     return;
 
-  state->args->MemoryMap = (UINT32)(UINTN)state->memory_map;
+  state->args->MemoryMap = (UINT32)state->memory_map_buf.phys;
   state->args->MemoryMapSize = (UINT32)state->memory_map_size;
   state->args->MemoryMapDescriptorSize = (UINT32)state->descriptor_size;
   state->args->MemoryMapDescriptorVersion = state->descriptor_version;
-
-  boot_fill_physical_memory_size(state);
+  state->args->PhysicalMemorySize = app_detect_physical_memory_size(ctx);
 }
 
 EFI_STATUS boot_set_command_line(
@@ -246,6 +237,7 @@ EFI_STATUS boot_build_args(
   if (state->args != NULL)
     return EFI_ALREADY_STARTED;
 
+  log_info(L"[B0a] alloc_pages\r\n");
   status = lowmem_alloc_pages(
       ctx,
       sizeof(boot_args),
@@ -254,9 +246,11 @@ EFI_STATUS boot_build_args(
   if (EFI_ERROR(status))
     return status;
 
+  log_info(L"[B0b] setmem args\r\n");
   args = (boot_args *)args_buf.ptr;
   SetMem(args, sizeof(boot_args), 0);
 
+  log_info(L"[B0c] dt_build_minimal\r\n");
   if (state->device_tree == NULL) {
     status = dt_build_minimal(
         ctx,
@@ -270,6 +264,7 @@ EFI_STATUS boot_build_args(
     }
   }
 
+  log_info(L"[B0d] field assignments\r\n");
   args->Revision = 0;
   args->Version  = 2;
 
@@ -281,6 +276,9 @@ EFI_STATUS boot_build_args(
   args->MemoryMapSize = (UINT32)state->memory_map_size;
   args->MemoryMapDescriptorSize = (UINT32)state->descriptor_size;
   args->MemoryMapDescriptorVersion = state->descriptor_version;
+  log_info(L"[B1] before app_detect_physical_memory_size\r\n");
+  args->PhysicalMemorySize = app_detect_physical_memory_size(ctx);
+  log_info(L"[B2] PhysicalMemorySize=0x%lx\r\n", args->PhysicalMemorySize);
 
   args->deviceTreeP = (UINT32)(UINTN)state->device_tree;
   args->deviceTreeLength = state->device_tree_size;
@@ -293,6 +291,7 @@ EFI_STATUS boot_build_args(
   args->KC_hdrs_vaddr = 0;
   args->kslide = 0;
 
+  log_info(L"[B3] before boot_fill_video\r\n");
   status = boot_fill_video(ctx, args);
   if (EFI_ERROR(status)) {
     lowmem_free(ctx, &args_buf);
@@ -302,12 +301,11 @@ EFI_STATUS boot_build_args(
   state->args = args;
   state->args_buf = args_buf;
 
-  boot_fill_physical_memory_size(state);
-
   log_info(L"sizeof(boot_args) = 0x%lx\r\n", (UINT64)sizeof(boot_args));
   log_info(L"boot_args low phys = 0x%lx\r\n", (UINT64)state->args_buf.phys);
   log_info(L"device_tree low phys = 0x%lx\r\n", (UINT64)state->device_tree_buf.phys);
-  log_info(L"memory_map low phys = 0x%lx\r\n", (UINT64)state->memory_map_buf.phys);
+  log_info(L"memory_map ptr  = 0x%lx\r\n", (UINT64)(UINTN)state->memory_map);
+  log_info(L"memory_map phys = 0x%lx\r\n", (UINT64)state->memory_map_buf.phys);
 
   return EFI_SUCCESS;
 }
@@ -410,25 +408,66 @@ EFI_STATUS exit_boot_services_retry(
 {
   EFI_STATUS status;
 
-  for (;;) {
-    status = boot_refresh_memory_map(ctx, state);
-    if (EFI_ERROR(status))
-      return status;
+  status = boot_refresh_memory_map(ctx, state);
+  if (EFI_ERROR(status))
+    return status;
 
-    boot_update_args_memory_map(state);
+  boot_update_args_memory_map(ctx, state);
+
+  for (;;) {
+    UINTN map_size = state->memory_map_buf.pages << EFI_PAGE_SHIFT;
+    UINTN key = 0;
+    UINTN desc_size = 0;
+    UINT32 desc_ver = 0;
+
+    /*
+     * Disable hardware interrupts so the 8254 timer cannot fire between
+     * GetMemoryMap capturing the key and ExitBootServices validating it.
+     * OVMF DEBUG fires 14+ memory-map-change events inside GetMemoryMap
+     * (debug callbacks that AllocatePool), so the key returned is already
+     * "post-events". Without CLI the periodic timer interrupt fires
+     * between GM return and EBS, incrementing the key one more time and
+     * causing perpetual EFI_INVALID_PARAMETER in QEMU TCG where each
+     * instruction takes longer in wall-clock time.
+     */
+    __asm__ volatile ("cli");
+
+    status = uefi_call_wrapper(
+        ctx->bs->GetMemoryMap,
+        5,
+        &map_size,
+        state->memory_map_buf.ptr,
+        &key,
+        &desc_size,
+        &desc_ver);
+
+    if (EFI_ERROR(status)) {
+      __asm__ volatile ("sti");
+      return status;
+    }
+
+    /* Update args while interrupts are still off - no UEFI calls. */
+    state->memory_map_key = key;
+    state->memory_map_size = map_size;
+    state->descriptor_size = desc_size;
+    state->descriptor_version = desc_ver;
+    state->args->MemoryMap = (UINT32)state->memory_map_buf.phys;
+    state->args->MemoryMapSize = (UINT32)map_size;
+    state->args->MemoryMapDescriptorSize = (UINT32)desc_size;
+    state->args->MemoryMapDescriptorVersion = desc_ver;
 
     status = uefi_call_wrapper(
         ctx->bs->ExitBootServices,
         2,
         image,
-        state->memory_map_key);
+        key);
 
     if (status == EFI_SUCCESS)
       return EFI_SUCCESS;
 
+    __asm__ volatile ("sti");
+
     if (status != EFI_INVALID_PARAMETER)
       return status;
-
-    /* retry: memory map changed */
   }
 }

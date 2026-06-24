@@ -125,33 +125,19 @@ typedef struct BootArgsState {
   LowMemBuffer memory_map_buf;
 } BootArgsState;
 
-EFI_STATUS boot_collect_memory_map(
-    AppContext *ctx,
-    BootArgsState *state);
+EFI_STATUS boot_collect_memory_map(AppContext *ctx, BootArgsState *state);
 
-EFI_STATUS boot_refresh_memory_map(
-    AppContext *ctx,
-    BootArgsState *state);
+EFI_STATUS boot_refresh_memory_map(AppContext *ctx, BootArgsState *state);
 
-VOID boot_update_args_memory_map(BootArgsState *state);
+VOID boot_update_args_memory_map(AppContext *ctx, BootArgsState *state);
 
-EFI_STATUS boot_set_command_line(
-    AppContext *ctx,
-    BootArgsState *state,
-    const CHAR8 *cmdline);
+EFI_STATUS boot_set_command_line(AppContext *ctx, BootArgsState *state, const CHAR8 *cmdline);
 
-EFI_STATUS boot_build_args(
-    AppContext *ctx,
-    MachoLoadResult *load_result,
-    BootArgsState *state);
+EFI_STATUS boot_build_args(AppContext *ctx, MachoLoadResult *load_result, BootArgsState *state);
 
-EFI_STATUS boot_fill_video(
-    AppContext *ctx,
-    boot_args *args);
+EFI_STATUS boot_fill_video(AppContext *ctx, boot_args *args);
 
-VOID boot_free_args(
-    AppContext *ctx,
-    BootArgsState *state);
+VOID boot_free_args(AppContext *ctx, BootArgsState *state);
 
 VOID boot_log_args(BootArgsState *state);
 
