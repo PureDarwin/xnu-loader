@@ -6,6 +6,7 @@
 #include "lowmem.h"
 
 #define DT_MAX_NAME 32
+#define DT_FIXED_SIZE (EFI_PAGE_SIZE)
 
 typedef struct DeviceTreeNode {
   UINT32 nProperties;
@@ -17,7 +18,7 @@ typedef struct DeviceTreeNode {
 typedef struct DeviceTreeNodeProperty {
   CHAR8 name[DT_MAX_NAME];
   UINT32 length;
-  VOID *value; // pointer to the data
+  VOID *value;
 } DeviceTreeNodeProperty;
 
 DeviceTreeNode *dt_create_node(AppContext *ctx);
@@ -28,11 +29,35 @@ VOID dt_add_child(AppContext *ctx, DeviceTreeNode *parent, DeviceTreeNode *child
 
 UINT32 dt_flatten_node(DeviceTreeNode *node, UINT8 *buf);
 
-EFI_STATUS dt_build_minimal(
+#define DT_MAX_KEXTS 32
+
+typedef struct {
+  UINT32 infoDictPhysAddr;
+  UINT32 infoDictLength;
+  UINT32 executablePhysAddr;
+  UINT32 executableLength;
+  UINT32 bundlePathPhysAddr;
+  UINT32 bundlePathLength;
+} DtBooterKextFileInfo;
+
+typedef struct {
+  DtBooterKextFileInfo info;
+  UINT32 infoStructPhysAddr;
+  CHAR8  dtName[DT_MAX_NAME];
+} DtKextEntry;
+
+typedef struct {
+  DtKextEntry entries[DT_MAX_KEXTS];
+  UINT32 count;
+} DtKextList;
+
+EFI_STATUS dt_build(
     AppContext *ctx,
     VOID **out_blob,
     UINT32 *out_size,
     LowMemBuffer *out_buf,
-    const CHAR8 *boot_args);
+    const CHAR8 *boot_args,
+    DtKextList *kexts,
+    UINT64 rt_table_phys);   /* physical addr of EFI_RUNTIME_SERVICES copy in conventional memory */
 
 #endif

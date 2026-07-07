@@ -6,6 +6,61 @@
 #include "macho.h"
 #include "jump.h"
 
+//#define KASLR_ENABLED
+
+static UINT32 KASLRSlideUnitToBytes(UINT8 unit) {
+  UINT32 result = (UINT32)unit << 21; /* unit * 2MB, baseline */
+
+  if (unit & 0x80) {
+    /* CPUID leaf 1, detect Sandy Bridge / Ivy Bridge */
+    UINT32 eax = 0;
+    __asm__ volatile("cpuid" : "=a"(eax) : "a"(1) : "ebx", "ecx", "edx");
+
+    UINT32 base_model   = (eax >>  4) & 0xF;
+    UINT32 base_family  = (eax >>  8) & 0xF;
+    UINT32 ext_model  = (eax >> 16) & 0xF;
+    UINT32 ext_family   = (eax >> 20) & 0xFF;
+
+    /* Standard Intel display-family / display-model */
+    UINT32 family = (base_family != 0xF) ? base_family
+                        : (base_family + ext_family);
+    UINT32 model  = base_model;
+    if (family == 6 || family == 15)
+      model |= (ext_model << 4);
+
+    /* Sandy Bridge (0x2A) and Ivy Bridge (0x3A): bit 4 is "don't care"
+     * because 0x3A & ~0x10 == 0x2A.  Add a fixed +0x10200000 offset. */
+    if (family == 6 && (model & ~0x10U) == 0x2A)
+      result += 0x10200000U;
+  }
+
+  return result;
+}
+
+EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes) {
+  /* Allocate a HIGH staging buffer, OVMF occupies 0x800000-0x1780000 so
+   * AllocateAddress at 0x100000 would fail.  We copy to 0x100000 post-EBS. */
+  EFI_PHYSICAL_ADDRESS base = 0x7FFFFFFF;
+  UINTN total_pages = (UINTN)((span_bytes + EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT);
+
+  EFI_STATUS status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
+    AllocateMaxAddress, EfiLoaderData, total_pages, &base);
+  if (EFI_ERROR(status)) {
+    log_error(L"AllocKernelMemRegion: AllocatePages(%lu pages) failed: %r\r\n",
+              (UINT64)total_pages, status);
+    return status;
+  }
+
+  SetMem((VOID *)(UINTN)base, (UINTN)((UINT64)total_pages << EFI_PAGE_SHIFT), 0);
+
+  ctx->kernel_region_base = base;
+  ctx->kernel_region_end  = base + ((UINT64)total_pages << EFI_PAGE_SHIFT);
+
+  log_info(L"kernel staging: 0x%lx - 0x%lx (%lu pages)\r\n",
+       ctx->kernel_region_base, ctx->kernel_region_end, (UINT64)total_pages);
+  return EFI_SUCCESS;
+}
+
 EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   AppContext ctx;
   FileBuffer kernel = {0};
@@ -17,7 +72,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   if (EFI_ERROR(status))
     return status;
 
-  log_info(L"XNU EFI loader start\r\n");
+  log_info(L"XNU EFI loader start [BUILD-A]\r\n");
 
   {
     EFI_LOADED_IMAGE *li = NULL;
@@ -38,6 +93,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     log_error(L"failed to read kernel from any volume: %r\r\n", status);
     return status;
   }
+  ctx.boot_volume = found_handle;
 
   log_info(L"kernel size: %lu bytes\r\n", kernel.size);
 
@@ -55,7 +111,49 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     return status;
   }
 
-  /* Dump memory map around 0x100000 before attempting AllocateAddress there */
+  /* Pick KASLR slide: fixed 16KB slide matching Apple's g_kaslr_mode==2 path.
+   * Apple's GenerateKASLRSlide() uses cpuid which serializes the CPU and stalls
+   * in QEMU TCG; setting g_kaslr_mode==2 bypasses it with a fixed 0x4000 slide. */
+  {
+#ifdef KASLR_ENABLED
+    ctx.kslide = 2 * KASLR_SLIDE_GRANULE;  /* 0x400000, 2MB-aligned */
+    log_info(L"KASLR: fixed slide=0x%x\r\n", ctx.kslide);
+#else
+    ctx.kslide = 0;
+    log_info(L"KASLR: disabled, kslide=0\r\n");
+#endif
+  }
+
+  /* Compute vm range to derive phys_base before any allocation,
+   * matching Apple: phys_base = lo32(lowest_vmaddr) + kslide */
+  {
+    UINT64 lo = 0, hi = 0;
+    status = macho_compute_vm_range_pub(&image_info, &lo, &hi);
+    if (EFI_ERROR(status)) {
+      log_error(L"failed to compute vm range: %r\r\n", status);
+      file_free(&ctx, &kernel);
+      return status;
+    }
+    ctx.phys_base = (UINT32)lo;  /* physical is always unslid; kslide shifts VAs only */
+    log_info(L"phys_base=0x%lx kslide=0x%x span=0x%lx\r\n",
+             (UINT64)ctx.phys_base, ctx.kslide, hi - lo);
+  }
+
+  /* Allocate a high staging buffer for the kernel image. */
+  {
+    UINT64 lo2 = 0, hi2 = 0;
+    macho_compute_vm_range_pub(&image_info, &lo2, &hi2);
+    status = AllocKernelMemRegion(&ctx, hi2 - lo2);
+  }
+  if (EFI_ERROR(status)) {
+    log_error(L"AllocKernelMemRegion failed: %r\r\n", status);
+    file_free(&ctx, &kernel);
+    return status;
+  }
+  /* phys_base = staging address; post-EBS copy moves it to 0x100000 */
+  ctx.phys_base = ctx.kernel_region_base;
+
+  /* Dump memory map around phys_base before AllocateAddress */
   {
     UINTN map_size = 0, key = 0, desc_size = 0;
     UINT32 desc_ver = 0;
@@ -78,15 +176,40 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     }
   }
 
-  status = macho_load_segments(&ctx, &image_info, &load_result);
+  /* Single contiguous allocation at phys_base, matching Apple's model */
+  status = macho_load_segments_contiguous(&ctx, &image_info, ctx.phys_base, &load_result);
   if (EFI_ERROR(status)) {
     log_error(L"failed to load segments: %r\r\n", status);
     file_free(&ctx, &kernel);
     return status;
   }
 
+  if (ctx.kslide) {
+    status = macho_apply_kaslr_slide(&image_info, &load_result, ctx.kslide);
+    if (EFI_ERROR(status)) {
+      log_error(L"KASLR: apply slide failed: %r\r\n", status);
+      macho_unload_contiguous(&ctx, &load_result);
+      file_free(&ctx, &kernel);
+      return status;
+    }
+    /* Note: pstart's __HIB bootstrap immediates (CR3/BootPML4/GDT/stack/ljmp)
+     * and the GDT descriptor base ARE in the local reloc table as negative
+     * (signed) __DATA-relative entries, so macho_apply_kaslr_slide above
+     * already patched them once r_address is treated as signed.  No separate
+     * pstart fixup is needed -- boot.efi doesn't do one either. */
+
+    /* XNU rebuilds page tables from its embedded header; slide it too. */
+    status = macho_patch_header_slide(&image_info, &load_result, ctx.kslide);
+    if (EFI_ERROR(status)) {
+      log_error(L"KASLR: patch embedded header failed: %r\r\n", status);
+      macho_unload_contiguous(&ctx, &load_result);
+      file_free(&ctx, &kernel);
+      return status;
+    }
+  }
+
   log_info(
-      L"staged image host=0x%lx vm_low=0x%lx span=0x%lx segments=%u\r\n",
+      L"loaded image phys_base=0x%lx vm_low=0x%lx span=0x%lx segments=%u\r\n",
       (UINT64)load_result.host_base,
       load_result.lowest_vmaddr,
       load_result.image_size,
@@ -98,7 +221,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   status = macho_find_entry_vmaddr(&image_info, &entry_vmaddr);
   if (EFI_ERROR(status)) {
     log_error(L"failed to find entry vmaddr: %r\r\n", status);
-    macho_unload_segments(&ctx, &load_result);
+    macho_unload_contiguous(&ctx, &load_result);
     file_free(&ctx, &kernel);
     return status;
   }
@@ -106,7 +229,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   status = macho_compute_host_entry(&load_result, entry_vmaddr, &host_entry);
   if (EFI_ERROR(status)) {
     log_error(L"failed to compute host entry: %r\r\n", status);
-    macho_unload_segments(&ctx, &load_result);
+    macho_unload_contiguous(&ctx, &load_result);
     file_free(&ctx, &kernel);
     return status;
   }
@@ -127,33 +250,19 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     return status;
   }
 
-  /* Dump memory map entries near 0x100000 to diagnose AllocateAddress failure */
-  {
-    UINTN n = boot_state.memory_map_size / boot_state.descriptor_size;
-    UINTN i;
-    for (i = 0; i < n; i++) {
-      EFI_MEMORY_DESCRIPTOR *d = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)boot_state.memory_map + i * boot_state.descriptor_size);
-      UINT64 start = d->PhysicalStart;
-      UINT64 end = start + ((UINT64)d->NumberOfPages << EFI_PAGE_SHIFT);
-      if (end < 0x100000 || start > 0x300000)
-        continue;
-      log_info(L"memmap: type=%u phys=0x%lx-0x%lx pages=%lu attr=0x%lx\r\n", d->Type, start, end, d->NumberOfPages, d->Attribute);
-    }
-  }
+  log_info(L"[B] before boot_load_kexts\r\n");
 
-  log_info(L"[B] before boot_build_args\r\n");
+  DtKextList kext_list;
+  SetMem(&kext_list, sizeof(kext_list), 0);
+  status = boot_load_kexts(&ctx, &kext_list);
+  if (EFI_ERROR(status))
+    log_error(L"boot_load_kexts: %r (continuing without kexts)\r\n", status);
 
-  status = boot_build_args(&ctx, &load_result, &boot_state);
+  log_info(L"[B2] before boot_build_args (%u kexts)\r\n", kext_list.count);
+  status = boot_build_args(&ctx, "-v debug=0x219 -nogzalloc_mode startup_debug=1 -l=1 keepsyms=1",
+                           &load_result, &boot_state, &kext_list);
   if (EFI_ERROR(status)) {
     log_error(L"failed to build boot_args: %r\r\n", status);
-    return status;
-  }
-
-  log_info(L"[C] before boot_set_command_line\r\n");
-
-  status = boot_set_command_line(&ctx, &boot_state, "-v debug=0x8");
-  if (EFI_ERROR(status)) {
-    log_error(L"failed to set command line: %r\r\n", status);
     return status;
   }
 
@@ -161,231 +270,159 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   UINTN stack_pages = 16;
 
   status = uefi_call_wrapper(
-      ctx.bs->AllocatePages,
-      4,
+      ctx.bs->AllocatePages, 4,
       AllocateMaxAddress,
       EfiLoaderData,
       stack_pages,
       &stack_base);
-
   if (EFI_ERROR(status)) {
     log_error(L"failed to allocate stack: %r\r\n", status);
     return status;
   }
 
-  VOID *stack_top = (VOID *)((UINT8 *)(UINTN)stack_base + (stack_pages << EFI_PAGE_SHIFT) - 16);
+  VOID *stack_top = (VOID *)((UINT8 *)(UINTN)stack_base +
+                             (stack_pages << EFI_PAGE_SHIFT) - 16);
 
   boot_log_args(&boot_state);
 
-  /*
-   * pin boot_args at a fixed low physical address before ExitBootServices.
-   * The DT is already pinned at 0x91000 by dt_build_minimal (AllocateAddress + never freed), so deviceTreeP is already correct.
-   *
-   * 0x90000 = boot_args (1 page, safely below XNU's HIB at 0x100000)
-   */
-  {
-    EFI_PHYSICAL_ADDRESS ba_fixed = 0x90000;
-
-    status = uefi_call_wrapper(ctx.bs->AllocatePages, 4,
-        AllocateAddress, EfiLoaderData, 1, &ba_fixed);
-    if (EFI_ERROR(status)) {
-        log_error(L"reloc: failed to alloc ba page at 0x90000: %r\r\n", status);
-        return status;
-    }
-
-    boot_args *old = boot_state.args;
-    boot_args *new = (boot_args *)(UINTN)ba_fixed;
-
-    SetMem(new, sizeof(boot_args), 0);
-
-    CopyMem(new, old, sizeof(*old));
-    new->Revision = old->Revision;
-    new->Version = old->Version;
-
-    UINTN i;
-    for (i = 0; i < BOOT_LINE_LENGTH - 1 && old->CommandLine[i]; i++) {
-      new->CommandLine[i] = old->CommandLine[i];
-    }
-
-    new->CommandLine[i] = '\0';
-
-    new->deviceTreeP = old->deviceTreeP;
-    new->MemoryMap = old->MemoryMap;
-
-    boot_state.args = new;
+  /* Reserve pages in the boot-info block (phys >= 0x100000) for the post-EBS
+   * memory map relocation, so the map XNU walks survives pmap_lowmem_finalize
+   * (see common.h XNU_BOOTINFO_BASE). 16 pages = 64KB, ample for the map. */
+  EFI_PHYSICAL_ADDRESS mm_fixed = XNU_MEMMAP_PHYS;
+  status = uefi_call_wrapper(ctx.bs->AllocatePages, 4,
+      AllocateAddress, EfiLoaderData, 16, &mm_fixed);
+  if (EFI_ERROR(status)) {
+    log_error(L"reloc: failed to alloc mmap pages: %r\r\n", status);
+    return status;
   }
 
-  /* Reserve 2 pages at 0x92000 for the EFI memory map relocation.
-   * exit_boot_services_retry overwrites boot_args->MemoryMap with the final
-   * GetMemoryMap buffer address (high OVMF pool ~0x7e057000); we copy it here
-   * after EBS returns, in the workarounds block below. */
-  EFI_PHYSICAL_ADDRESS mm_fixed = 0x92000;
-  status = uefi_call_wrapper(ctx.bs->AllocatePages, 4,
-      AllocateAddress, EfiLoaderData, 2, &mm_fixed);
-  if (EFI_ERROR(status)) {
-    log_error(L"reloc: failed to alloc mmap pages at 0x92000: %r\r\n", status);
-    return status;
+  /* Diagnostic: raw file bytes and staged bytes at HIB+0x3610 */
+  {
+    UINT8 *raw = (UINT8 *)kernel.data + 0x11b2610;
+    log_info(L"raw[0x11b2610]: %02x %02x %02x %02x %02x %02x %02x %02x\r\n",
+             raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
+    for (UINT32 _si = 0; _si < load_result.segment_count; _si++) {
+      MachoLoadedSegment *_seg = &load_result.segments[_si];
+      if (_seg->name[0]=='_' && _seg->name[1]=='_' &&
+          _seg->name[2]=='H' && _seg->name[3]=='I' && _seg->name[4]=='B') {
+        UINT8 *stg = (UINT8 *)_seg->host_addr + 0x3610;
+        log_info(L"stg[HIB+0x3610]: %02x %02x %02x %02x %02x %02x %02x %02x\r\n",
+                 stg[0], stg[1], stg[2], stg[3], stg[4], stg[5], stg[6], stg[7]);
+        break;
+      }
+    }
   }
 
   log_info(L"[D] before exit_boot_services\r\n");
   log_info(L"boot_args phys = 0x%lx\r\n", (UINT64)(UINTN)boot_state.args);
-  log_info(L"stack_top = 0x%lx\r\n", (UINT64)(UINTN)stack_top);
-  log_info(L"entry = 0x%lx\r\n", (UINT64)(UINTN)host_entry);
+  log_info(L"stack_top = 0x%lx\r\n",      (UINT64)(UINTN)stack_top);
+  log_info(L"entry     = 0x%lx\r\n",      (UINT64)(UINTN)host_entry);
 
-  // Update boot_args to reflect physical load address
-  boot_state.args->kaddr = (UINT32)load_result.lowest_vmaddr;
-  boot_state.args->kslide = 0;
-
-  log_info(L"kaddr=0x%x kslide=0x%x\r\n", boot_state.args->kaddr, boot_state.args->kslide);
-
-  // no logging after this point
+  /* No logging after this point */
   status = exit_boot_services_retry(&ctx, image, &boot_state);
   if (EFI_ERROR(status)) {
     log_error(L"ExitBootServices failed: %r\r\n", status);
     return status;
   }
 
-  /*
-   * After ExitBootServices all boot-services memory is ours.
-   * Copy each segment from its staging area to its physical target address.
-   * Physical address = low 32 bits of vmaddr (strips 0xFFFFFF80 kernel bias).
-   */
-  for (UINT32 si = 0; si < load_result.segment_count; si++) {
-    MachoLoadedSegment *seg = &load_result.segments[si];
-    UINT64 *dst = (UINT64 *)(UINTN)(UINT32)seg->vmaddr;
-    UINT64 *src = (UINT64 *)seg->host_addr;
-    UINT64 fw = seg->filesize >> 3;
-    UINT64 tail = seg->filesize &  7;
-    UINT64 j;
-
-    for (j = 0; j < fw; j++)
-      dst[j] = src[j];
-
-    // handle trailing bytes (filesize not a multiple of 8)
-    UINT8 *db = (UINT8 *)(dst + fw);
-    UINT8 *sb = (UINT8 *)(src + fw);
-    for (j = 0; j < tail; j++)
-      db[j] = sb[j];
-
-    // zero vmsize - filesize
-    UINT8 *zb   = (UINT8 *)(UINTN)(UINT32)seg->vmaddr + seg->filesize;
-    UINT64 zlen = seg->vmsize - seg->filesize;
-    UINT64 *z64 = (UINT64 *)zb;
-    UINT64 zw   = zlen >> 3;
-    for (j = 0; j < zw; j++)
-      z64[j] = 0;
-    zb = (UINT8 *)(z64 + zw);
-    for (j = 0; j < (zlen & 7); j++)
-      zb[j] = 0;
+  /* Copy staged kernel image to its SLID physical base (0x100000 + kslide).
+   * boot.efi physically relocates the whole image: each segment goes to
+   * (vmaddr + kslide) & 0x3FFFFFFF, and the local relocs (base = __HIB) patch
+   * every absolute reference by += kslide -- including pstart's own immediates
+   * (mov cr3, 0x106000 -> 0x506000; ljmp 0x10105c -> 0x50105c) so the
+   * bootstrap runs correctly at the slid physical location.
+   * XNU's i386_vm_init derives vm_kernel_slide = kaddr - 0x100000 and panics
+   * ("inconsistent slide") unless it equals boot_args->kslide, so kaddr MUST
+   * be the slid base too.
+   * OVMF's memory (0x800000-0x1780000) is now reclaimed as conventional. */
+  UINT64 phys_real  = 0x100000ULL + ctx.kslide;
+  {
+    UINT64 *src64 = (UINT64 *)(UINTN)ctx.kernel_region_base;
+    UINT64 *dst64 = (UINT64 *)(UINTN)phys_real;
+    UINTN   words = (UINTN)((load_result.image_size + 7) >> 3);
+    for (UINTN i = 0; i < words; i++) dst64[i] = src64[i];
   }
 
-  // Vali: any patches below were cheating using a LLM, so do take it with a grain of salt.
+  /* kaddr = slid physical base so vm_kernel_slide == kslide; entry runs at
+   * the slid low-identity physical (pstart immediates were relocated). */
+  UINT64 vm_base = load_result.lowest_vmaddr;
+  INT64  vm_slide = (INT64)phys_real - (INT64)vm_base;
 
-  // Physical entry = low 32 bits of entry vmaddr
-  VOID *phys_entry = (VOID *)(UINTN)(UINT32)entry_vmaddr;
+  VOID *phys_entry = (VOID *)(UINTN)((INT64)entry_vmaddr + vm_slide);
+
+  boot_state.args->kaddr = (UINT32)phys_real;
+  boot_state.args->kslide = ctx.kslide;
 
   /*
-   * Boot CPU workarounds - applied after segment copy, before kernel entry.
-   *
-   * scdatas[0] is in __DATA at physical 0xa04e80.
-   *
-   * cpu_int_stack_top redirect (phys 0xa04ec0 = scdatas[0]+0x40):
-   *    The static initializer points to low_eintstack (phys 0x19b000), only
-   *    4KB above idt64_hndl_table0 (0x196000).  The i386_init call chain
-   *    consumes ~250KB, overflowing into the IDT and corrupting trap dispatch.
-   *    Redirect to phys 0x80000 (VA 0xffffff8000080000); the stack grows DOWN
-   *    from there, away from 0x196000, with 384KB of headroom.
-   *
-   * cpu_active_thread (phys 0xa04e90 = scdatas[0]+0x10):
-   *    vm_fault_internal reads %gs:0x10 early in its prologue.  With the
-   *    default NULL it accesses 0x41c(NULL) = user-space VA 0x41c, which
-   *    faults after Idle_PTs_init installs PML4[0]=0, causing infinite
-   *    page-fault recursion.  Point at a zeroed fake-thread page (phys 0x6000,
-   *    VA 0xffffff8000006000) inside KPTphys coverage so the dereference
-   *    returns 0 instead of faulting.
-   *
-   * fake_thread+0x6a8 (phys 0x66a8):
-   *    vm_fault_internal computes rdi = 0x390 + *(cpu_active_thread+0x6a8)
-   *    before the second counter_incPPy call.  With the zeroed fake thread,
-   *    rdi = 0x390, a user-space address that faults.  Pre-load 0x6a8 with
-   *    0xffffff8000a00ea0 so rdi = 0xffffff8000a01230, the same mapped kernel
-   *    address used by the first counter_incPPy call.
+   * Kernel collection (KC) support, "approach B" (kc-builder / loader-aware).
+   * The kernel keeps its own MH_EXECUTE header at fileoff 0 but carries the
+   * MH_DYLIB_IN_CACHE flag (so XNU's kernel_mach_header_is_in_fileset() is
+   * true).  The top-level MH_FILESET header lives in a private "__KCHDR"
+   * segment appended by kc-builder.  XNU rebases the KC in i386_init IFF
+   * boot_args->KC_hdrs_vaddr points at that MH_FILESET header (Version>=2,
+   * Revision>=1 already set).  We must NOT run our own KASLR reloc pass for a
+   * KC (already skipped at kslide==0).
    */
-
-  /* Relocate the EFI memory map to physical 0x92000.
-   * exit_boot_services_retry set boot_args->MemoryMap to the final GetMemoryMap
-   * buffer (~0x7e057000), which is above XNU's bootPT coverage (~6MB).  Copy to
-   * the pre-allocated pages at 0x92000 and patch the pointer.  Both addresses
-   * are reachable via UEFI's identity-mapped page tables still active in CR3. */
-  {
-    UINT64 *src = (UINT64 *)(UINTN)boot_state.args->MemoryMap;
-    UINT64 *dst = (UINT64 *)(UINTN)0x92000ULL;
-    UINTN sz  = (UINTN)boot_state.args->MemoryMapSize;
-    UINTN wi;
-    for (wi = 0; wi < (sz + 7) / 8; wi++)
-      dst[wi] = src[wi];
-    boot_state.args->MemoryMap = (UINT32)0x92000;
-  }
-
-  /* PhysicalMemorySize: app_detect_physical_memory_size() returns 0 because the
-   * first GetMemoryMap(NULL) call doesn't return EFI_BUFFER_TOO_SMALL on this
-   * OVMF build.  XNU's pmap_bootstrap() uses mem_size to allocate pmap arrays;
-   * with 0 it allocates nothing and zones immediately run out of bitmap space.
-   * Compute the correct value from the final memory map we just copied to 0x92000.
-   * Count conventional + reclaimable types (1=LoaderCode, 2=LoaderData,
-   * 3=BSCode, 4=BSData, 7=Conventional, 9=ACPIReclaim, 10=ACPINVS). */
-  {
-    UINT32  desc_sz = boot_state.args->MemoryMapDescriptorSize;
-    UINT32  map_sz  = boot_state.args->MemoryMapSize;
-    UINT8  *map     = (UINT8 *)(UINTN)0x92000ULL;
-    UINT64  total   = 0;
-    UINT32  off;
-    for (off = 0; off + desc_sz <= map_sz; off += desc_sz) {
-      UINT32 typ = *(UINT32 *)(map + off); // EFI_MEMORY_DESCRIPTOR.Type
-      UINT64 npg = *(UINT64 *)(map + off + 24); // .NumberOfPages
-      if (typ == 1 || typ == 2 || typ == 3 || typ == 4 ||  typ == 7 || typ == 9 || typ == 10)
-        total += npg << EFI_PAGE_SHIFT;
+  if (image_info.header->flags & 0x80000000u /* MH_DYLIB_IN_CACHE */) {
+    for (UINT32 si = 0; si < load_result.segment_count; si++) {
+      const CHAR8 *n = load_result.segments[si].name;
+      if (n[0]=='_' && n[1]=='_' && n[2]=='K' && n[3]=='C' &&
+          n[4]=='H' && n[5]=='D' && n[6]=='R' && n[7]=='\0') {
+        /* FINAL physical of __KCHDR after the staging->phys_real copy, NOT the
+         * staging phys_target: XNU reads the KC header here and computes all KC
+         * addresses relative to it. */
+        boot_state.args->KC_hdrs_vaddr =
+            phys_real + (load_result.segments[si].vmaddr - vm_base);
+        break;
+      }
     }
-    boot_state.args->PhysicalMemorySize = total;
+    /* NO log_info here: this runs post-ExitBootServices, ConOut is dead. */
   }
 
-  // Zero the fake-thread page (phys 0x1a0000-0x1a0fff).
+  /* Relocate the EFI memory map to mm_fixed and coalesce adjacent
+   * same-type descriptors to keep entry count within XNU's zone limit. */
   {
-    volatile UINT64 *p = (volatile UINT64 *)(UINTN)0x1a0000ULL;
-    UINTN i;
-    for (i = 0; i < 512; i++)
-      p[i] = 0ULL;
+    UINT8 *src = (UINT8 *)(UINTN)boot_state.args->MemoryMap;
+    UINT8 *dst = (UINT8 *)(UINTN)mm_fixed;
+    UINTN sz = (UINTN)boot_state.args->MemoryMapSize;
+    UINTN dsz = (UINTN)boot_state.args->MemoryMapDescriptorSize;
+
+    for (UINTN wi = 0; wi < (sz + 7) / 8; wi++)
+      ((UINT64 *)dst)[wi] = ((UINT64 *)src)[wi];
+
+    UINTN n = sz / dsz;
+    for (UINTN i = 0; i < n; i++) {
+      EFI_MEMORY_DESCRIPTOR *d = (EFI_MEMORY_DESCRIPTOR *)(dst + i * dsz);
+      if (d->Type == EfiLoaderCode     ||
+          d->Type == EfiLoaderData     ||
+          d->Type == EfiBootServicesCode ||
+          d->Type == EfiBootServicesData)
+        d->Type = EfiConventionalMemory;
+    }
+
+    UINTN out = 0;
+    for (UINTN i = 0; i < n; i++) {
+      EFI_MEMORY_DESCRIPTOR *cur  = (EFI_MEMORY_DESCRIPTOR *)(dst + i  * dsz);
+      EFI_MEMORY_DESCRIPTOR *prev = (EFI_MEMORY_DESCRIPTOR *)(dst + out * dsz);
+      if (out > 0 &&
+          cur->Type      == prev->Type &&
+          cur->Attribute == prev->Attribute &&
+          cur->PhysicalStart ==
+              prev->PhysicalStart + (prev->NumberOfPages << EFI_PAGE_SHIFT)) {
+        prev->NumberOfPages += cur->NumberOfPages;
+      } else {
+        if (out != i) {
+          EFI_MEMORY_DESCRIPTOR *slot = (EFI_MEMORY_DESCRIPTOR *)(dst + out * dsz);
+          for (UINTN b = 0; b < dsz; b++)
+            ((UINT8 *)slot)[b] = ((UINT8 *)cur)[b];
+        }
+        out++;
+      }
+    }
+
+    boot_state.args->MemoryMap     = (UINT32)mm_fixed;
+    boot_state.args->MemoryMapSize = (UINT32)(out * dsz);
   }
-
-  // cpu_int_stack_top: scdatas[0]+0x40 = phys 0xa04ec0
-  *((volatile UINT64 *)(UINTN)0xa04ec0ULL) = 0xffffff8000080000ULL;
-
-  /* cpu_active_thread: scdatas[0]+0x10 = phys 0xa04e90.
-   * Use 0x1a0000 (just past __HIB end at 0x19ffff) - this VA is NOT freed
-   * by XNU's low-memory cleanup (which removes 0x0000-0xffff), so the
-   * fake thread remains accessible throughout boot and in the panic handler.
-   */
-  *((volatile UINT64 *)(UINTN)0xa04e90ULL) = 0xffffff80001a0000ULL;
-
-  /* fake_thread+0x6a8 at phys 0x1a06a8.
-   * Stack never reaches 0x1a0000 (stack top = 0x19b000 < 0x1a0000) so this
-   * value survives until counter_incPPy reads it. */
-  *((volatile UINT64 *)(UINTN)0x1a06a8ULL) = 0xffffff8000a00ea0ULL;
-
-  /* max_cpus_from_firmware: XNU panics in percpu_size() if this is 0.
-   * Normally set by ACPI MADT parsing (lapic_init). Without proper ACPI
-   * the MADT walker never runs. Set to 1 (single BSP) post-segment-copy
-   * so percpu initialization proceeds. Physical 0xbc2a20 (in __DATA). */
-  *((volatile UINT32 *)(UINTN)0xbc2a20ULL) = 1UL;
-
-  /* cpu_preemption_level remains 0 (default).
-   * Previously set to 1 to bypass vm_fault_internal's slow path (which would
-   * deadlock on the vm_map lock held by the "Hiding local relocations" caller
-   * during the spin-lock acquisition fault at 0x38064f).  That fault was a
-   * secondary effect of the EFI memory map being at an unmapped high address.
-   * With MemoryMap now relocated to 0x92000, the deadlock path is not reached.
-   * XNU uses lazy mapping, kernel pages are demand-faulted in by vm_fault_internal.
-   * Keeping preemption_level=0 lets vm_fault_internal handle these normally. */
 
   jump_to_xnu(
       phys_entry,

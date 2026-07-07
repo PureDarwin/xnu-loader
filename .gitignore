@@ -433,3 +433,4 @@ files
 output.txt
 esp
 OVMF_VARS.fd
+*.ext4

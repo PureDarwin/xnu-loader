@@ -4,6 +4,7 @@
 #include "common.h"
 #include "macho.h"
 #include "lowmem.h"
+#include "devtree.h"
 
 #define BOOT_LINE_LENGTH        1024
 #define BOOT_STRING_LEN         BOOT_LINE_LENGTH
@@ -123,6 +124,8 @@ typedef struct BootArgsState {
   UINTN descriptor_size;
   UINT32 descriptor_version;
   LowMemBuffer memory_map_buf;
+
+  UINT64 rt_table_phys;
 } BootArgsState;
 
 EFI_STATUS boot_collect_memory_map(AppContext *ctx, BootArgsState *state);
@@ -131,9 +134,14 @@ EFI_STATUS boot_refresh_memory_map(AppContext *ctx, BootArgsState *state);
 
 VOID boot_update_args_memory_map(AppContext *ctx, BootArgsState *state);
 
-EFI_STATUS boot_set_command_line(AppContext *ctx, BootArgsState *state, const CHAR8 *cmdline);
+EFI_STATUS boot_set_command_line(BootArgsState *state,  boot_args *args, const CHAR8 *cmdline);
 
-EFI_STATUS boot_build_args(AppContext *ctx, MachoLoadResult *load_result, BootArgsState *state);
+EFI_STATUS boot_build_args(AppContext *ctx, const CHAR8 *cmdline, MachoLoadResult *load_result, BootArgsState *state, DtKextList *kexts);
+
+/* Load kext binaries from \EFI\BOOT\Extensions\<Name>\info.plist and binary.
+ * Allocates EfiLoaderData pages for each kext's Info.plist, executable, bundle
+ * path, and _BooterKextFileInfo descriptor.  Fill kexts->entries[]. */
+EFI_STATUS boot_load_kexts(AppContext *ctx, DtKextList *kexts);
 
 EFI_STATUS boot_fill_video(AppContext *ctx, boot_args *args);
 

@@ -1,10 +1,48 @@
 #include "boot.h"
 #include "console.h"
 #include "devtree.h"
+#include "fileio.h"
 #include <efiprot.h>
+
+#define KEXT_NAME_MAX 128
 
 static UINT64 align_up_u64(UINT64 v, UINT64 a) {
   return (v + (a - 1)) & ~(a - 1);
+}
+
+/* Walk ACPI XSDT to find a table by 4-byte signature. Returns physical
+ * address of the table header, or 0 if not found. */
+static UINT64 acpi_find_table(AppContext *ctx, const CHAR8 *sig) {
+  static const EFI_GUID acpi20 = ACPI_20_TABLE_GUID;
+
+  /* Find RSDP from EFI configuration table */
+  UINT64 rsdp_addr = 0;
+  for (UINTN i = 0; i < ctx->st->NumberOfTableEntries; i++) {
+    EFI_CONFIGURATION_TABLE *e = &ctx->st->ConfigurationTable[i];
+    if (CompareMem(&e->VendorGuid, &acpi20, sizeof(EFI_GUID)) == 0) {
+      rsdp_addr = (UINT64)(UINTN)e->VendorTable;
+      break;
+    }
+  }
+  if (!rsdp_addr) return 0;
+
+  /* RSDP: +24 = XSDT physical address (8 bytes) */
+  UINT64 xsdt_addr = *(UINT64 *)(UINTN)(rsdp_addr + 24);
+  if (!xsdt_addr) return 0;
+
+  /* XSDT header: +4 = length (4 bytes); entries start at +36, each 8 bytes */
+  UINT32 xsdt_len = *(UINT32 *)(UINTN)(xsdt_addr + 4);
+  UINTN  n_entries = (xsdt_len - 36) / 8;
+  UINT64 *entries  = (UINT64 *)(UINTN)(xsdt_addr + 36);
+
+  for (UINTN i = 0; i < n_entries; i++) {
+    UINT64 tbl = entries[i];
+    if (!tbl) continue;
+    CHAR8 *s = (CHAR8 *)(UINTN)tbl;
+    if (s[0] == sig[0] && s[1] == sig[1] && s[2] == sig[2] && s[3] == sig[3])
+      return tbl;
+  }
+  return 0;
 }
 
 static UINTN boot_ascii_len(const CHAR8 *s) {
@@ -181,51 +219,28 @@ VOID boot_update_args_memory_map(AppContext *ctx, BootArgsState *state) {
   state->args->PhysicalMemorySize = app_detect_physical_memory_size(ctx);
 }
 
-EFI_STATUS boot_set_command_line(
-    AppContext *ctx,
-    BootArgsState *state,
-    const CHAR8 *cmdline)
-{
-  EFI_STATUS status;
-
-  if (!ctx || !state || !state->args || !cmdline)
+EFI_STATUS boot_set_command_line(BootArgsState *state, boot_args *args, const CHAR8 *cmdline) {
+  if (!state || !args || !cmdline)
     return EFI_INVALID_PARAMETER;
 
-  SetMem(state->args->CommandLine, BOOT_LINE_LENGTH, 0);
+  SetMem(args->CommandLine, BOOT_LINE_LENGTH, 0);
 
-  {
-    UINTN len = boot_ascii_len(cmdline);
-    if (len >= BOOT_LINE_LENGTH)
-      len = BOOT_LINE_LENGTH - 1;
-    CopyMem(state->args->CommandLine, cmdline, len);
-    state->args->CommandLine[len] = '\0';
-  }
+  UINTN len = boot_ascii_len(cmdline);
+  if (len >= BOOT_LINE_LENGTH)
+    len = BOOT_LINE_LENGTH - 1;
 
-  if (state->device_tree_buf.ptr != NULL) {
-    lowmem_free(ctx, &state->device_tree_buf);
-    state->device_tree = NULL;
-    state->device_tree_size = 0;
-  }
-
-  status = dt_build_minimal(
-      ctx,
-      &state->device_tree,
-      &state->device_tree_size,
-      &state->device_tree_buf,
-      state->args->CommandLine);
-  if (EFI_ERROR(status))
-    return status;
-
-  state->args->deviceTreeP = (UINT32)(UINTN)state->device_tree;
-  state->args->deviceTreeLength = state->device_tree_size;
+  CopyMem(args->CommandLine, cmdline, len);
+  args->CommandLine[len] = '\0';
 
   return EFI_SUCCESS;
 }
 
 EFI_STATUS boot_build_args(
     AppContext *ctx,
+    const CHAR8 *cmdline,
     MachoLoadResult *load_result,
-    BootArgsState *state)
+    BootArgsState *state,
+    DtKextList *kexts)
 {
   EFI_STATUS status;
   LowMemBuffer args_buf;
@@ -238,26 +253,148 @@ EFI_STATUS boot_build_args(
     return EFI_ALREADY_STARTED;
 
   log_info(L"[B0a] alloc_pages\r\n");
-  status = lowmem_alloc_pages(
-      ctx,
-      sizeof(boot_args),
-      EfiLoaderData,
-      &args_buf);
-  if (EFI_ERROR(status))
-    return status;
+  {
+    EFI_PHYSICAL_ADDRESS args_phys = XNU_BOOTARGS_PHYS;
+    status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
+        AllocateAddress, EfiLoaderData, 1, &args_phys);
+    if (EFI_ERROR(status)) {
+      log_error(L"boot_args: AllocateAddress(0x%lx) failed: %r\r\n",
+                (UINT64)XNU_BOOTARGS_PHYS, status);
+      return status;
+    }
+    args_buf.ptr = (VOID *)(UINTN)args_phys;
+    args_buf.phys = args_phys;
+    args_buf.size = sizeof(boot_args);
+    args_buf.pages = 1;
+  }
 
-  log_info(L"[B0b] setmem args\r\n");
   args = (boot_args *)args_buf.ptr;
   SetMem(args, sizeof(boot_args), 0);
 
-  log_info(L"[B0c] dt_build_minimal\r\n");
+  state->args = args;
+  state->args_buf = args_buf;
+
+  log_info(L"[B0b] set command line\r\n");
+  status = boot_set_command_line(state, args, cmdline);
+  if (EFI_ERROR(status))
+    return status;
+
+  /* Copy EFI tables to conventional memory before building the device tree
+   * so state->rt_table_phys is valid when dt_build stores the runtime-services
+   * table address in /efi/runtime-services/table.
+   * OVMF places EFI_SYSTEM_TABLE and EFI_RUNTIME_SERVICES in runtime-services
+   * pages (type 5/6) which XNU excludes from pmap_memory_regions. After
+   * pmap_bootstrap the physmap doesn't cover those pages, so phys_to_kva()
+   * produces KVAs that fault on access. Copy the structs to a pinned page in
+   * conventional memory (always in the physmap) so XNU can read them. */
+  {
+    EFI_PHYSICAL_ADDRESS tbl_phys = XNU_EFITABLES_PHYS;
+    if (!EFI_ERROR(uefi_call_wrapper(ctx->bs->AllocatePages, 4,
+            AllocateAddress, EfiLoaderData, 1, &tbl_phys))) {
+      UINT8 *page = (UINT8 *)(UINTN)tbl_phys;
+      EFI_SYSTEM_TABLE *st_copy = (EFI_SYSTEM_TABLE *)page;
+      EFI_RUNTIME_SERVICES *rt_copy = (EFI_RUNTIME_SERVICES *)(page + 0x200);
+      state->rt_table_phys = (UINT64)(UINTN)rt_copy;
+
+      XnuCopyMem(st_copy, ctx->st, sizeof(EFI_SYSTEM_TABLE));
+      XnuCopyMem(rt_copy, ctx->st->RuntimeServices, sizeof(EFI_RUNTIME_SERVICES));
+      /*
+       * XNU's efi_set_tables_64() dereferences SystemTable->RuntimeServices
+       * DIRECTLY (no ml_static_ptovirt), unlike the configuration-table walk.
+       * So this pointer must already be the kernel physmap VA
+       * (VM_MIN_KERNEL_ADDRESS | phys), not the raw physical address, or the
+       * first access faults in the user VA range and crashes in vm_fault
+       * (current_task() is still NULL this early).
+       */
+      st_copy->RuntimeServices =
+          (EFI_RUNTIME_SERVICES *)(UINTN)(0xFFFFFF8000000000ULL |
+                                          (UINT64)(UINTN)rt_copy);
+
+      /* Also copy the EFI configuration table array to conventional memory
+       * so XNU can walk it to find the ACPI RSDP.  The array pointer in the
+       * original system table often points to EFI runtime/boot-services data
+       * which is excluded from XNU's physmap after pmap_bootstrap.
+       *
+       * Layout: page+0x000=EFI_SYSTEM_TABLE, page+0x200=EFI_RUNTIME_SERVICES,
+       *         page+0x400=EFI_CONFIGURATION_TABLE[n] */
+      if (ctx->st->NumberOfTableEntries > 0 && ctx->st->ConfigurationTable) {
+        EFI_CONFIGURATION_TABLE *cfg_copy =
+            (EFI_CONFIGURATION_TABLE *)(page + 0x400);
+        UINTN cfg_size =
+            ctx->st->NumberOfTableEntries * sizeof(EFI_CONFIGURATION_TABLE);
+        XnuCopyMem(cfg_copy, ctx->st->ConfigurationTable, cfg_size);
+        st_copy->ConfigurationTable = cfg_copy;
+        st_copy->NumberOfTableEntries = ctx->st->NumberOfTableEntries;
+        log_info(L"EFI config table: %lu entries copied to 0x%lx\r\n",
+                 ctx->st->NumberOfTableEntries, (UINT64)(UINTN)cfg_copy);
+        for (UINTN ci = 0; ci < ctx->st->NumberOfTableEntries; ci++) {
+          log_info(L"  cfg[%lu]: vendor=%lx\r\n",
+                   ci, (UINT64)(UINTN)cfg_copy[ci].VendorTable);
+        }
+      }
+
+      /* Recompute the EFI_SYSTEM_TABLE CRC32 after modifying RuntimeServices
+       * and ConfigurationTable.  XNU verifies CRC32 in both efi_set_tables_64
+       * and efi_get_cfgtbl_by_guid; a stale checksum makes both return early,
+       * breaking ACPI RSDP lookup and EFI runtime services setup. */
+      {
+        UINT32 new_crc = 0;
+        st_copy->Hdr.CRC32 = 0;
+        uefi_call_wrapper(ctx->bs->CalculateCrc32, 3,
+                          st_copy, st_copy->Hdr.HeaderSize, &new_crc);
+        st_copy->Hdr.CRC32 = new_crc;
+        log_info(L"EFI_SYSTEM_TABLE CRC32 recomputed: 0x%x\r\n", new_crc);
+      }
+
+      args->efiSystemTable = (UINT32)(UINTN)tbl_phys;
+      log_info(L"EFI tables copied to 0x%lx (st) / 0x%lx (rt)\r\n",
+               (UINT64)tbl_phys, (UINT64)(tbl_phys + 0x200));
+    } else {
+      args->efiSystemTable = (UINT32)(UINTN)ctx->st;
+      log_info(L"EFI table copy failed, using original 0x%lx\r\n",
+               (UINT64)(UINTN)ctx->st);
+    }
+
+    /* Record physical page range for runtime-flagged descriptors.
+     * Virtual page start is filled in after SetVirtualAddressMap in
+     * exit_boot_services_retry once we know the actual virtual addresses. */
+    {
+      UINT8 *map = (UINT8 *)state->memory_map;
+      UINT32 desc_sz = (UINT32)state->descriptor_size;
+      UINT32 map_sz = (UINT32)state->memory_map_size;
+      UINT32 min_pg = 0xFFFFFFFFU;
+      UINT32 max_pg = 0;
+
+      for (UINT32 off = 0; off + desc_sz <= map_sz; off += desc_sz) {
+        EFI_MEMORY_DESCRIPTOR *d = (EFI_MEMORY_DESCRIPTOR *)(map + off);
+        if (!(d->Attribute & EFI_MEMORY_RUNTIME))
+          continue;
+        UINT32 pg_start = (UINT32)(d->PhysicalStart >> EFI_PAGE_SHIFT);
+        UINT32 pg_end   = pg_start + (UINT32)d->NumberOfPages;
+        if (pg_start < min_pg) min_pg = pg_start;
+        if (pg_end   > max_pg) max_pg = pg_end;
+      }
+
+      if (min_pg < max_pg) {
+        args->efiRuntimeServicesPageStart = min_pg;
+        args->efiRuntimeServicesPageCount = max_pg - min_pg;
+        /* efiRuntimeServicesVirtualPageStart is set after SVAM. */
+      }
+    }
+
+    args->csrActiveConfig = 0;
+  }
+
+  log_info(L"[B0c] dt_build\r\n");
   if (state->device_tree == NULL) {
-    status = dt_build_minimal(
+    status = dt_build(
         ctx,
         &state->device_tree,
         &state->device_tree_size,
         &state->device_tree_buf,
-        args->CommandLine);
+        cmdline,
+        kexts,
+        state->rt_table_phys);
     if (EFI_ERROR(status)) {
       lowmem_free(ctx, &args_buf);
       return status;
@@ -265,12 +402,16 @@ EFI_STATUS boot_build_args(
   }
 
   log_info(L"[B0d] field assignments\r\n");
-  args->Revision = 0;
+  /* boot.efi sets Revision=kBootArgsRevision=1 and Version=kBootArgsVersion2=2.
+   * XNU checks Version to select struct layout; Version=2 enables efiMode/flags. */
+  args->Revision = 1;
   args->Version  = 2;
 
-  args->efiMode   = 64;
+  args->efiMode = 64;
   args->debugMode = 0;
-  args->flags     = 0;
+  /* boot.efi always sets bit 0; additional bits come from boot-arg parsing.
+   * We set bit 0 (kBootArgsFlagHiDPI baseline) to match. */
+  args->flags = 1;
 
   args->MemoryMap = (UINT32)(UINTN)state->memory_map;
   args->MemoryMapSize = (UINT32)state->memory_map_size;
@@ -286,10 +427,33 @@ EFI_STATUS boot_build_args(
   args->kaddr = (UINT32)load_result->host_base;
   args->ksize = (UINT32)align_up_u64(load_result->image_size, EFI_PAGE_SIZE);
 
-  args->efiSystemTable = (UINT32)(UINTN)ctx->st;
-
   args->KC_hdrs_vaddr = 0;
-  args->kslide = 0;
+  args->kslide = ctx->kslide;
+
+  /* FSBFrequency: Ivy Bridge-E (Mac Pro 6,1) uses 100 MHz BCLK.
+   * XNU's tsc_init reads this from boot_args if the DT is unavailable. */
+  args->FSBFrequency = 100000000ULL;
+
+  /* pciConfigSpaceBaseAddress / StartBus / EndBus: from ACPI MCFG.
+   * boot.efi reads MCFG[0] allocation structure at offset +44. */
+  {
+    UINT64 mcfg = acpi_find_table(ctx, "MCFG");
+    if (mcfg) {
+      /* MCFG allocation structure starts at offset 44 (36 header + 8 reserved).
+       * BaseAddress[8] at +44, SegmentGroup[2] at +52, StartBus[1] at +54,
+       * EndBus[1] at +55. */
+      args->pciConfigSpaceBaseAddress   = *(UINT64 *)(UINTN)(mcfg + 44);
+      args->pciConfigSpaceStartBusNumber = *(UINT8  *)(UINTN)(mcfg + 54);
+      args->pciConfigSpaceEndBusNumber   = *(UINT8  *)(UINTN)(mcfg + 55);
+      log_info(L"MCFG: PCI base=0x%lx bus=%u-%u\r\n",
+               args->pciConfigSpaceBaseAddress,
+               args->pciConfigSpaceStartBusNumber,
+               args->pciConfigSpaceEndBusNumber);
+    } else {
+      log_info(L"MCFG: not found in ACPI\r\n");
+    }
+  }
+
 
   log_info(L"[B3] before boot_fill_video\r\n");
   status = boot_fill_video(ctx, args);
@@ -314,36 +478,105 @@ EFI_STATUS boot_fill_video(
     AppContext *ctx,
     boot_args *args)
 {
-  EFI_STATUS status;
-  EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
-
   if (!ctx || !args)
-    return EFI_INVALID_PARAMETER;
+      return EFI_INVALID_PARAMETER;
 
-  status = uefi_call_wrapper(
+  EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
+
+  EFI_STATUS status = uefi_call_wrapper(
       ctx->bs->LocateProtocol,
       3,
       &gEfiGraphicsOutputProtocolGuid,
       NULL,
       (VOID **)&gop);
 
-  if (EFI_ERROR(status))
-    return status;
+  log_info(L"GOP LocateProtocol status=%r\r\n", status);
 
+  if (EFI_ERROR(status))
+    return EFI_NOT_FOUND;
+
+  if (!gop || !gop->Mode || !gop->Mode->Info)
+    return EFI_DEVICE_ERROR;
+
+  /* XNU needs a LINEAR framebuffer.  The firmware's current GOP mode is
+   * normally the native panel resolution with a linear framebuffer, so keep it
+   * when it is RGBX(0)/BGRX(1).  Only if the current mode is BltOnly/bitmask
+   * (no CPU-addressable framebuffer) do we search for the highest-resolution
+   * linear mode and switch to it. */
+  {
+    EFI_GRAPHICS_PIXEL_FORMAT curfmt = gop->Mode->Info->PixelFormat;
+    BOOLEAN cur_linear =
+        (curfmt == PixelRedGreenBlueReserved8BitPerColor ||
+         curfmt == PixelBlueGreenRedReserved8BitPerColor);
+
+    if (!cur_linear) {
+      UINT32 best_mode = gop->Mode->MaxMode; /* sentinel = none found */
+      UINT64 best_px   = 0;
+      for (UINT32 m = 0; m < gop->Mode->MaxMode; m++) {
+        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi = NULL;
+        UINTN misz = 0;
+        if (EFI_ERROR(uefi_call_wrapper(gop->QueryMode, 4, gop, m, &misz, &mi)) || !mi)
+          continue;
+        if (mi->PixelFormat != PixelRedGreenBlueReserved8BitPerColor &&
+            mi->PixelFormat != PixelBlueGreenRedReserved8BitPerColor)
+          continue;
+        UINT64 px = (UINT64)mi->HorizontalResolution * mi->VerticalResolution;
+        if (px > best_px) {
+          best_px   = px;
+          best_mode = m;
+        }
+      }
+      if (best_mode == gop->Mode->MaxMode) {
+        log_error(L"boot_fill_video: current mode not linear and no linear mode found\r\n");
+        return EFI_DEVICE_ERROR;
+      }
+      log_info(L"boot_fill_video: current mode not linear, switching to mode %u\r\n",
+               best_mode);
+      status = uefi_call_wrapper(gop->SetMode, 2, gop, best_mode);
+      if (EFI_ERROR(status)) {
+        log_error(L"boot_fill_video: SetMode(%u) failed: %r\r\n", best_mode, status);
+        return EFI_DEVICE_ERROR;
+      }
+    }
+  }
+
+  UINT32 width = gop->Mode->Info->HorizontalResolution;
+  UINT32 height = gop->Mode->Info->VerticalResolution;
+  UINT32 stride = gop->Mode->Info->PixelsPerScanLine * 4;
+  UINT64 fb_base  = gop->Mode->FrameBufferBase;
+
+  UINT8 pixel_fmt = (UINT8)gop->Mode->Info->PixelFormat;
+
+  log_info(L"boot_fill_video: %ux%u stride=%u fb=0x%lx pixfmt=%u\r\n",
+           width, height, stride, fb_base, (UINT32)pixel_fmt);
+
+  /* This extended Boot_Video (offset 1192, 64-bit v_baseAddr at 1240) is the
+   * struct XNU's PE_init_platform actually consumes.  v_rotate is the DISPLAY
+   * ROTATION (0/1/2/3 = 0/90/180/270 deg) -- XNU swaps v_width/v_height when
+   * it is 1 or 3.  It is NOT the pixel format; it MUST be 0 or the panel is
+   * rotated and the geometry transposed. */
   args->Video.v_display  = GRAPHICS_MODE;
-  args->Video.v_rowBytes = gop->Mode->Info->PixelsPerScanLine * 4;
-  args->Video.v_width    = gop->Mode->Info->HorizontalResolution;
-  args->Video.v_height   = gop->Mode->Info->VerticalResolution;
+  args->Video.v_rowBytes = stride;
+  args->Video.v_width    = width;
+  args->Video.v_height   = height;
   args->Video.v_depth    = 32;
   args->Video.v_rotate   = 0;
-  args->Video.v_baseAddr = gop->Mode->FrameBufferBase;
+  args->Video.v_baseAddr = fb_base;
+  (void)pixel_fmt;
 
-  args->VideoV1.v_baseAddr = (UINT32)gop->Mode->FrameBufferBase;
+  /* VideoV1 (the struct XNU reads at boot_args+1048): base addr is 32-bit.
+   * XNU's Boot_Video.v_baseAddr is 32-bit, so a framebuffer above 4GB cannot
+   * be described, warn (some discrete GPUs place the FB high, but Macs and
+   * most laptop iGPUs keep it below 4GB). */
+  if (fb_base > 0xFFFFFFFFULL)
+    log_error(L"boot_fill_video: WARNING framebuffer 0x%lx > 4GB, truncated\r\n",
+              fb_base);
+  args->VideoV1.v_baseAddr = (UINT32)fb_base;
   args->VideoV1.v_display  = GRAPHICS_MODE;
-  args->VideoV1.v_rowBytes = args->Video.v_rowBytes;
-  args->VideoV1.v_width    = args->Video.v_width;
-  args->VideoV1.v_height   = args->Video.v_height;
-  args->VideoV1.v_depth    = args->Video.v_depth;
+  args->VideoV1.v_rowBytes = stride;
+  args->VideoV1.v_width    = width;
+  args->VideoV1.v_height   = height;
+  args->VideoV1.v_depth    = 32;
 
   return EFI_SUCCESS;
 }
@@ -401,6 +634,539 @@ VOID boot_log_args(BootArgsState *state) {
   log_info(L"  efiMode: %u\r\n", state->args->efiMode);
 }
 
+/* Allocate EfiLoaderData pages for a buffer of 'size' bytes.
+ * Returns the physical (= virtual in pre-EBS identity map) address. */
+/*
+ * Bump allocator over the fixed low kext-blob region [XNU_KEXTS_PHYS,
+ * XNU_KEXTS_END).  XNU's readBooterExtensions reads each blob via
+ * ml_static_ptovirt(phys), which only resolves LOW physical addresses within
+ * the static kernel region (below physfree).  EfiACPIMemoryNVS blobs at ~2GB
+ * are unreachable there and fault.  So all kext blobs live in this reserved
+ * region (inside the ksize-inflated, mapped, never-freed kernel area).
+ */
+static EFI_PHYSICAL_ADDRESS g_kext_bump_cursor = 0;
+
+static EFI_STATUS kext_region_reserve(AppContext *ctx) {
+  EFI_PHYSICAL_ADDRESS base = XNU_KEXTS_PHYS;
+  UINTN n_pages = XNU_KEXTS_SIZE / EFI_PAGE_SIZE;
+  EFI_STATUS s = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
+      AllocateAddress, EfiLoaderData, n_pages, &base);
+  if (EFI_ERROR(s)) {
+    log_error(L"kext_region_reserve: AllocateAddress(0x%lx, %lu pg) failed: %r\r\n",
+              (UINT64)XNU_KEXTS_PHYS, (UINT64)n_pages, s);
+    return s;
+  }
+  SetMem((VOID *)(UINTN)XNU_KEXTS_PHYS, (UINTN)XNU_KEXTS_SIZE, 0);
+  g_kext_bump_cursor = XNU_KEXTS_PHYS;
+  return EFI_SUCCESS;
+}
+
+/* Page-aligned bump allocation from the reserved kext region. */
+static EFI_STATUS kext_bump_alloc(UINTN size, EFI_PHYSICAL_ADDRESS *phys_out) {
+  UINTN aligned = (size + EFI_PAGE_SIZE - 1) & ~(UINTN)(EFI_PAGE_SIZE - 1);
+  if (g_kext_bump_cursor == 0 ||
+      g_kext_bump_cursor + aligned > XNU_KEXTS_END) {
+    *phys_out = 0;
+    return EFI_OUT_OF_RESOURCES;
+  }
+  *phys_out = g_kext_bump_cursor;
+  g_kext_bump_cursor += aligned;
+  return EFI_SUCCESS;
+}
+
+static EFI_STATUS
+dir_open_from_any_volume(AppContext *ctx, const CHAR16 *path,
+                         EFI_FILE_PROTOCOL **out)
+{
+  EFI_HANDLE  *handles     = NULL;
+  UINTN        num_handles = 0;
+  EFI_STATUS   s;
+
+  s = uefi_call_wrapper(ctx->bs->LocateHandleBuffer, 5,
+                        ByProtocol,
+                        &gEfiSimpleFileSystemProtocolGuid,
+                        NULL,
+                        &num_handles,
+                        &handles);
+  if (EFI_ERROR(s)) return s;
+
+  s = EFI_NOT_FOUND;
+  for (UINTN i = 0; i < num_handles; i++) {
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL  *fs        = NULL;
+    EFI_FILE_PROTOCOL                *root      = NULL;
+    EFI_FILE_PROTOCOL                *dir       = NULL;
+    EFI_FILE_INFO                    *fi        = NULL;
+    UINTN                             info_size = sizeof(EFI_FILE_INFO) + 256;
+
+    if (EFI_ERROR(uefi_call_wrapper(ctx->bs->HandleProtocol, 3,
+                                    handles[i],
+                                    &gEfiSimpleFileSystemProtocolGuid,
+                                    (VOID **)&fs)))
+      continue;
+
+    if (EFI_ERROR(uefi_call_wrapper(fs->OpenVolume, 2, fs, &root)))
+      continue;
+
+    if (EFI_ERROR(uefi_call_wrapper(root->Open, 5,
+                                    root, &dir, (CHAR16 *)path,
+                                    EFI_FILE_MODE_READ, 0))) {
+      uefi_call_wrapper(root->Close, 1, root);
+      continue;
+    }
+
+    if (EFI_ERROR(uefi_call_wrapper(ctx->bs->AllocatePool, 3,
+                                    EfiLoaderData, info_size,
+                                    (VOID **)&fi))) {
+      uefi_call_wrapper(dir->Close,  1, dir);
+      uefi_call_wrapper(root->Close, 1, root);
+      continue;
+    }
+
+    if (!EFI_ERROR(uefi_call_wrapper(dir->GetInfo, 4,
+                                     dir, &gEfiFileInfoGuid,
+                                     &info_size, fi)) &&
+        (fi->Attribute & EFI_FILE_DIRECTORY)) {
+      uefi_call_wrapper(ctx->bs->FreePool, 1, fi);
+      uefi_call_wrapper(root->Close, 1, root);
+      *out = dir;
+      s    = EFI_SUCCESS;
+      break;
+    }
+
+    uefi_call_wrapper(ctx->bs->FreePool, 1, fi);
+    uefi_call_wrapper(dir->Close,  1, dir);
+    uefi_call_wrapper(root->Close, 1, root);
+  }
+
+  uefi_call_wrapper(ctx->bs->FreePool, 1, handles);
+  return s;
+}
+
+typedef enum {
+  KEXT_LAYOUT_CONTENTS,
+  KEXT_LAYOUT_FLAT,
+} KextLayout;
+
+static EFI_STATUS
+dir_first_file(AppContext *ctx, EFI_FILE_PROTOCOL *dir, CHAR16 **name_out)
+{
+  UINTN          buf_size = sizeof(EFI_FILE_INFO) + 512;
+  EFI_FILE_INFO *fi       = NULL;
+  EFI_STATUS     ret      = EFI_NOT_FOUND;
+  EFI_STATUS     s;
+
+  s = uefi_call_wrapper(ctx->bs->AllocatePool, 3,
+                        EfiLoaderData, buf_size, (VOID **)&fi);
+  if (EFI_ERROR(s)) return EFI_OUT_OF_RESOURCES;
+
+  uefi_call_wrapper(dir->SetPosition, 2, dir, 0);
+
+  for (;;) {
+    UINTN sz = buf_size;
+    s = uefi_call_wrapper(dir->Read, 3, dir, &sz, fi);
+    if (EFI_ERROR(s) || sz == 0) break;
+
+    if (fi->FileName[0] == L'.' &&
+        (fi->FileName[1] == L'\0' ||
+         (fi->FileName[1] == L'.' && fi->FileName[2] == L'\0')))
+      continue;
+
+    if (fi->Attribute & EFI_FILE_DIRECTORY)
+      continue;
+
+    {
+      UINTN   len = 0;
+      CHAR16 *copy;
+      while (fi->FileName[len]) len++;
+      s = uefi_call_wrapper(ctx->bs->AllocatePool, 3,
+                            EfiLoaderData, (len + 1) * sizeof(CHAR16),
+                            (VOID **)&copy);
+      if (EFI_ERROR(s)) { ret = EFI_OUT_OF_RESOURCES; break; }
+      for (UINTN i = 0; i <= len; i++) copy[i] = fi->FileName[i];
+      *name_out = copy;
+      ret = EFI_SUCCESS;
+    }
+    break;
+  }
+
+  uefi_call_wrapper(ctx->bs->FreePool, 1, fi);
+  return ret;
+}
+
+static EFI_STATUS
+read_file_from_dir(AppContext *ctx, EFI_FILE_PROTOCOL *dir,
+                   const CHAR16 *rel_path, FileBuffer *fb)
+{
+  EFI_FILE_PROTOCOL *fh        = NULL;
+  UINTN              info_size = sizeof(EFI_FILE_INFO) + 256;
+  EFI_FILE_INFO     *fi        = NULL;
+  UINTN              file_sz;
+  VOID              *buf;
+  UINTN              read_sz;
+  EFI_STATUS         s;
+
+  s = uefi_call_wrapper(dir->Open, 5, dir, &fh, (CHAR16 *)rel_path,
+                        EFI_FILE_MODE_READ, 0);
+  if (EFI_ERROR(s)) return s;
+
+  s = uefi_call_wrapper(ctx->bs->AllocatePool, 3,
+                        EfiLoaderData, info_size, (VOID **)&fi);
+  if (EFI_ERROR(s)) {
+    uefi_call_wrapper(fh->Close, 1, fh);
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  s       = uefi_call_wrapper(fh->GetInfo, 4, fh, &gEfiFileInfoGuid,
+                              &info_size, fi);
+  file_sz = EFI_ERROR(s) ? 0 : (UINTN)fi->FileSize;
+  uefi_call_wrapper(ctx->bs->FreePool, 1, fi);
+
+  if (EFI_ERROR(s) || file_sz == 0) {
+    uefi_call_wrapper(fh->Close, 1, fh);
+    return EFI_ERROR(s) ? s : EFI_NOT_FOUND;
+  }
+
+  s = uefi_call_wrapper(ctx->bs->AllocatePool, 3,
+                        EfiLoaderData, file_sz, (VOID **)&buf);
+  if (EFI_ERROR(s)) {
+    uefi_call_wrapper(fh->Close, 1, fh);
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  read_sz = file_sz;
+  s       = uefi_call_wrapper(fh->Read, 3, fh, &read_sz, buf);
+  uefi_call_wrapper(fh->Close, 1, fh);
+  if (EFI_ERROR(s)) {
+    uefi_call_wrapper(ctx->bs->FreePool, 1, buf);
+    return s;
+  }
+
+  fb->data = buf;
+  fb->size = read_sz;
+  return EFI_SUCCESS;
+}
+
+static EFI_STATUS
+open_subdir(EFI_FILE_PROTOCOL *parent, const CHAR16 *name,
+            EFI_FILE_PROTOCOL **out)
+{
+  return uefi_call_wrapper(parent->Open, 5, parent, out, (CHAR16 *)name,
+                           EFI_FILE_MODE_READ, 0);
+}
+
+static BOOLEAN
+kext_name_strip_suffix(const CHAR16 *src, CHAR16 *dst)
+{
+  UINTN len = 0, copy_len;
+
+  while (src[len]) {
+    if (++len >= KEXT_NAME_MAX)
+      return FALSE;
+  }
+
+  copy_len = len;
+  if (len >= 5 && src[len-5] == L'.' && src[len-4] == L'k' && src[len-3] == L'e' && src[len-2] == L'x' && src[len-1] == L't')
+      copy_len = len - 5;
+
+  for (UINTN i = 0; i < copy_len; i++)
+    dst[i] = src[i];
+  dst[copy_len] = L'\0';
+  return TRUE;
+}
+
+static BOOLEAN
+kext_build_bundle_path8(const CHAR8 *base, const CHAR16 *name16, CHAR8 *buf, UINTN buf_size) {
+  UINTN off = 0;
+  const CHAR8 sfx[] = ".kext";
+
+  for (; base[off]; off++) {
+    if (off + 1 >= buf_size)
+      return FALSE;
+    buf[off] = base[off];
+  }
+  if (off + 1 >= buf_size)
+    return FALSE;
+  buf[off++] = '/';
+
+  for (UINTN i = 0; name16[i]; i++, off++) {
+    if (off + 6 >= buf_size)
+      return FALSE;
+    buf[off] = (CHAR8)name16[i];
+  }
+  for (UINTN i = 0; sfx[i]; i++, off++) {
+    if (off + 1 >= buf_size)
+      return FALSE;
+    buf[off] = sfx[i];
+  }
+  buf[off] = '\0';
+  return TRUE;
+}
+
+static EFI_STATUS
+kext_load_one(AppContext *ctx, DtKextList *kexts,
+              EFI_FILE_PROTOCOL *kext_dir,
+              const CHAR16      *kext_name,
+              const CHAR8       *bundle_path,
+              KextLayout         layout)
+{
+  FileBuffer           info_fb       = {0};
+  FileBuffer           bin_fb        = {0};
+  BOOLEAN              has_binary    = FALSE;
+  EFI_PHYSICAL_ADDRESS info_phys     = 0;
+  EFI_PHYSICAL_ADDRESS bin_phys      = 0;
+  EFI_PHYSICAL_ADDRESS bpath_phys    = 0;
+  EFI_PHYSICAL_ADDRESS info_struct_phys;
+  UINTN                info_size;
+  UINTN                bin_len       = 0;
+  UINTN                bpath_len     = 0;
+  DtKextEntry         *ke;
+  EFI_STATUS           s;
+  const CHAR8          hex_chars[]   = "0123456789abcdef";
+
+  if (kexts->count >= DT_MAX_KEXTS)
+    return EFI_OUT_OF_RESOURCES;
+
+  if (layout == KEXT_LAYOUT_CONTENTS)
+    s = read_file_from_dir(ctx, kext_dir, L"Contents\\Info.plist", &info_fb);
+  else
+    s = read_file_from_dir(ctx, kext_dir, L"Info.plist", &info_fb);
+
+  if (EFI_ERROR(s)) {
+    log_info(L"kext %s: no Info.plist (%r), skipping\r\n", kext_name, s);
+    return EFI_NOT_FOUND;
+  }
+
+  if (layout == KEXT_LAYOUT_CONTENTS) {
+    EFI_FILE_PROTOCOL *macos_dir = NULL;
+    s = open_subdir(kext_dir, L"Contents\\MacOS", &macos_dir);
+    if (!EFI_ERROR(s)) {
+      CHAR16 *bin_name = NULL;
+      s = dir_first_file(ctx, macos_dir, &bin_name);
+      if (!EFI_ERROR(s)) {
+        s = read_file_from_dir(ctx, macos_dir, bin_name, &bin_fb);
+        if (!EFI_ERROR(s))
+          has_binary = TRUE;
+        else
+          log_info(L"kext %s: binary read failed (%r)\r\n", kext_name, s);
+        uefi_call_wrapper(ctx->bs->FreePool, 1, bin_name);
+      }
+      uefi_call_wrapper(macos_dir->Close, 1, macos_dir);
+    } else {
+      log_info(L"kext %s: no MacOS dir (%r)\r\n", kext_name, s);
+    }
+  }
+
+  s = kext_bump_alloc(info_fb.size, &info_phys);
+  if (EFI_ERROR(s)) {
+    uefi_call_wrapper(ctx->bs->FreePool, 1, info_fb.data);
+    if (has_binary) uefi_call_wrapper(ctx->bs->FreePool, 1, bin_fb.data);
+    log_info(L"kext %s: alloc info failed\r\n", kext_name);
+    return s;
+  }
+  info_size = info_fb.size;
+  XnuCopyMem((VOID *)(UINTN)info_phys, info_fb.data, info_fb.size);
+  uefi_call_wrapper(ctx->bs->FreePool, 1, info_fb.data);
+
+  if (has_binary) {
+    s = kext_bump_alloc(bin_fb.size, &bin_phys);
+    if (!EFI_ERROR(s)) {
+      XnuCopyMem((VOID *)(UINTN)bin_phys, bin_fb.data, bin_fb.size);
+      bin_len = bin_fb.size;
+    } else {
+      log_info(L"kext %s: alloc binary failed\r\n", kext_name);
+    }
+    uefi_call_wrapper(ctx->bs->FreePool, 1, bin_fb.data);
+  }
+
+  // Bundle path string
+  while (bundle_path[bpath_len]) bpath_len++;
+  bpath_len++;
+  s = kext_bump_alloc(bpath_len, &bpath_phys);
+  if (!EFI_ERROR(s))
+    XnuCopyMem((VOID *)(UINTN)bpath_phys, bundle_path, bpath_len);
+  else {
+    log_info(L"kext %s: alloc bpath failed\r\n", kext_name);
+    bpath_phys = 0; bpath_len = 0;
+  }
+
+  // _BooterKextFileInfo struct
+  s = kext_bump_alloc(sizeof(DtBooterKextFileInfo), &info_struct_phys);
+  if (EFI_ERROR(s)) {
+    log_info(L"kext %s: alloc info struct failed\r\n", kext_name);
+    return s;
+  }
+
+  ke = &kexts->entries[kexts->count];
+  ke->info.infoDictPhysAddr   = (UINT32)info_phys;
+  ke->info.infoDictLength     = (UINT32)info_size;
+  ke->info.executablePhysAddr = (UINT32)bin_phys;
+  ke->info.executableLength   = (UINT32)bin_len;
+  ke->info.bundlePathPhysAddr = (UINT32)bpath_phys;
+  ke->info.bundlePathLength   = (UINT32)bpath_len;
+  ke->infoStructPhysAddr      = (UINT32)info_struct_phys;
+
+  XnuCopyMem((VOID *)(UINTN)info_struct_phys,
+             &ke->info, sizeof(DtBooterKextFileInfo));
+
+  // Build DT property name: "Driver-XXXXXXXX"
+  ke->dtName[0] = 'D'; ke->dtName[1] = 'r'; ke->dtName[2] = 'i';
+  ke->dtName[3] = 'v'; ke->dtName[4] = 'e'; ke->dtName[5] = 'r';
+  ke->dtName[6] = '-';
+  for (INT32 d = 7; d < 15; d++)
+    ke->dtName[d] = hex_chars[(info_struct_phys >> ((14 - d) * 4)) & 0xf];
+  ke->dtName[15] = '\0';
+
+  log_info(L"kext %s: info@0x%x bin@0x%x struct@0x%x DT=%a\r\n",
+           kext_name, (UINT32)info_phys, (UINT32)bin_phys,
+           (UINT32)info_struct_phys, ke->dtName);
+
+  kexts->count++;
+  return EFI_SUCCESS;
+}
+
+static VOID
+kext_enum_dir(AppContext *ctx, DtKextList *kexts,
+              EFI_FILE_PROTOCOL *ext_dir,
+              const CHAR8       *bundle_base,
+              KextLayout         layout)
+{
+  UINTN          buf_size = sizeof(EFI_FILE_INFO) + KEXT_NAME_MAX * sizeof(CHAR16);
+  EFI_FILE_INFO *fi       = NULL;
+  EFI_STATUS     s;
+
+  s = uefi_call_wrapper(ctx->bs->AllocatePool, 3,
+                        EfiLoaderData, buf_size, (VOID **)&fi);
+  if (EFI_ERROR(s)) return;
+
+  uefi_call_wrapper(ext_dir->SetPosition, 2, ext_dir, 0);
+
+  for (;;) {
+    UINTN              sz = buf_size;
+    UINTN              nlen;
+    CHAR16             bare_name[KEXT_NAME_MAX];
+    CHAR8              bundle_path[256];
+    BOOLEAN            is_system_kext;
+    EFI_FILE_PROTOCOL *kext_dir = NULL;
+
+    if (kexts->count >= DT_MAX_KEXTS) break;
+
+    s = uefi_call_wrapper(ext_dir->Read, 3, ext_dir, &sz, fi);
+    if (EFI_ERROR(s) || sz == 0) break;
+
+    if (!(fi->Attribute & EFI_FILE_DIRECTORY)) continue;
+    if (fi->FileName[0] == L'.') continue;
+
+    nlen = 0;
+    while (fi->FileName[nlen]) nlen++;
+    if (nlen < 5 ||
+        fi->FileName[nlen-5] != L'.' || fi->FileName[nlen-4] != L'k' ||
+        fi->FileName[nlen-3] != L'e' || fi->FileName[nlen-2] != L'x' ||
+        fi->FileName[nlen-1] != L't') continue;
+
+    if (!kext_name_strip_suffix(fi->FileName, bare_name)) {
+      log_info(L"kext: name too long, skipping\r\n");
+      continue;
+    }
+
+    if (!kext_build_bundle_path8(bundle_base, bare_name,
+                                 bundle_path, sizeof(bundle_path))) {
+      log_info(L"kext %s: bundle path too long\r\n", bare_name);
+      continue;
+    }
+
+    s = open_subdir(ext_dir, fi->FileName, &kext_dir);
+    if (EFI_ERROR(s)) {
+      log_info(L"kext %s: open dir failed (%r)\r\n", bare_name, s);
+      continue;
+    }
+
+    is_system_kext =
+      (bare_name[0] == L'S' && bare_name[1] == L'y' &&
+       bare_name[2] == L's' && bare_name[3] == L't' &&
+       bare_name[4] == L'e' && bare_name[5] == L'm' &&
+       bare_name[6] == L'\0');
+
+    kext_load_one(ctx, kexts, kext_dir, bare_name, bundle_path,
+                  is_system_kext ? KEXT_LAYOUT_FLAT : layout);
+
+    if (is_system_kext) {
+      EFI_FILE_PROTOCOL *plugins_dir = NULL;
+      s = open_subdir(kext_dir, L"PlugIns", &plugins_dir);
+      if (!EFI_ERROR(s)) {
+        kext_enum_dir(ctx, kexts, plugins_dir,
+                      "/System/Library/Extensions/System.kext/PlugIns",
+                      KEXT_LAYOUT_FLAT);
+        uefi_call_wrapper(plugins_dir->Close, 1, plugins_dir);
+      } else {
+        log_info(L"System.kext: no PlugIns dir (%r)\r\n", s);
+      }
+    }
+
+    uefi_call_wrapper(kext_dir->Close, 1, kext_dir);
+  }
+
+  uefi_call_wrapper(ctx->bs->FreePool, 1, fi);
+}
+
+EFI_STATUS boot_load_kexts(AppContext *ctx, DtKextList *kexts)
+{
+  EFI_FILE_PROTOCOL *ext_dir = NULL;
+  EFI_STATUS         s;
+
+  if (!ctx || !kexts)
+    return EFI_INVALID_PARAMETER;
+
+  kexts->count = 0;
+
+  if (EFI_ERROR(kext_region_reserve(ctx)))
+    return EFI_OUT_OF_RESOURCES;
+
+  s = dir_open_from_any_volume(ctx, L"\\EFI\\BOOT\\Extensions", &ext_dir);
+  if (EFI_ERROR(s)) {
+    log_info(L"boot_load_kexts: Extensions dir not found (%r)\r\n", s);
+    return s;
+  }
+
+  kext_enum_dir(ctx, kexts, ext_dir,
+                "/System/Library/Extensions",
+                KEXT_LAYOUT_CONTENTS);
+
+  uefi_call_wrapper(ext_dir->Close, 1, ext_dir);
+
+  log_info(L"boot_load_kexts: loaded %u kexts\r\n", kexts->count);
+  return EFI_SUCCESS;
+}
+
+/*
+ * Sort the EFI memory map ascending by PhysicalStart, in place.
+ *
+ * boot.efi calls SortMemoryMap around SetVirtualAddressMap; an ordered map is
+ * what XNU's efi_init walks and lets us assign a single monotonically-increasing
+ * packed virtual range.  Runs AFTER ExitBootServices, so it must not use any
+ * BootServices call, CopyMem here is the loader's own XnuCopyMem.  descriptor
+ * records are ~48 bytes; guard against anything larger than the temp buffer.
+ */
+static VOID boot_sort_memory_map(UINT8 *map, UINTN map_sz, UINTN desc_sz) {
+  if (!map || desc_sz == 0)
+    return;
+  UINTN n = map_sz / desc_sz;
+  UINT8 tmp[512];
+  if (desc_sz > sizeof(tmp))
+    return; /* would overflow tmp; leave unsorted rather than corrupt */
+
+  for (UINTN i = 1; i < n; i++) {
+    CopyMem(tmp, map + i * desc_sz, desc_sz);
+    UINT64 key = ((EFI_MEMORY_DESCRIPTOR *)tmp)->PhysicalStart;
+    INTN j = (INTN)i - 1;
+    while (j >= 0 &&
+           ((EFI_MEMORY_DESCRIPTOR *)(map + (UINTN)j * desc_sz))->PhysicalStart > key) {
+      CopyMem(map + ((UINTN)j + 1) * desc_sz, map + (UINTN)j * desc_sz, desc_sz);
+      j--;
+    }
+    CopyMem(map + ((UINTN)j + 1) * desc_sz, tmp, desc_sz);
+  }
+}
+
 EFI_STATUS exit_boot_services_retry(
     AppContext *ctx,
     EFI_HANDLE image,
@@ -413,6 +1179,15 @@ EFI_STATUS exit_boot_services_retry(
     return status;
 
   boot_update_args_memory_map(ctx, state);
+
+  {
+    UINT64 dbg_kaddr = 0x100000ULL + ctx->kslide;
+    UINT64 dbg_kend  = dbg_kaddr + state->args->ksize;
+    log_info(L"  SVAM dbg: kaddr=0x%lx ksize=0x%x kend=0x%lx bootinfo=[0x%lx,0x%lx) rt_va_base=0x%lx\r\n",
+             dbg_kaddr, state->args->ksize, dbg_kend,
+             (UINT64)XNU_BOOTINFO_BASE, (UINT64)XNU_BOOTINFO_END,
+             (UINT64)XNU_RT_VA_BASE);
+  }
 
   for (;;) {
     UINTN map_size = state->memory_map_buf.pages << EFI_PAGE_SHIFT;
@@ -462,8 +1237,111 @@ EFI_STATUS exit_boot_services_retry(
         image,
         key);
 
-    if (status == EFI_SUCCESS)
+    if (status == EFI_SUCCESS) {
+      /*
+       * Call SetVirtualAddressMap now that boot services are gone.
+       *
+       * Assign EFI runtime virtual addresses the way boot.efi does: a single
+       * CONTIGUOUS, PACKED range placed just above the kernel image, in
+       * ascending physical order.  This is the only scheme that satisfies BOTH
+       * constraints imposed by XNU's efi_init (osfmk/i386/AT386/model_dep.c):
+       *
+       *   - efi_init maps each runtime descriptor with pmap_map_bd(), which
+       *     requires the target VA to already have a page-table page and
+       *     PANICS ("pmap_map_bd: Invalid kernel address") otherwise.  The
+       *     bootstrap kernel pmap only has NKPT (=500) page tables, covering
+       *     VA [KERNEL_BASE, KERNEL_BASE + 500*2MB) = up to +0x3E800000.  So a
+       *     runtime VA must be BELOW 0x3E800000.  (A per-descriptor
+       *     PhysicalStart & 0x3FFFFFFF map fails here: a runtime page at phys
+       *     ~0x3eb3f000 lands just past the NKPT edge.)
+       *   - efi_init OR-s low VAs into VM_MIN_KERNEL_ADDRESS and maps
+       *     VirtualStart -> PhysicalStart in the kernel's own address space, so
+       *     the VA must NOT overlap the kernel image [kaddr, kaddr+ksize) or it
+       *     clobbers kernel text.
+       *
+       * The window (kaddr+ksize, 0x3E800000) has page tables (NKPT) with empty
+       * PTEs, so packing there is both PT-backed and collision-free.  Pages are
+       * not moved physically; only their VA mapping is assigned.
+       */
+      EFI_RUNTIME_SERVICES *rt = ctx->st->RuntimeServices;
+      UINT8 *rmap = (UINT8 *)state->memory_map_buf.ptr;
+      UINTN rdesc_sz = state->descriptor_size;
+      UINTN rmap_sz  = state->memory_map_size;
+
+      boot_sort_memory_map(rmap, rmap_sz, rdesc_sz);
+
+      /*
+       * Pack base = 2MB-aligned first VA above the kernel image, then EXTEND
+       * ksize so XNU's physfree (= kaddr + ksize) covers the packed range.
+       * XNU only keeps bootstrap page tables for [0, physfree), Idle_PTs_release
+       * frees the rest before efi_init runs, so runtime VAs MUST live below
+       * physfree.  By growing ksize we make the runtime region "part of the
+       * kernel": its PT pages survive, its PTEs are identity-filled by pstart,
+       * and efi_init remaps them to the real runtime physical pages.  This is
+       * boot.efi's AllocKernelMem-region trick without physically moving pages.
+       */
+      /*
+       * IMPORTANT: state->args->kaddr here is the STAGING host_base (high RAM,
+       * ~0x7A8B4000) where segments were parked -- NOT where XNU runs.  main.c
+       * copies the image to the SLID base 0x100000 + kslide AFTER EBS and sets
+       * args->kaddr to that.  XNU derives physfree and its bootstrap page
+       * tables from that slid base, so the runtime VA window MUST be computed
+       * relative to it, otherwise pmap_map_bd sees VAs with no page table.
+       */
+      UINT64 kaddr    = 0x100000ULL + ctx->kslide;
+      /*
+       * Pack runtime VAs above the boot-info block (XNU_RT_VA_BASE), not just
+       * above the kernel image: the boot-info block [XNU_BOOTINFO_BASE,
+       * XNU_BOOTINFO_END) holds boot_args/DT/EFI-tables/memmap and must not be
+       * clobbered by efi_init's runtime PTE writes.
+       */
+      UINT64 va_base  = XNU_RT_VA_BASE;
+
+      UINT64 va_cursor   = va_base;
+      UINT32 rmin_virt_pg = 0xFFFFFFFFU;
+      for (UINTN roff = 0; roff + rdesc_sz <= rmap_sz; roff += rdesc_sz) {
+        EFI_MEMORY_DESCRIPTOR *d = (EFI_MEMORY_DESCRIPTOR *)(rmap + roff);
+        if (!(d->Attribute & EFI_MEMORY_RUNTIME))
+          continue;
+
+        BOOLEAN pack = (d->Type == EfiRuntimeServicesCode ||
+                d->Type == EfiRuntimeServicesData ||
+                d->Type == EfiMemoryMappedIO ||
+                d->Type == EfiMemoryMappedIOPortSpace);
+
+        if (pack) {
+          UINT64 sz = (UINT64)d->NumberOfPages << EFI_PAGE_SHIFT;
+          d->VirtualStart = va_cursor;
+          va_cursor += sz;
+        } else {
+          /* Identity: VA == PA. efi_init OR-s VM_MIN_KERNEL_ADDRESS on
+          * any VA below it, landing safely within the NKPT window. */
+          d->VirtualStart = d->PhysicalStart;
+        }
+
+        UINT32 vpg = (UINT32)(d->VirtualStart >> EFI_PAGE_SHIFT);
+        if (vpg < rmin_virt_pg) rmin_virt_pg = vpg;
+      }
+
+      /* Grow ksize so physfree covers the packed runtime region (2MB-rounded). */
+      UINT64 new_kend = (va_cursor + 0x1FFFFFULL) & ~0x1FFFFFULL;
+      state->args->ksize = (UINT32)(new_kend - kaddr);
+
+      rt->SetVirtualAddressMap(rmap_sz, rdesc_sz,
+                               state->descriptor_version,
+                               (EFI_MEMORY_DESCRIPTOR *)rmap);
+
+      /* Update boot_args: virtual page start only.
+       * efiSystemTable was already set to the conventional-memory copy
+       * (tbl_phys) before EBS; that address is in XNU's physmap and
+       * needs no adjustment after SVAM. */
+      if (state->args) {
+        if (rmin_virt_pg != 0xFFFFFFFFU)
+          state->args->efiRuntimeServicesVirtualPageStart = rmin_virt_pg;
+      }
+
       return EFI_SUCCESS;
+    }
 
     __asm__ volatile ("sti");
 

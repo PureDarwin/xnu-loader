@@ -24,17 +24,27 @@ jump_to_xnu:
     lgdt 0(%rsp)
     add $16, %rsp
 
-    /* clear FS/GS base MSRs */
+    /* stash entry + boot_args in callee-saved regs before lretq */
+    mov %rdi, %rbx /* entry_phys */
+    mov %rsi, %rbp /* boot_args */
+
+    /* load 32-bit flat data segments in 64-bit mode so the descriptor
+     * cache picks up base=0 from the GDT before the far jump.
+     * In 64-bit mode this does not update GS_BASE MSR, that MSR is
+     * cleared separately below so OVMF's value doesn't survive. */
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %fs
+    mov %ax, %gs
+
+    /* clear GS_BASE MSR, OVMF leaves a non-zero value */
     xor %eax, %eax
     xor %edx, %edx
     mov $0xC0000101, %ecx
     wrmsr
     mov $0xC0000102, %ecx
     wrmsr
-
-    /* stash entry + boot_args in callee-saved regs before lretq */
-    mov %rdi, %rbx /* entry_phys */
-    mov %rsi, %rbp /* boot_args */
 
     /* far jump into 32-bit compat CS */
     pushq $0x08
@@ -45,6 +55,7 @@ jump_to_xnu:
 
 .code32
 compat32:
+    /* set data segments now that we're in 32-bit mode (base comes from GDT) */
     mov $0x10, %ax
     mov %ax, %ds
     mov %ax, %es
@@ -52,6 +63,20 @@ compat32:
     mov %ax, %gs
     mov %ax, %ss
 
+    /* disable paging, matches Apple boot.efi trampoline */
+    mov %cr0, %eax
+    and $0x7fffffff, %eax
+    mov %eax, %cr0
+
+    /* clear EFER.LME, exit long mode entirely */
+    mov $0xC0000080, %ecx
+    rdmsr
+    and $0xfffffeff, %eax
+    wrmsr
+
+    /* pipeline flush */
+    jmp 1f
+1:
     mov %ebp, %eax
     jmp *%ebx
 
