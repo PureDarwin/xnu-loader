@@ -136,12 +136,7 @@ VOID boot_update_args_memory_map(AppContext *ctx, BootArgsState *state);
 
 EFI_STATUS boot_set_command_line(BootArgsState *state,  boot_args *args, const CHAR8 *cmdline);
 
-EFI_STATUS boot_build_args(AppContext *ctx, const CHAR8 *cmdline, MachoLoadResult *load_result, BootArgsState *state, DtKextList *kexts);
-
-/* Load kext binaries from \EFI\BOOT\Extensions\<Name>\info.plist and binary.
- * Allocates EfiLoaderData pages for each kext's Info.plist, executable, bundle
- * path, and _BooterKextFileInfo descriptor.  Fill kexts->entries[]. */
-EFI_STATUS boot_load_kexts(AppContext *ctx, DtKextList *kexts);
+EFI_STATUS boot_build_args(AppContext *ctx, const CHAR8 *cmdline, MachoLoadResult *load_result, BootArgsState *state);
 
 EFI_STATUS boot_fill_video(AppContext *ctx, boot_args *args);
 

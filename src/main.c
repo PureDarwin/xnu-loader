@@ -250,17 +250,8 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     return status;
   }
 
-  log_info(L"[B] before boot_load_kexts\r\n");
-
-  DtKextList kext_list;
-  SetMem(&kext_list, sizeof(kext_list), 0);
-  status = boot_load_kexts(&ctx, &kext_list);
-  if (EFI_ERROR(status))
-    log_error(L"boot_load_kexts: %r (continuing without kexts)\r\n", status);
-
-  log_info(L"[B2] before boot_build_args (%u kexts)\r\n", kext_list.count);
-  status = boot_build_args(&ctx, "-v debug=0x219 -nogzalloc_mode startup_debug=1 -l=1 keepsyms=1",
-                           &load_result, &boot_state, &kext_list);
+  status = boot_build_args(&ctx, "-v debug=0x219 -nogzalloc_mode startup_debug=1 -l=1 keepsyms=1 serial=3",
+                           &load_result, &boot_state);
   if (EFI_ERROR(status)) {
     log_error(L"failed to build boot_args: %r\r\n", status);
     return status;

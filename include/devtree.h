@@ -29,35 +29,12 @@ VOID dt_add_child(AppContext *ctx, DeviceTreeNode *parent, DeviceTreeNode *child
 
 UINT32 dt_flatten_node(DeviceTreeNode *node, UINT8 *buf);
 
-#define DT_MAX_KEXTS 32
-
-typedef struct {
-  UINT32 infoDictPhysAddr;
-  UINT32 infoDictLength;
-  UINT32 executablePhysAddr;
-  UINT32 executableLength;
-  UINT32 bundlePathPhysAddr;
-  UINT32 bundlePathLength;
-} DtBooterKextFileInfo;
-
-typedef struct {
-  DtBooterKextFileInfo info;
-  UINT32 infoStructPhysAddr;
-  CHAR8  dtName[DT_MAX_NAME];
-} DtKextEntry;
-
-typedef struct {
-  DtKextEntry entries[DT_MAX_KEXTS];
-  UINT32 count;
-} DtKextList;
-
 EFI_STATUS dt_build(
     AppContext *ctx,
     VOID **out_blob,
     UINT32 *out_size,
     LowMemBuffer *out_buf,
     const CHAR8 *boot_args,
-    DtKextList *kexts,
     UINT64 rt_table_phys);   /* physical addr of EFI_RUNTIME_SERVICES copy in conventional memory */
 
 #endif

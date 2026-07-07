@@ -19,16 +19,12 @@
  * AllocateKernelMemory scheme.
  *
  * The kernel image lands at [0x100000, ~0x1779000); this block sits above it.
- * The booter-kext blobs (info structs, Info.plists, binaries, bundle paths)
- * ALSO must be reachable via ml_static_ptovirt for XNU's readBooterExtensions,
- * so they go in a second low reserved region (XNU_KEXTS_*) below physfree too.
- * Runtime-services VAs are packed above ALL of that (see boot.c SVAM) starting
- * at XNU_RT_VA_BASE; ksize is inflated so physfree covers everything.
+ * Runtime-services VAs are packed above it (see boot.c SVAM) starting at
+ * XNU_RT_VA_BASE; ksize is inflated so physfree covers everything.
  *
  * Layout (phys):
- *   [0x100000, ~0x1b02000)   kernel image (KC-with-kexts extends this far)
+ *   [0x100000, ~0x1b02000)   kernel image (fileset KC extends this far)
  *   [0x2800000, 0x2820000)   boot-info block (boot_args/tables/DT/memmap)
- *   [0x2900000, 0x3100000)   booter-kext blobs (8MB bump region; unused for KC)
  *   [0x3200000, va_cursor)   runtime-services VA pack; physfree = round_up(va_cursor)
  */
 #define XNU_BOOTINFO_BASE       0x2800000ULL   /* 2MB-aligned, above KC image  */
@@ -37,10 +33,7 @@
 #define XNU_DEVTREE_PHYS        (XNU_BOOTINFO_BASE + 0x02000) /* 2 pages      */
 #define XNU_MEMMAP_PHYS         (XNU_BOOTINFO_BASE + 0x10000) /* up to 16 pg  */
 #define XNU_BOOTINFO_END        (XNU_BOOTINFO_BASE + 0x20000) /* 128KB block  */
-#define XNU_KEXTS_PHYS          0x2900000ULL   /* booter-kext blob region     */
-#define XNU_KEXTS_SIZE          0x800000ULL    /* 8 MB, bump-allocated        */
-#define XNU_KEXTS_END           (XNU_KEXTS_PHYS + XNU_KEXTS_SIZE)
-#define XNU_RT_VA_BASE          0x3200000ULL   /* runtime pack base, > kexts  */
+#define XNU_RT_VA_BASE          0x3200000ULL   /* runtime-services VA pack base */
 
 /*
  * GNU-EFI 4.x marks CopyMem_1 and SetMem as EFIAPI (__attribute__((ms_abi))),

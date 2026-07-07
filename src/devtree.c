@@ -270,7 +270,6 @@ EFI_STATUS dt_build(
     UINT32 *out_size,
     LowMemBuffer *out_buf,
     const CHAR8 *boot_args,
-    DtKextList *kexts,
     UINT64 rt_table_phys)
 {
   if (!ctx || !out_blob || !out_size || !out_buf || !boot_args)
@@ -503,20 +502,6 @@ EFI_STATUS dt_build(
     UINT32 io_fde_user_matched  = 0;
     dt_prop_u32(ctx, chosen, "IOScreenLockState", io_screen_lock_state);
     dt_prop_u32(ctx, chosen, "IOFDEUserMatched", io_fde_user_matched);
-  }
-
-  /* /chosen/memory-map child (only when kexts are loaded) */
-  if (kexts && kexts->count > 0) {
-    DeviceTreeNode *mmap = dt_create_node(ctx);
-    dt_prop_str(ctx, mmap, "name", "memory-map");
-    for (UINT32 ki = 0; ki < kexts->count; ki++) {
-      DtKextEntry *ke = &kexts->entries[ki];
-      UINT32 dtbuf[2];
-      dtbuf[0] = ke->infoStructPhysAddr;
-      dtbuf[1] = (UINT32)sizeof(DtBooterKextFileInfo);
-      dt_prop(ctx, mmap, ke->dtName, dtbuf, (UINT32)sizeof(dtbuf));
-    }
-    dt_add_child(ctx, chosen, mmap);
   }
 
   DeviceTreeNode *platform = dt_create_node(ctx);
