@@ -6,8 +6,6 @@
 #include "macho.h"
 #include "jump.h"
 
-//#define KASLR_ENABLED
-
 EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes) {
   EFI_PHYSICAL_ADDRESS base = 0x7FFFFFFF;
   UINTN total_pages = (UINTN)((span_bytes + EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT);
@@ -41,7 +39,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   if (EFI_ERROR(status))
     return status;
 
-  log_info(L"XNU EFI loader start [BUILD-A]\r\n");
+  log_info(L"XNU EFI loader start\r\n");
 
   {
     EFI_LOADED_IMAGE *li = NULL;
@@ -119,29 +117,6 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   /* phys_base = staging address; post-EBS copy moves it to 0x100000 */
   ctx.phys_base = ctx.kernel_region_base;
 
-  /* Dump memory map around phys_base before AllocateAddress */
-  {
-    UINTN map_size = 0, key = 0, desc_size = 0;
-    UINT32 desc_ver = 0;
-    EFI_MEMORY_DESCRIPTOR *mm = NULL;
-    uefi_call_wrapper(ctx.bs->GetMemoryMap, 5, &map_size, mm, &key, &desc_size, &desc_ver);
-    map_size += desc_size * 4;
-    uefi_call_wrapper(ctx.bs->AllocatePool, 3, EfiLoaderData, map_size, (VOID **)&mm);
-    if (mm) {
-      uefi_call_wrapper(ctx.bs->GetMemoryMap, 5, &map_size, mm, &key, &desc_size, &desc_ver);
-      UINTN nm = map_size / desc_size;
-      for (UINTN mi = 0; mi < nm; mi++) {
-        EFI_MEMORY_DESCRIPTOR *d = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)mm + mi * desc_size);
-        UINT64 s = d->PhysicalStart;
-        UINT64 e = s + ((UINT64)d->NumberOfPages << EFI_PAGE_SHIFT);
-        if (e >= 0x80000 && s <= 0x2000000)
-          log_info(L"memmap: type=%u 0x%lx-0x%lx pages=%lu\r\n",
-                   d->Type, s, e, d->NumberOfPages);
-      }
-      uefi_call_wrapper(ctx.bs->FreePool, 1, mm);
-    }
-  }
-
   /* Single contiguous allocation at phys_base, matching Apple's model */
   status = macho_load_segments_contiguous(&ctx, &image_info, ctx.phys_base, &load_result);
   if (EFI_ERROR(status)) {
@@ -206,8 +181,6 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
 
   log_info(L"entry vm=0x%lx -> host=0x%lx\r\n", entry_vmaddr, (UINT64)(UINTN)host_entry);
 
-  log_info(L"[A] before boot_collect_memory_map\r\n");
-
   BootArgsState boot_state = {0};
 
   status = boot_collect_memory_map(&ctx, &boot_state);
@@ -253,24 +226,6 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     return status;
   }
 
-  /* Diagnostic: raw file bytes and staged bytes at HIB+0x3610 */
-  {
-    UINT8 *raw = (UINT8 *)kernel.data + 0x11b2610;
-    log_info(L"raw[0x11b2610]: %02x %02x %02x %02x %02x %02x %02x %02x\r\n",
-             raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
-    for (UINT32 _si = 0; _si < load_result.segment_count; _si++) {
-      MachoLoadedSegment *_seg = &load_result.segments[_si];
-      if (_seg->name[0]=='_' && _seg->name[1]=='_' &&
-          _seg->name[2]=='H' && _seg->name[3]=='I' && _seg->name[4]=='B') {
-        UINT8 *stg = (UINT8 *)_seg->host_addr + 0x3610;
-        log_info(L"stg[HIB+0x3610]: %02x %02x %02x %02x %02x %02x %02x %02x\r\n",
-                 stg[0], stg[1], stg[2], stg[3], stg[4], stg[5], stg[6], stg[7]);
-        break;
-      }
-    }
-  }
-
-  log_info(L"[D] before exit_boot_services\r\n");
   log_info(L"boot_args phys = 0x%lx\r\n", (UINT64)(UINTN)boot_state.args);
   log_info(L"stack_top = 0x%lx\r\n",      (UINT64)(UINTN)stack_top);
   log_info(L"entry     = 0x%lx\r\n",      (UINT64)(UINTN)host_entry);
