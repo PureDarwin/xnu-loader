@@ -175,9 +175,11 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     return status;
   }
 
+#ifdef VERBOSE_MACHO
   macho_log_entry_context(&image_info, entry_vmaddr);
   macho_log_section_host_info(&image_info, &load_result, "__HIB", "__bootPT");
   macho_dump_entry_bytes(host_entry, 32);
+#endif // VERBOSE_MACHO
 
   log_info(L"entry vm=0x%lx -> host=0x%lx\r\n", entry_vmaddr, (UINT64)(UINTN)host_entry);
 
@@ -213,7 +215,9 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   VOID *stack_top = (VOID *)((UINT8 *)(UINTN)stack_base +
                              (stack_pages << EFI_PAGE_SHIFT) - 16);
 
+#ifdef VERBOSE_BOOT
   boot_log_args(&boot_state);
+#endif // VERBOSE_BOOT
 
   /* Reserve pages in the boot-info block (phys >= 0x100000) for the post-EBS
    * memory map relocation, so the map XNU walks survives pmap_lowmem_finalize
@@ -226,9 +230,12 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     return status;
   }
 
+#ifdef VERBOSE_BOOT
+  log_info(L"[D] before exit_boot_services\r\n");
   log_info(L"boot_args phys = 0x%lx\r\n", (UINT64)(UINTN)boot_state.args);
   log_info(L"stack_top = 0x%lx\r\n",      (UINT64)(UINTN)stack_top);
   log_info(L"entry     = 0x%lx\r\n",      (UINT64)(UINTN)host_entry);
+#endif // VERBOSE_BOOT
 
   /* No logging after this point */
   status = exit_boot_services_retry(&ctx, image, &boot_state);

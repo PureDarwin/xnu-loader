@@ -249,7 +249,6 @@ EFI_STATUS boot_build_args(
   if (state->args != NULL)
     return EFI_ALREADY_STARTED;
 
-  log_info(L"[B0a] alloc_pages\r\n");
   {
     EFI_PHYSICAL_ADDRESS args_phys = XNU_BOOTARGS_PHYS;
     status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
@@ -271,7 +270,6 @@ EFI_STATUS boot_build_args(
   state->args = args;
   state->args_buf = args_buf;
 
-  log_info(L"[B0b] set command line\r\n");
   status = boot_set_command_line(state, args, cmdline);
   if (EFI_ERROR(status))
     return status;
@@ -324,10 +322,6 @@ EFI_STATUS boot_build_args(
         st_copy->NumberOfTableEntries = ctx->st->NumberOfTableEntries;
         log_info(L"EFI config table: %lu entries copied to 0x%lx\r\n",
                  ctx->st->NumberOfTableEntries, (UINT64)(UINTN)cfg_copy);
-        for (UINTN ci = 0; ci < ctx->st->NumberOfTableEntries; ci++) {
-          log_info(L"  cfg[%lu]: vendor=%lx\r\n",
-                   ci, (UINT64)(UINTN)cfg_copy[ci].VendorTable);
-        }
       }
 
       /* Recompute the EFI_SYSTEM_TABLE CRC32 after modifying RuntimeServices
@@ -382,7 +376,6 @@ EFI_STATUS boot_build_args(
     args->csrActiveConfig = 0;
   }
 
-  log_info(L"[B0c] dt_build\r\n");
   if (state->device_tree == NULL) {
     status = dt_build(
         ctx,
@@ -397,7 +390,6 @@ EFI_STATUS boot_build_args(
     }
   }
 
-  log_info(L"[B0d] field assignments\r\n");
   /* boot.efi sets Revision=kBootArgsRevision=1 and Version=kBootArgsVersion2=2.
    * XNU checks Version to select struct layout; Version=2 enables efiMode/flags. */
   args->Revision = 1;
@@ -413,9 +405,7 @@ EFI_STATUS boot_build_args(
   args->MemoryMapSize = (UINT32)state->memory_map_size;
   args->MemoryMapDescriptorSize = (UINT32)state->descriptor_size;
   args->MemoryMapDescriptorVersion = state->descriptor_version;
-  log_info(L"[B1] before app_detect_physical_memory_size\r\n");
   args->PhysicalMemorySize = app_detect_physical_memory_size(ctx);
-  log_info(L"[B2] PhysicalMemorySize=0x%lx\r\n", args->PhysicalMemorySize);
 
   args->deviceTreeP = (UINT32)(UINTN)state->device_tree;
   args->deviceTreeLength = state->device_tree_size;
@@ -450,8 +440,6 @@ EFI_STATUS boot_build_args(
     }
   }
 
-
-  log_info(L"[B3] before boot_fill_video\r\n");
   status = boot_fill_video(ctx, args);
   if (EFI_ERROR(status)) {
     lowmem_free(ctx, &args_buf);
@@ -461,11 +449,13 @@ EFI_STATUS boot_build_args(
   state->args = args;
   state->args_buf = args_buf;
 
+#ifdef VERBOSE_BOOT
   log_info(L"sizeof(boot_args) = 0x%lx\r\n", (UINT64)sizeof(boot_args));
   log_info(L"boot_args low phys = 0x%lx\r\n", (UINT64)state->args_buf.phys);
   log_info(L"device_tree low phys = 0x%lx\r\n", (UINT64)state->device_tree_buf.phys);
   log_info(L"memory_map ptr  = 0x%lx\r\n", (UINT64)(UINTN)state->memory_map);
   log_info(L"memory_map phys = 0x%lx\r\n", (UINT64)state->memory_map_buf.phys);
+#endif // VERBOSE_BOOT
 
   return EFI_SUCCESS;
 }
@@ -485,8 +475,6 @@ EFI_STATUS boot_fill_video(
       &gEfiGraphicsOutputProtocolGuid,
       NULL,
       (VOID **)&gop);
-
-  log_info(L"GOP LocateProtocol status=%r\r\n", status);
 
   if (EFI_ERROR(status))
     return EFI_NOT_FOUND;
@@ -543,8 +531,10 @@ EFI_STATUS boot_fill_video(
 
   UINT8 pixel_fmt = (UINT8)gop->Mode->Info->PixelFormat;
 
+#ifdef VERBOSE_BOOT
   log_info(L"boot_fill_video: %ux%u stride=%u fb=0x%lx pixfmt=%u\r\n",
            width, height, stride, fb_base, (UINT32)pixel_fmt);
+#endif // VERBOSE_BOOT
 
   /* This extended Boot_Video (offset 1192, 64-bit v_baseAddr at 1240) is the
    * struct XNU's PE_init_platform actually consumes.  v_rotate is the DISPLAY
@@ -673,15 +663,6 @@ EFI_STATUS exit_boot_services_retry(
     return status;
 
   boot_update_args_memory_map(ctx, state);
-
-  {
-    UINT64 dbg_kaddr = 0x100000ULL + ctx->kslide;
-    UINT64 dbg_kend  = dbg_kaddr + state->args->ksize;
-    log_info(L"  SVAM dbg: kaddr=0x%lx ksize=0x%x kend=0x%lx bootinfo=[0x%lx,0x%lx) rt_va_base=0x%lx\r\n",
-             dbg_kaddr, state->args->ksize, dbg_kend,
-             (UINT64)XNU_BOOTINFO_BASE, (UINT64)XNU_BOOTINFO_END,
-             (UINT64)XNU_RT_VA_BASE);
-  }
 
   for (;;) {
     UINTN map_size = state->memory_map_buf.pages << EFI_PAGE_SHIFT;
