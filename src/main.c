@@ -8,38 +8,7 @@
 
 //#define KASLR_ENABLED
 
-static UINT32 KASLRSlideUnitToBytes(UINT8 unit) {
-  UINT32 result = (UINT32)unit << 21; /* unit * 2MB, baseline */
-
-  if (unit & 0x80) {
-    /* CPUID leaf 1, detect Sandy Bridge / Ivy Bridge */
-    UINT32 eax = 0;
-    __asm__ volatile("cpuid" : "=a"(eax) : "a"(1) : "ebx", "ecx", "edx");
-
-    UINT32 base_model   = (eax >>  4) & 0xF;
-    UINT32 base_family  = (eax >>  8) & 0xF;
-    UINT32 ext_model  = (eax >> 16) & 0xF;
-    UINT32 ext_family   = (eax >> 20) & 0xFF;
-
-    /* Standard Intel display-family / display-model */
-    UINT32 family = (base_family != 0xF) ? base_family
-                        : (base_family + ext_family);
-    UINT32 model  = base_model;
-    if (family == 6 || family == 15)
-      model |= (ext_model << 4);
-
-    /* Sandy Bridge (0x2A) and Ivy Bridge (0x3A): bit 4 is "don't care"
-     * because 0x3A & ~0x10 == 0x2A.  Add a fixed +0x10200000 offset. */
-    if (family == 6 && (model & ~0x10U) == 0x2A)
-      result += 0x10200000U;
-  }
-
-  return result;
-}
-
 EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes) {
-  /* Allocate a HIGH staging buffer, OVMF occupies 0x800000-0x1780000 so
-   * AllocateAddress at 0x100000 would fail.  We copy to 0x100000 post-EBS. */
   EFI_PHYSICAL_ADDRESS base = 0x7FFFFFFF;
   UINTN total_pages = (UINTN)((span_bytes + EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT);
 
@@ -111,12 +80,9 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     return status;
   }
 
-  /* Pick KASLR slide: fixed 16KB slide matching Apple's g_kaslr_mode==2 path.
-   * Apple's GenerateKASLRSlide() uses cpuid which serializes the CPU and stalls
-   * in QEMU TCG; setting g_kaslr_mode==2 bypasses it with a fixed 0x4000 slide. */
   {
 #ifdef KASLR_ENABLED
-    ctx.kslide = 2 * KASLR_SLIDE_GRANULE;  /* 0x400000, 2MB-aligned */
+    ctx.kslide = 2 * KASLR_SLIDE_GRANULE;
     log_info(L"KASLR: fixed slide=0x%x\r\n", ctx.kslide);
 #else
     ctx.kslide = 0;
@@ -250,7 +216,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     return status;
   }
 
-  status = boot_build_args(&ctx, "-v debug=0x219 -nogzalloc_mode startup_debug=1 -l=1 keepsyms=1 serial=3",
+  status = boot_build_args(&ctx, "-v debug=0x219 -nogzalloc_mode keepsyms=1 serial=3",
                            &load_result, &boot_state);
   if (EFI_ERROR(status)) {
     log_error(L"failed to build boot_args: %r\r\n", status);

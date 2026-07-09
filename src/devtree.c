@@ -468,21 +468,8 @@ EFI_STATUS dt_build(
   /* booter-name: boot.efi writes "boot.efi" (9 bytes incl null) */
   dt_prop_str(ctx, chosen, "booter-name", "boot.efi");
 
-  /* booter-build-info: from boot.efi 495.140.2 binary */
-  {
-    static const CHAR8 binfo[] =
-      "BUILD-INFO[300]:{\"DisplayName\":\"boot.efi\","
-      "\"DisplayVersion\":\"495.140.2~49\","
-      "\"RecordUuid\":\"E1825ECA-9168-4C33-BEFA-0E978038B7D4\","
-      "\"BuildTime\":\"2022-08-29T05:07:17-0700\","
-      "\"ProjectName\":\"efiboot\","
-      "\"ProductName\":\"boot.efi\","
-      "\"SourceVersion\":\"495.140.2\","
-      "\"BuildVersion\":\"49\","
-      "\"BuildConfiguration\":\"Release\","
-      "\"BuildType\":\"Official\"}";
-    dt_prop_str(ctx, chosen, "booter-build-info", binfo);
-  }
+  static const CHAR8 binfo[] = "boot.efi";
+  dt_prop_str(ctx, chosen, "booter-build-info", binfo);
 
   /* machine-signature: 4 bytes from FACS.HardwareSignature.
    * boot.efi reads this from the FACP ACPI table's FACS pointer.
@@ -552,7 +539,6 @@ EFI_STATUS dt_build(
 
     DeviceTreeNode *child = dt_create_node(ctx);
 
-    /* name: GUID formatted as hex string (boot.efi uses sub_B055 for this) */
     {
       CHAR8 gname[37];
       EFI_GUID *g = &entry->VendorGuid;
@@ -596,10 +582,6 @@ EFI_STATUS dt_build(
    * After SVAM: virtual = phys & 0x3FFFFFFF for runtime-flagged pages.
    */
   {
-    /* Use the conventional-memory copy if boot.c already allocated it
-     * (rt_table_phys = tbl_phys+0x200); fall back to the original pointer
-     * only if the copy failed. XNU's physmap excludes EFI runtime pages after
-     * pmap_bootstrap, so using the original causes a fault on first access. */
     UINT64 rt_phys = rt_table_phys
         ? rt_table_phys
         : (UINT64)(UINTN)(ctx->st->RuntimeServices);
@@ -656,9 +638,9 @@ EFI_STATUS dt_build(
   *out_blob = (VOID *)(UINTN)dt_addr;
   *out_size = used;
 
-  out_buf->ptr   = (VOID *)(UINTN)dt_addr;
-  out_buf->phys  = dt_addr;
-  out_buf->size  = used;
+  out_buf->ptr = (VOID *)(UINTN)dt_addr;
+  out_buf->phys = dt_addr;
+  out_buf->size = used;
   out_buf->pages = 2;
 
   return EFI_SUCCESS;
