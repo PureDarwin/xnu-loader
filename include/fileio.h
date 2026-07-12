@@ -31,4 +31,15 @@ EFI_STATUS file_read_all_from_any_volume(
     FileBuffer *out_buf,
     EFI_HANDLE *out_handle);
 
+/* Netboot fallback: fetch `filename` (ASCII, relative to the TFTP server
+ * root - same root BOOTX64.EFI itself was served from) via the
+ * EFI_PXE_BASE_CODE_PROTOCOL instance the firmware installs on the image's
+ * own device handle when it was PXE-booted. Only usable when the firmware
+ * actually netbooted us; returns EFI_NOT_FOUND if no PXE Base Code protocol
+ * instance is present at all (e.g. booted from local media). */
+EFI_STATUS file_read_all_via_tftp(
+    AppContext *ctx,
+    CONST CHAR8 *filename,
+    FileBuffer *out_buf);
+
 #endif

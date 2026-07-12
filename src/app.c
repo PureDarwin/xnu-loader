@@ -1,5 +1,6 @@
 #include "app.h"
 #include "console.h"
+#include "serial.h"
 
 EFI_STATUS app_init(AppContext *ctx, EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   if (!st)
@@ -14,6 +15,10 @@ EFI_STATUS app_init(AppContext *ctx, EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   ctx->rt = st->RuntimeServices;
 
   InitializeLib(image, st);
+
+  /* Bring up COM3 @ 115200 before any logging so serial captures the full
+   * boot on real hardware (where there is no EFI console to read). */
+  serial_init();
 
   return EFI_SUCCESS;
 }

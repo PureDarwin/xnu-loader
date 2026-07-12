@@ -42,6 +42,7 @@ set(SOURCES
   src/jump.S
   src/lowmem.c
   src/macho.c
+  src/serial.c
 )
 
 add_library(loader_objs OBJECT ${SOURCES})

@@ -5,8 +5,8 @@
 #include <efilib.h>
 #include <string.h>
 
-//#define VERBOSE_MACHO
-//#define VERBOSE_BOOT
+#define VERBOSE_MACHO
+#define VERBOSE_BOOT
 //#define KASLR_ENABLED
 
 /*

@@ -57,7 +57,12 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
       &found_handle);
 
   if (EFI_ERROR(status)) {
-    log_error(L"failed to read kernel from any volume: %r\r\n", status);
+    log_info(L"no local kernel file (%r); trying TFTP (netboot)\r\n", status);
+    status = file_read_all_via_tftp(&ctx, (CONST CHAR8 *)"EFI/BOOT/kernel", &kernel);
+  }
+
+  if (EFI_ERROR(status)) {
+    log_error(L"failed to read kernel from any volume or TFTP: %r\r\n", status);
     return status;
   }
   ctx.boot_volume = found_handle;
@@ -137,7 +142,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
      * and the GDT descriptor base ARE in the local reloc table as negative
      * (signed) __DATA-relative entries, so macho_apply_kaslr_slide above
      * already patched them once r_address is treated as signed.  No separate
-     * pstart fixup is needed -- boot.efi doesn't do one either. */
+     * pstart fixup is needed, boot.efi doesn't do one either. */
 
     /* XNU rebuilds page tables from its embedded header; slide it too. */
     status = macho_patch_header_slide(&image_info, &load_result, ctx.kslide);
@@ -191,7 +196,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     return status;
   }
 
-  status = boot_build_args(&ctx, "-v debug=0x219 -nogzalloc_mode keepsyms=1 serial=3",
+  status = boot_build_args(&ctx, "-v debug=0x219 -nogzalloc_mode keepsyms=1 serial=3 gopconsole=1",
                            &load_result, &boot_state);
   if (EFI_ERROR(status)) {
     log_error(L"failed to build boot_args: %r\r\n", status);
@@ -273,23 +278,28 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   boot_state.args->kslide = ctx.kslide;
 
   /*
-   * Kernel collection (KC) support, "approach B" (kc-builder / loader-aware).
-   * The kernel keeps its own MH_EXECUTE header at fileoff 0 but carries the
-   * MH_DYLIB_IN_CACHE flag (so XNU's kernel_mach_header_is_in_fileset() is
-   * true).  The top-level MH_FILESET header lives in a private "__KCHDR"
-   * segment appended by kc-builder.  XNU rebases the KC in i386_init IFF
-   * boot_args->KC_hdrs_vaddr points at that MH_FILESET header (Version>=2,
-   * Revision>=1 already set).  We must NOT run our own KASLR reloc pass for a
-   * KC (already skipped at kslide==0).
+   * Kernel collection (KC) support. kc-builder converts the kernel's own
+   * mach_header_64 in place into the top-level MH_FILESET header (appending
+   * LC_FILESET_ENTRY/LC_DYLD_CHAINED_FIXUPS onto its existing load command
+   * list, reusing its existing LC_SEGMENT_64 entries) and sets
+   * MH_DYLIB_IN_CACHE (so XNU's kernel_mach_header_is_in_fileset() is true).
+   * kc_mh is therefore the exact same object as the kernel's own header,
+   * which lives at the start of whichever segment has fileoff==0 (__TEXT --
+   * NOT necessarily the lowest-vmaddr segment: here __HIB sits at a lower
+   * vmaddr than __TEXT despite coming later in the file, so phys_real/
+   * vm_base, which track the lowest vmaddr, point at the wrong segment for
+   * this). An earlier revision appended a synthetic "__KCHDR" wrapper
+   * elsewhere, which broke kernel_collection_slide()'s internal slide
+   * computation: see kc-tools/src/fileset.c's top-of-file comment for the
+   * full story. XNU rebases the KC in i386_init IFF boot_args->KC_hdrs_vaddr
+   * is set (Version>=2, Revision>=1 already set). We must NOT run our own
+   * KASLR reloc pass for a KC (already skipped at kslide==0).
    */
   if (image_info.header->flags & 0x80000000u /* MH_DYLIB_IN_CACHE */) {
     for (UINT32 si = 0; si < load_result.segment_count; si++) {
-      const CHAR8 *n = load_result.segments[si].name;
-      if (n[0]=='_' && n[1]=='_' && n[2]=='K' && n[3]=='C' &&
-          n[4]=='H' && n[5]=='D' && n[6]=='R' && n[7]=='\0') {
-        /* FINAL physical of __KCHDR after the staging->phys_real copy, NOT the
-         * staging phys_target: XNU reads the KC header here and computes all KC
-         * addresses relative to it. */
+      if (load_result.segments[si].fileoff == 0) {
+        /* Same uniform vmaddr->physical delta the loader used for every
+         * segment (phys_real is anchored to vm_base = lowest vmaddr). */
         boot_state.args->KC_hdrs_vaddr =
             phys_real + (load_result.segments[si].vmaddr - vm_base);
         break;

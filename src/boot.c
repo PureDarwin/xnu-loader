@@ -538,7 +538,7 @@ EFI_STATUS boot_fill_video(
 
   /* This extended Boot_Video (offset 1192, 64-bit v_baseAddr at 1240) is the
    * struct XNU's PE_init_platform actually consumes.  v_rotate is the DISPLAY
-   * ROTATION (0/1/2/3 = 0/90/180/270 deg) -- XNU swaps v_width/v_height when
+   * ROTATION (0/1/2/3 = 0/90/180/270 deg), XNU swaps v_width/v_height when
    * it is 1 or 3.  It is NOT the pixel format; it MUST be 0 or the panel is
    * rotated and the geometry transposed. */
   args->Video.v_display  = GRAPHICS_MODE;
@@ -757,7 +757,7 @@ EFI_STATUS exit_boot_services_retry(
        */
       /*
        * IMPORTANT: state->args->kaddr here is the STAGING host_base (high RAM,
-       * ~0x7A8B4000) where segments were parked -- NOT where XNU runs.  main.c
+       * ~0x7A8B4000) where segments were parked, NOT where XNU runs.  main.c
        * copies the image to the SLID base 0x100000 + kslide AFTER EBS and sets
        * args->kaddr to that.  XNU derives physfree and its bootstrap page
        * tables from that slid base, so the runtime VA window MUST be computed

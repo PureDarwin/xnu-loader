@@ -1,5 +1,6 @@
 #include "fileio.h"
 #include "app.h"
+#include <efi/efipxebc.h>
 
 EFI_STATUS file_open(
     EFI_FILE_PROTOCOL *root,
@@ -156,4 +157,108 @@ EFI_STATUS file_read_all_from_any_volume(
 
   uefi_call_wrapper(ctx->bs->FreePool, 1, handles);
   return EFI_NOT_FOUND;
+}
+
+EFI_STATUS file_read_all_via_tftp(
+    AppContext *ctx,
+    CONST CHAR8 *filename,
+    FileBuffer *out_buf) {
+  EFI_STATUS status;
+  EFI_HANDLE *handles = NULL;
+  UINTN handle_count = 0;
+  EFI_PXE_BASE_CODE_PROTOCOL *pxe = NULL;
+  EFI_IP_ADDRESS server_ip;
+  UINT64 file_size = 0;
+  VOID *buffer = NULL;
+  UINTN i;
+
+  if (!ctx || !filename || !out_buf)
+    return EFI_INVALID_PARAMETER;
+
+  out_buf->data = NULL;
+  out_buf->size = 0;
+
+  status = uefi_call_wrapper(
+      ctx->bs->LocateHandleBuffer,
+      5,
+      ByProtocol,
+      &gEfiPxeBaseCodeProtocolGuid,
+      NULL,
+      &handle_count,
+      &handles);
+  if (EFI_ERROR(status))
+    return EFI_NOT_FOUND;
+
+  for (i = 0; i < handle_count && !pxe; i++) {
+    EFI_PXE_BASE_CODE_PROTOCOL *candidate = NULL;
+    if (EFI_ERROR(uefi_call_wrapper(
+            ctx->bs->HandleProtocol,
+            3,
+            handles[i],
+            &gEfiPxeBaseCodeProtocolGuid,
+            (VOID **)&candidate)))
+      continue;
+    pxe = candidate;
+  }
+  uefi_call_wrapper(ctx->bs->FreePool, 1, handles);
+
+  if (!pxe)
+    return EFI_NOT_FOUND;
+
+  if (!pxe->Mode->Started) {
+    status = uefi_call_wrapper(pxe->Start, 2, pxe, FALSE);
+    if (EFI_ERROR(status))
+      return status;
+  }
+
+  if (!pxe->Mode->DhcpAckReceived) {
+    /* Firmware netbooted us, so it already ran DHCP itself; if for some
+     * reason no ack was captured there is no server IP to target. */
+    return EFI_NOT_FOUND;
+  }
+
+  SetMem(&server_ip, sizeof(server_ip), 0);
+  CopyMem(&server_ip.v4, pxe->Mode->DhcpAck.Dhcpv4.BootpSiAddr, 4);
+
+  status = uefi_call_wrapper(
+      pxe->Mtftp,
+      10,
+      pxe,
+      EFI_PXE_BASE_CODE_TFTP_GET_FILE_SIZE,
+      NULL,
+      FALSE,
+      &file_size,
+      NULL,
+      &server_ip,
+      (UINT8 *)filename,
+      NULL,
+      FALSE);
+  if (EFI_ERROR(status) || file_size == 0)
+    return EFI_ERROR(status) ? status : EFI_NOT_FOUND;
+
+  status = app_alloc_pool(ctx, (UINTN)file_size, &buffer);
+  if (EFI_ERROR(status))
+    return status;
+
+  status = uefi_call_wrapper(
+      pxe->Mtftp,
+      10,
+      pxe,
+      EFI_PXE_BASE_CODE_TFTP_READ_FILE,
+      buffer,
+      FALSE,
+      &file_size,
+      NULL,
+      &server_ip,
+      (UINT8 *)filename,
+      NULL,
+      FALSE);
+  if (EFI_ERROR(status)) {
+    app_free_pool(ctx, buffer);
+    return status;
+  }
+
+  out_buf->data = buffer;
+  out_buf->size = (UINTN)file_size;
+  return EFI_SUCCESS;
 }
