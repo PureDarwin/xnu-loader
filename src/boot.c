@@ -476,11 +476,16 @@ EFI_STATUS boot_fill_video(
       NULL,
       (VOID **)&gop);
 
-  if (EFI_ERROR(status))
-    return EFI_NOT_FOUND;
-
-  if (!gop || !gop->Mode || !gop->Mode->Info)
-    return EFI_DEVICE_ERROR;
+  /* No GOP (headless firmware, no display attached, UGA-only board, etc.):
+   * leave args->Video/VideoV1 zeroed (v_display=0) and continue - XNU boots
+   * fine on the serial console alone (serial=3 in the boot-args cmdline)
+   * without a framebuffer. Only actual protocol/mode errors after a GOP was
+   * located are treated as fatal, since those indicate a broken GOP rather
+   * than its absence. */
+  if (EFI_ERROR(status) || !gop || !gop->Mode || !gop->Mode->Info) {
+    log_info(L"boot_fill_video: no usable GOP (%r), continuing headless\r\n", status);
+    return EFI_SUCCESS;
+  }
 
   /* XNU needs a LINEAR framebuffer.  The firmware's current GOP mode is
    * normally the native panel resolution with a linear framebuffer, so keep it
@@ -511,15 +516,17 @@ EFI_STATUS boot_fill_video(
         }
       }
       if (best_mode == gop->Mode->MaxMode) {
-        log_error(L"boot_fill_video: current mode not linear and no linear mode found\r\n");
-        return EFI_DEVICE_ERROR;
+        log_info(L"boot_fill_video: current mode not linear and no linear mode "
+                 L"found, continuing headless\r\n");
+        return EFI_SUCCESS;
       }
       log_info(L"boot_fill_video: current mode not linear, switching to mode %u\r\n",
                best_mode);
       status = uefi_call_wrapper(gop->SetMode, 2, gop, best_mode);
       if (EFI_ERROR(status)) {
-        log_error(L"boot_fill_video: SetMode(%u) failed: %r\r\n", best_mode, status);
-        return EFI_DEVICE_ERROR;
+        log_info(L"boot_fill_video: SetMode(%u) failed: %r, continuing headless\r\n",
+                 best_mode, status);
+        return EFI_SUCCESS;
       }
     }
   }
