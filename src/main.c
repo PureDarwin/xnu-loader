@@ -196,8 +196,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     return status;
   }
 
-  status = boot_build_args(&ctx, "-v debug=0x219 -nogzalloc_mode keepsyms=1 serial=3 gopconsole=1 kextlog=0xffff io=0xffffffff",
-                           &load_result, &boot_state);
+  status = boot_build_args(&ctx, "-v debug=0x219 -nogzalloc_mode keepsyms=1 serial=3 gopconsole=1", &load_result, &boot_state);
   if (EFI_ERROR(status)) {
     log_error(L"failed to build boot_args: %r\r\n", status);
     return status;
