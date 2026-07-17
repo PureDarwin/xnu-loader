@@ -196,7 +196,41 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     return status;
   }
 
-  status = boot_build_args(&ctx, "-v debug=0x219 -nogzalloc_mode keepsyms=1 serial=3 gopconsole=1", &load_result, &boot_state);
+  CONST CHAR8 *cmdline = "-v debug=0x219 -nogzalloc_mode keepsyms=1 serial=3 gopconsole=1";
+  FileBuffer boot_args_file = {0};
+  EFI_STATUS args_status = file_read_all_from_any_volume(
+      &ctx,
+      L"\\EFI\\BOOT\\boot-args.txt",
+      &boot_args_file,
+      NULL);
+
+  if (!EFI_ERROR(args_status) && boot_args_file.size > 0) {
+    UINTN len = boot_args_file.size;
+    CHAR8 *bytes = (CHAR8 *)boot_args_file.data;
+    /* Trim trailing CR/LF/whitespace a text editor may have left. */
+    while (len > 0 &&
+           (bytes[len - 1] == '\n' || bytes[len - 1] == '\r' ||
+            bytes[len - 1] == ' '  || bytes[len - 1] == '\t'))
+      len--;
+
+    if (len > 0) {
+      CHAR8 *copy = NULL;
+      status = uefi_call_wrapper(ctx.bs->AllocatePool, 3, EfiLoaderData, len + 1, (VOID **)&copy);
+      if (!EFI_ERROR(status)) {
+        CopyMem(copy, bytes, len);
+        copy[len] = '\0';
+        cmdline = copy;
+        log_info(L"boot-args.txt: using \"%a\"\r\n", cmdline);
+      } else {
+        log_error(L"boot-args.txt: AllocatePool failed (%r), using default\r\n", status);
+      }
+    }
+    file_free(&ctx, &boot_args_file);
+  } else {
+    log_info(L"no boot-args.txt found (%r); using default boot args\r\n", args_status);
+  }
+
+  status = boot_build_args(&ctx, cmdline, &load_result, &boot_state);
   if (EFI_ERROR(status)) {
     log_error(L"failed to build boot_args: %r\r\n", status);
     return status;
