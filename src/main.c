@@ -6,6 +6,48 @@
 #include "macho.h"
 #include "jump.h"
 
+
+static EFI_STATUS ReserveBootInfoGuard(AppContext *ctx,
+                                       EFI_PHYSICAL_ADDRESS *guard_base,
+                                       UINTN *guard_pages) {
+  EFI_PHYSICAL_ADDRESS base = XNU_BOOTINFO_BASE;
+  UINTN pages = (UINTN)((XNU_BOOTINFO_END - XNU_BOOTINFO_BASE) >> EFI_PAGE_SHIFT);
+
+  EFI_STATUS status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
+      AllocateAddress, EfiLoaderData, pages, &base);
+  if (EFI_ERROR(status)) {
+    log_error(L"boot-info guard: AllocateAddress(0x%lx, %lu pages) failed: %r\r\n",
+              (UINT64)XNU_BOOTINFO_BASE, (UINT64)pages, status);
+    return status;
+  }
+
+  *guard_base = base;
+  *guard_pages = pages;
+  log_info(L"boot-info guard: reserved 0x%lx - 0x%lx\r\n",
+           (UINT64)base,
+           (UINT64)(base + ((UINT64)pages << EFI_PAGE_SHIFT)));
+  return EFI_SUCCESS;
+}
+
+static VOID ReleaseBootInfoGuard(AppContext *ctx,
+                                 EFI_PHYSICAL_ADDRESS *guard_base,
+                                 UINTN *guard_pages) {
+  if (*guard_pages == 0)
+    return;
+
+  EFI_STATUS status = uefi_call_wrapper(ctx->bs->FreePages, 2,
+      *guard_base, *guard_pages);
+  if (EFI_ERROR(status)) {
+    log_error(L"boot-info guard: FreePages(0x%lx, %lu pages) failed: %r\r\n",
+              (UINT64)*guard_base, (UINT64)*guard_pages, status);
+    return;
+  }
+
+  log_info(L"boot-info guard: released for boot_build_args\r\n");
+  *guard_base = 0;
+  *guard_pages = 0;
+}
+
 EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes) {
   EFI_PHYSICAL_ADDRESS base = 0x7FFFFFFF;
   UINTN total_pages = (UINTN)((span_bytes + EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT);
@@ -34,6 +76,8 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   MachoImage image_info;
   MachoLoadResult load_result = {0};
   EFI_STATUS status;
+  EFI_PHYSICAL_ADDRESS bootinfo_guard_base = 0;
+  UINTN bootinfo_guard_pages = 0;
 
   status = app_init(&ctx, image, st);
   if (EFI_ERROR(status))
@@ -106,6 +150,17 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     ctx.phys_base = (UINT32)lo;  /* physical is always unslid; kslide shifts VAs only */
     log_info(L"phys_base=0x%lx kslide=0x%x span=0x%lx\r\n",
              (UINT64)ctx.phys_base, ctx.kslide, hi - lo);
+  }
+
+  /* Protect the fixed boot-info block before allocating the large contiguous
+   * staging image. Without this guard, AllocateMaxAddress may return a range
+   * that crosses XNU_BOOTINFO_BASE; debug kernels are large enough to expose
+   * that collision. The guard is released once staging is fixed in place,
+   * immediately before boot_build_args() claims the addresses for real. */
+  status = ReserveBootInfoGuard(&ctx, &bootinfo_guard_base, &bootinfo_guard_pages);
+  if (EFI_ERROR(status)) {
+    file_free(&ctx, &kernel);
+    return status;
   }
 
   /* Allocate a high staging buffer for the kernel image. */
@@ -189,6 +244,12 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   log_info(L"entry vm=0x%lx -> host=0x%lx\r\n", entry_vmaddr, (UINT64)(UINTN)host_entry);
 
   BootArgsState boot_state = {0};
+
+  ReleaseBootInfoGuard(&ctx, &bootinfo_guard_base, &bootinfo_guard_pages);
+  if (bootinfo_guard_pages != 0) {
+    file_free(&ctx, &kernel);
+    return EFI_DEVICE_ERROR;
+  }
 
   status = boot_collect_memory_map(&ctx, &boot_state);
   if (EFI_ERROR(status)) {
