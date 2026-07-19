@@ -110,6 +110,55 @@ typedef struct boot_args {
   uint32_t __reserved4[692];
 } boot_args;
 
+#if defined(__aarch64__)
+/* pexpert/arm64/boot.h's real Boot_Video: six plain unsigned longs, in
+ * this exact order (baseAddr first) - NOT the same struct as the
+ * extended x86 Boot_Video above (different field order, extra
+ * rotate/reserved fields). */
+typedef struct arm64_Boot_Video {
+  uint64_t v_baseAddr;
+  uint64_t v_display;
+  uint64_t v_rowBytes;
+  uint64_t v_width;
+  uint64_t v_height;
+  uint64_t v_depth;
+} arm64_Boot_Video;
+
+typedef struct arm64_boot_args {
+  uint16_t Revision;
+  uint16_t Version;
+  uint64_t virtBase;
+  uint64_t physBase;
+  uint64_t memSize;
+  uint64_t topOfKernelData;
+  arm64_Boot_Video Video;
+  uint32_t machineType;
+  uint64_t deviceTreeP;      /* real field is a pointer; kept as a fixed-width
+                              * physical address here since we're 64-bit either way */
+  uint32_t deviceTreeLength;
+  char CommandLine[BOOT_LINE_LENGTH];
+  uint64_t bootFlags;
+  uint64_t memSizeActual;
+} arm64_boot_args;
+
+#define ARM64_BOOT_ARGS_REVISION 2 /* kBootArgsRevision2 */
+#define ARM64_BOOT_ARGS_VERSION  2 /* kBootArgsVersion2 */
+
+EFI_STATUS arm64_boot_build_args(
+    AppContext *ctx,
+    const CHAR8 *cmdline,
+    UINT64 virt_base,
+    UINT64 phys_base,
+    UINT64 mem_size,
+    UINT64 top_of_kernel_data,
+    UINT64 device_tree_phys,
+    UINT32 device_tree_len,
+    LowMemBuffer *out_args_buf,
+    arm64_boot_args **out_args);
+
+VOID arm64_boot_log_args(arm64_boot_args *args);
+#endif /* __aarch64__ */
+
 typedef struct BootArgsState {
   boot_args *args;
   LowMemBuffer args_buf;

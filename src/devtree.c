@@ -37,7 +37,7 @@ static UINTN dt_wcs_len(const CHAR16 *s) {
 
 DeviceTreeNode *dt_create_node(AppContext *ctx) {
   DeviceTreeNode *node = NULL;
-  uefi_call_wrapper(ctx->bs->AllocatePool, 3, EfiBootServicesData, sizeof(DeviceTreeNode), &node);
+  uefi_call_wrapper(ctx->bs->AllocatePool, 3, EfiBootServicesData, sizeof(DeviceTreeNode), (VOID **)&node);
   if (node)
     SetMem(node, sizeof(DeviceTreeNode), 0);
   return node;
@@ -45,7 +45,7 @@ DeviceTreeNode *dt_create_node(AppContext *ctx) {
 
 DeviceTreeNodeProperty *dt_create_property(AppContext *ctx, const CHAR8 *name, VOID *data, UINT32 len) {
   DeviceTreeNodeProperty *prop = NULL;
-  uefi_call_wrapper(ctx->bs->AllocatePool, 3, EfiBootServicesData, sizeof(DeviceTreeNodeProperty), &prop);
+  uefi_call_wrapper(ctx->bs->AllocatePool, 3, EfiBootServicesData, sizeof(DeviceTreeNodeProperty), (VOID **)&prop);
   if (!prop)
     return NULL;
 
@@ -59,7 +59,7 @@ DeviceTreeNodeProperty *dt_create_property(AppContext *ctx, const CHAR8 *name, V
 
   prop->length = len;
   if (len && data) {
-    uefi_call_wrapper(ctx->bs->AllocatePool, 3, EfiBootServicesData, len, &prop->value);
+    uefi_call_wrapper(ctx->bs->AllocatePool, 3, EfiBootServicesData, len, (VOID **)&prop->value);
     if (prop->value)
       CopyMem(prop->value, data, len);
   }
@@ -69,7 +69,7 @@ DeviceTreeNodeProperty *dt_create_property(AppContext *ctx, const CHAR8 *name, V
 
 VOID dt_add_property(AppContext *ctx, DeviceTreeNode *node, DeviceTreeNodeProperty *prop) {
   DeviceTreeNodeProperty **newProps = NULL;
-  uefi_call_wrapper(ctx->bs->AllocatePool, 3, EfiBootServicesData, sizeof(DeviceTreeNodeProperty*) * (node->nProperties + 1), &newProps);
+  uefi_call_wrapper(ctx->bs->AllocatePool, 3, EfiBootServicesData, sizeof(DeviceTreeNodeProperty*) * (node->nProperties + 1), (VOID **)&newProps);
   if (!newProps)
     return;
 
@@ -84,7 +84,7 @@ VOID dt_add_property(AppContext *ctx, DeviceTreeNode *node, DeviceTreeNodeProper
 
 VOID dt_add_child(AppContext *ctx, DeviceTreeNode *parent, DeviceTreeNode *child) {
   DeviceTreeNode **newChildren = NULL;
-  uefi_call_wrapper(ctx->bs->AllocatePool, 3, EfiBootServicesData, sizeof(DeviceTreeNode*) * (parent->nChildren + 1), &newChildren);
+  uefi_call_wrapper(ctx->bs->AllocatePool, 3, EfiBootServicesData, sizeof(DeviceTreeNode*) * (parent->nChildren + 1), (VOID **)&newChildren);
   if (!newChildren)
     return;
 
@@ -140,11 +140,24 @@ static void dt_prop_u64(AppContext *ctx, DeviceTreeNode *node, const CHAR8 *name
   dt_prop(ctx, node, name, &val, 8);
 }
 
+#if defined(__x86_64__)
 static UINT64 rdtsc64_raw(void) {
   UINT32 lo, hi;
   __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
   return ((UINT64)hi << 32) | lo;
 }
+#elif defined(__aarch64__)
+/* Real, not a stub: CNTVCT_EL0 is arm64's equivalent free-running counter
+ * (its rate comes from CNTFRQ_EL0, unlike TSC's calibration dance below,
+ * but the raw-read shape matches what callers here want). */
+static UINT64 rdtsc64_raw(void) {
+  UINT64 v;
+  __asm__ volatile ("mrs %0, cntvct_el0" : "=r"(v));
+  return v;
+}
+#else
+#error "devtree.c: unsupported architecture"
+#endif
 
 static UINT64 estimate_tsc_frequency(AppContext *ctx, UINT64 *initial_tsc) {
   const UINTN usec = 20000;
@@ -842,9 +855,9 @@ EFI_STATUS dt_build(
     }
 
     if (!got_rng) {
-      /* Fallback: xorshift64 seeded from TSC */
-      UINT64 state;
-      __asm__ volatile ("rdtsc; shlq $32,%%rdx; orq %%rdx,%%rax" : "=a"(state) :: "rdx");
+      /* Fallback: xorshift64 seeded from the free-running counter
+       * (TSC on x86_64, CNTVCT_EL0 on arm64 - see rdtsc64_raw() above). */
+      UINT64 state = rdtsc64_raw();
       if (!state)
         state = 0xDEADBEEFCAFEBABEULL;
       for (UINTN si = 0; si < 64; si++) {
@@ -993,7 +1006,16 @@ EFI_STATUS dt_build(
 
   DeviceTreeNode *kcompat = dt_create_node(ctx);
   dt_prop_str(ctx, kcompat, "name", "kernel-compatibility");
+#if defined(__x86_64__)
   dt_prop_u32(ctx, kcompat, "x86_64", 1);
+#elif defined(__aarch64__)
+  /* a real arm64/BCM2837 boot needs its own tree (FDT-derived board info,
+   * mailbox-queried memory layout, no ACPI at all). This just lets the
+   * kcompat marker match the arch actually compiling. */
+  dt_prop_u32(ctx, kcompat, "arm64", 1);
+#else
+#error "devtree.c: unsupported architecture"
+#endif
 
   DeviceTreeNode *efi = dt_create_node(ctx);
   dt_prop_str(ctx, efi, "name", "efi");

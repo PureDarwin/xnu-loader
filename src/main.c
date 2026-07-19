@@ -6,6 +6,10 @@
 #include "macho.h"
 #include "jump.h"
 
+#if defined(__aarch64__)
+EFI_PHYSICAL_ADDRESS g_xnu_bootinfo_base;
+#endif
+
 
 static EFI_STATUS ReserveBootInfoGuard(AppContext *ctx,
                                        EFI_PHYSICAL_ADDRESS *guard_base,
@@ -150,6 +154,20 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     ctx.phys_base = (UINT32)lo;  /* physical is always unslid; kslide shifts VAs only */
     log_info(L"phys_base=0x%lx kslide=0x%x span=0x%lx\r\n",
              (UINT64)ctx.phys_base, ctx.kslide, hi - lo);
+
+#if defined(__aarch64__)
+    /*
+     * Place the boot-info block 32MB below the kernel's own linked
+     * phys_base, 2MB-aligned - clear of both the kernel image itself and
+     * (empirically, under QEMU's raspi3b + u-boot) whatever u-boot/DTB
+     * carve-outs occupy low memory. See common.h's XNU_BOOTINFO_BASE
+     * comment for why this can't be the x86_64 fixed 0x2800000.
+     */
+    g_xnu_bootinfo_base = (ctx.phys_base > 0x2200000ULL)
+        ? ((ctx.phys_base - 0x2200000ULL) & ~0x1FFFFFULL)
+        : 0x2800000ULL;
+    log_info(L"arm64 bootinfo base=0x%lx\r\n", (UINT64)g_xnu_bootinfo_base);
+#endif
   }
 
   /* Protect the fixed boot-info block before allocating the large contiguous
@@ -297,6 +315,42 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     return status;
   }
 
+#if defined(__aarch64__)
+  /*
+   * boot_state.args (the x86_64 boot_args struct boot_build_args just
+   * filled in) is unused scratch for arm64 from here on - only kept
+   * around because boot_collect_memory_map/exit_boot_services_retry
+   * below are shared EFI-bookkeeping machinery that happen to take a
+   * BootArgsState*. The struct arm64 XNU actually needs (see boot.h) is
+   * built here instead, reusing the device tree boot_build_args already
+   * built via dt_build() into boot_state.device_tree.
+   *
+   * Must happen before exit_boot_services_retry (below): it calls
+   * AllocatePages, which isn't legal once boot services have exited.
+   */
+  LowMemBuffer arm64_args_buf = {0};
+  arm64_boot_args *arm64_args = NULL;
+  {
+    UINT64 image_size_aligned = (load_result.image_size + EFI_PAGE_SIZE - 1) &
+                                ~(UINT64)(EFI_PAGE_SIZE - 1);
+    status = arm64_boot_build_args(
+        &ctx,
+        cmdline,
+        load_result.lowest_vmaddr,               /* virtBase */
+        ctx.kernel_region_base,                  /* physBase - staging IS final for arm64 */
+        app_detect_physical_memory_size(&ctx),   /* memSize */
+        ctx.kernel_region_base + image_size_aligned, /* topOfKernelData */
+        (UINT64)(UINTN)boot_state.device_tree,
+        boot_state.device_tree_size,
+        &arm64_args_buf,
+        &arm64_args);
+    if (EFI_ERROR(status)) {
+      log_error(L"failed to build arm64 boot_args: %r\r\n", status);
+      return status;
+    }
+  }
+#endif
+
   EFI_PHYSICAL_ADDRESS stack_base = 0xFFFFFFFFULL;
   UINTN stack_pages = 16;
 
@@ -315,7 +369,11 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
                              (stack_pages << EFI_PAGE_SHIFT) - 16);
 
 #ifdef VERBOSE_BOOT
+#if defined(__aarch64__)
+  arm64_boot_log_args(arm64_args);
+#else
   boot_log_args(&boot_state);
+#endif
 #endif // VERBOSE_BOOT
 
   /* Reserve pages in the boot-info block (phys >= 0x100000) for the post-EBS
@@ -331,7 +389,11 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
 
 #ifdef VERBOSE_BOOT
   log_info(L"[D] before exit_boot_services\r\n");
+#if defined(__aarch64__)
+  log_info(L"boot_args phys = 0x%lx\r\n", (UINT64)(UINTN)arm64_args);
+#else
   log_info(L"boot_args phys = 0x%lx\r\n", (UINT64)(UINTN)boot_state.args);
+#endif
   log_info(L"stack_top = 0x%lx\r\n",      (UINT64)(UINTN)stack_top);
   log_info(L"entry     = 0x%lx\r\n",      (UINT64)(UINTN)host_entry);
 #endif // VERBOSE_BOOT
@@ -343,6 +405,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     return status;
   }
 
+#if defined(__x86_64__)
   /* Copy staged kernel image to its SLID physical base (0x100000 + kslide).
    * boot.efi physically relocates the whole image: each segment goes to
    * (vmaddr + kslide) & 0x3FFFFFFF, and the local relocs (base = __HIB) patch
@@ -370,6 +433,18 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
 
   boot_state.args->kaddr = (UINT32)phys_real;
   boot_state.args->kslide = ctx.kslide;
+#else
+  /*
+   * Arm64 doesn't need any of that: the kernel is already sitting exactly
+   * where we staged it (ctx.kernel_region_base), and host_entry (computed
+   * earlier via macho_compute_host_entry, before this function ever
+   * touched phys_entry) is already the correct physical entry address in
+   * that same staging region.
+   */
+  UINT64 vm_base = load_result.lowest_vmaddr;
+  UINT64 phys_real = ctx.kernel_region_base;
+  VOID *phys_entry = host_entry;
+#endif
 
   /*
    * Kernel collection (KC) support. kc-builder converts the kernel's own
@@ -449,6 +524,10 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
 
   jump_to_xnu(
       phys_entry,
+#if defined(__aarch64__)
+      (UINT64)(UINTN)arm64_args,
+#else
       (UINT64)(UINTN)boot_state.args,
+#endif
       stack_top);
 }

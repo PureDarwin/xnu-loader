@@ -521,6 +521,15 @@ EFI_STATUS macho_find_entry_vmaddr(
           return EFI_SUCCESS;
         }
 
+        if (flavor == ARM_THREAD_STATE64) {
+          if (state_size < sizeof(arm_thread_state64))
+            return EFI_COMPROMISED_DATA;
+
+          arm_thread_state64 *ts = (arm_thread_state64 *)state;
+          *out_entry_vmaddr = ts->pc;
+          return EFI_SUCCESS;
+        }
+
         q = state + state_size;
       }
 

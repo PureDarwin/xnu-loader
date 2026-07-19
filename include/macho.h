@@ -94,6 +94,18 @@ typedef struct x86_thread_state64 {
   UINT64 gs;
 } x86_thread_state64;
 
+#define ARM_THREAD_STATE64 6
+
+typedef struct arm_thread_state64 {
+  UINT64 x[29]; /* x0-x28 */
+  UINT64 fp;    /* x29 */
+  UINT64 lr;    /* x30 */
+  UINT64 sp;    /* x31 */
+  UINT64 pc;
+  UINT32 cpsr;
+  UINT32 flags;
+} arm_thread_state64;
+
 typedef struct macho_dysymtab_command {
   UINT32 cmd;
   UINT32 cmdsize;

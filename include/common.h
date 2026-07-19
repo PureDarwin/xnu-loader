@@ -31,10 +31,28 @@
  *   [0x2800000, 0x2820000)   boot-info block (boot_args/tables/DT/memmap)
  *   [0x3200000, va_cursor)   runtime-services VA pack; physfree = round_up(va_cursor)
  */
+#if defined(__aarch64__)
+extern EFI_PHYSICAL_ADDRESS g_xnu_bootinfo_base;
+#define XNU_BOOTINFO_BASE       g_xnu_bootinfo_base
+#else
 #define XNU_BOOTINFO_BASE       0x2800000ULL   /* 2MB-aligned, above KC image  */
+#endif
 #define XNU_BOOTARGS_PHYS       (XNU_BOOTINFO_BASE + 0x00000) /* 1 page       */
 #define XNU_EFITABLES_PHYS      (XNU_BOOTINFO_BASE + 0x01000) /* 1 page       */
 #define XNU_DEVTREE_PHYS        (XNU_BOOTINFO_BASE + 0x02000) /* 2 pages      */
+#if defined(__aarch64__)
+/*
+ * arm64's real boot_args (see boot.h's arm64_boot_args) can't share
+ * XNU_BOOTARGS_PHYS with the x86-shaped one: main.c still calls the
+ * existing x86 boot_build_args() for its device-tree-building side
+ * effect (dt_build), which allocates the x86 struct at XNU_BOOTARGS_PHYS
+ * first: allocating the real arm64 struct at that same address right
+ * after collided (AllocateAddress failing with EFI_NOT_FOUND, already
+ * taken). Plenty of free space in this block between DEVTREE (ends at
+ * +0x4000) and MEMMAP (+0x10000) for a second 1-page slot.
+ */
+#define XNU_ARM64_BOOTARGS_PHYS (XNU_BOOTINFO_BASE + 0x04000) /* 1 page       */
+#endif
 #define XNU_MEMMAP_PHYS         (XNU_BOOTINFO_BASE + 0x10000) /* up to 16 pg  */
 #define XNU_BOOTINFO_END        (XNU_BOOTINFO_BASE + 0x20000) /* 128KB block  */
 #define XNU_RT_VA_BASE          0x3200000ULL   /* runtime-services VA pack base */

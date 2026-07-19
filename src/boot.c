@@ -4,6 +4,18 @@
 #include "fileio.h"
 #include <efiprot.h>
 
+/* IRQ mask/unmask, real on both architectures (not stubs) - x86's
+ * cli/sti and arm64's DAIF.I bit are each a single instruction. */
+#if defined(__x86_64__)
+#define IRQ_DISABLE() __asm__ volatile ("cli")
+#define IRQ_ENABLE()  __asm__ volatile ("sti")
+#elif defined(__aarch64__)
+#define IRQ_DISABLE() __asm__ volatile ("msr daifset, #2")
+#define IRQ_ENABLE()  __asm__ volatile ("msr daifclr, #2")
+#else
+#error "boot.c: unsupported architecture"
+#endif
+
 static UINT64 align_up_u64(UINT64 v, UINT64 a) {
   return (v + (a - 1)) & ~(a - 1);
 }
@@ -687,7 +699,7 @@ EFI_STATUS exit_boot_services_retry(
      * causing perpetual EFI_INVALID_PARAMETER in QEMU TCG where each
      * instruction takes longer in wall-clock time.
      */
-    __asm__ volatile ("cli");
+    IRQ_DISABLE();
 
     status = uefi_call_wrapper(
         ctx->bs->GetMemoryMap,
@@ -699,7 +711,7 @@ EFI_STATUS exit_boot_services_retry(
         &desc_ver);
 
     if (EFI_ERROR(status)) {
-      __asm__ volatile ("sti");
+      IRQ_ENABLE();
       return status;
     }
 
@@ -825,9 +837,86 @@ EFI_STATUS exit_boot_services_retry(
       return EFI_SUCCESS;
     }
 
-    __asm__ volatile ("sti");
+    IRQ_ENABLE();
 
     if (status != EFI_INVALID_PARAMETER)
       return status;
   }
 }
+
+#if defined(__aarch64__)
+EFI_STATUS arm64_boot_build_args(
+    AppContext *ctx,
+    const CHAR8 *cmdline,
+    UINT64 virt_base,
+    UINT64 phys_base,
+    UINT64 mem_size,
+    UINT64 top_of_kernel_data,
+    UINT64 device_tree_phys,
+    UINT32 device_tree_len,
+    LowMemBuffer *out_args_buf,
+    arm64_boot_args **out_args)
+{
+  EFI_STATUS status;
+  LowMemBuffer args_buf;
+  arm64_boot_args *args;
+
+  if (!ctx || !out_args_buf || !out_args)
+    return EFI_INVALID_PARAMETER;
+
+  {
+    EFI_PHYSICAL_ADDRESS args_phys = XNU_ARM64_BOOTARGS_PHYS;
+    status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
+        AllocateAddress, EfiLoaderData, 1, &args_phys);
+    if (EFI_ERROR(status)) {
+      log_error(L"arm64 boot_args: AllocateAddress(0x%lx) failed: %r\r\n",
+                (UINT64)XNU_ARM64_BOOTARGS_PHYS, status);
+      return status;
+    }
+    args_buf.ptr = (VOID *)(UINTN)args_phys;
+    args_buf.phys = args_phys;
+    args_buf.size = sizeof(arm64_boot_args);
+    args_buf.pages = 1;
+  }
+
+  args = (arm64_boot_args *)args_buf.ptr;
+  SetMem(args, sizeof(arm64_boot_args), 0);
+
+  args->Revision = ARM64_BOOT_ARGS_REVISION;
+  args->Version = ARM64_BOOT_ARGS_VERSION;
+  args->virtBase = virt_base;
+  args->physBase = phys_base;
+  args->memSize = mem_size;
+  args->topOfKernelData = top_of_kernel_data;
+  args->machineType = 0; /* unused by this kernel's pe_arm_init path */
+  args->deviceTreeP = device_tree_phys;
+  args->deviceTreeLength = device_tree_len;
+  args->bootFlags = 0;
+  args->memSizeActual = 0; /* 0 == "same as memSize", per real XNU's convention */
+
+  if (cmdline) {
+    UINTN len = 0;
+    while (cmdline[len] && len < BOOT_LINE_LENGTH - 1) len++;
+    CopyMem(args->CommandLine, cmdline, len);
+    args->CommandLine[len] = '\0';
+  }
+
+  *out_args_buf = args_buf;
+  *out_args = args;
+  return EFI_SUCCESS;
+}
+
+VOID arm64_boot_log_args(arm64_boot_args *args)
+{
+  if (!args)
+    return;
+
+  log_info(L"arm64 boot_args @ 0x%lx\r\n", (UINT64)(UINTN)args);
+  log_info(L"  Revision: %d  Version: %d\r\n", args->Revision, args->Version);
+  log_info(L"  virtBase: 0x%lx  physBase: 0x%lx\r\n", args->virtBase, args->physBase);
+  log_info(L"  memSize: 0x%lx  topOfKernelData: 0x%lx\r\n", args->memSize, args->topOfKernelData);
+  log_info(L"  deviceTreeP: 0x%lx  deviceTreeLength: 0x%x\r\n",
+           args->deviceTreeP, args->deviceTreeLength);
+  log_info(L"  CommandLine: %a\r\n", args->CommandLine);
+}
+#endif /* __aarch64__ */

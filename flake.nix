@@ -12,6 +12,9 @@
     packages.${system} = {
       default = pkgs.callPackage ./. {};
       hello = pkgs.callPackage ./hello.nix {};
+      arm64 = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./. {
+        arch = "aarch64";
+      };
     };
   };
 }

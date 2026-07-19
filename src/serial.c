@@ -1,5 +1,9 @@
 #include "serial.h"
 
+static BOOLEAN serial_ready = FALSE;
+
+#if defined(__x86_64__)
+
 /* Standard ISA I/O bases. */
 #define COM1_BASE 0x3F8
 #define COM3_BASE 0x3E8
@@ -19,8 +23,6 @@
 /* 115200 baud: the UART base clock is 1.8432 MHz / 16 = 115200 Hz, so the
  * 16-bit divisor for 115200 baud is exactly 1. */
 #define UART_DIVISOR 1
-
-static BOOLEAN serial_ready = FALSE;
 
 static inline VOID io_outb(UINT16 port, UINT8 val) {
   __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
@@ -69,6 +71,53 @@ VOID serial_init(VOID) {
 static VOID serial_putc(CHAR8 c) {
   uart_putc(SERIAL_BASE, c);
 }
+
+#elif defined(__aarch64__)
+
+/*
+ * PUREDARWIN: compile-only arm64/BCM2837 scaffold - x86's port-mapped
+ * 16550 (outb/inb) doesn't exist on this hardware at all. BCM2837's
+ * "mini UART" (the one wired to the same GPIO 14/15 pins as the real
+ * PL011, and what's usually mapped to /dev/ttyS0 as a console) is a
+ * handful of plain MMIO registers instead - real and correct (not a
+ * stub), but this loader doesn't yet know its own load address relative
+ * to the peripheral base, or whether MMU/UART clock setup has already
+ * happened by the time we run, so it's not wired into serial_init() yet.
+ */
+#define BCM2837_PERIPHERAL_BASE 0x3F000000ULL
+#define AUX_ENABLES     (*(volatile UINT32 *)(BCM2837_PERIPHERAL_BASE + 0x215004))
+#define AUX_MU_IO_REG   (*(volatile UINT32 *)(BCM2837_PERIPHERAL_BASE + 0x215040))
+#define AUX_MU_IER_REG  (*(volatile UINT32 *)(BCM2837_PERIPHERAL_BASE + 0x215044))
+#define AUX_MU_LCR_REG  (*(volatile UINT32 *)(BCM2837_PERIPHERAL_BASE + 0x21504C))
+#define AUX_MU_LSR_REG  (*(volatile UINT32 *)(BCM2837_PERIPHERAL_BASE + 0x215054))
+#define AUX_MU_CNTL_REG (*(volatile UINT32 *)(BCM2837_PERIPHERAL_BASE + 0x215060))
+#define AUX_MU_BAUD_REG (*(volatile UINT32 *)(BCM2837_PERIPHERAL_BASE + 0x215068))
+
+static VOID uart_putc(CHAR8 c) {
+  while ((AUX_MU_LSR_REG & 0x20) == 0) {
+    /* spin until the transmit holding register drains */
+  }
+  AUX_MU_IO_REG = (UINT32)(UINT8)c;
+}
+
+VOID serial_init(VOID) {
+  AUX_ENABLES |= 1;      /* enable mini UART */
+  AUX_MU_IER_REG = 0;    /* mask interrupts */
+  AUX_MU_LCR_REG = 3;    /* 8-bit mode */
+  AUX_MU_CNTL_REG = 0;   /* disable tx/rx while reprogramming */
+  AUX_MU_BAUD_REG = 270; /* 115200 baud @ 250MHz core clock */
+  AUX_MU_CNTL_REG = 3;   /* enable tx+rx */
+
+  serial_ready = TRUE;
+}
+
+static VOID serial_putc(CHAR8 c) {
+  uart_putc(c);
+}
+
+#else
+#error "serial.c: unsupported architecture"
+#endif
 
 VOID serial_puts8(CONST CHAR8 *s) {
   if (!serial_ready)

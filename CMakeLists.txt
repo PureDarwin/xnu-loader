@@ -10,7 +10,14 @@ if(NOT DEFINED GNU_EFI_DIR)
   message(FATAL_ERROR "GNU_EFI_DIR must be set")
 endif()
 
-set(ARCH x86_64)
+if(NOT ARCH)
+  set(ARCH x86_64)
+endif()
+set(ARCH "${ARCH}" CACHE STRING "Target architecture (x86_64 or aarch64)")
+
+if(NOT ARCH STREQUAL "x86_64" AND NOT ARCH STREQUAL "aarch64")
+  message(FATAL_ERROR "ARCH must be x86_64 or aarch64, got '${ARCH}'")
+endif()
 
 set(GNU_EFI_INC
   ${GNU_EFI_DIR}/include
@@ -24,8 +31,14 @@ set(GNU_EFI_LIB_DIR ${GNU_EFI_DIR}/lib)
 set(GNU_EFI_LDS ${GNU_EFI_LIB_DIR}/elf_${ARCH}_efi.lds)
 set(GNU_EFI_CRT ${GNU_EFI_LIB_DIR}/crt0-efi-${ARCH}.o)
 
+if(ARCH STREQUAL "x86_64")
+  set(ARCH_M_FLAG -m64)
+else()
+  set(ARCH_M_FLAG "")
+endif()
+
 execute_process(
-  COMMAND ${CMAKE_C_COMPILER} -m64 -print-libgcc-file-name
+  COMMAND ${CMAKE_C_COMPILER} ${ARCH_M_FLAG} -print-libgcc-file-name
   OUTPUT_VARIABLE LIBGCC_FILE
   OUTPUT_STRIP_TRAILING_WHITESPACE
 )
@@ -59,18 +72,27 @@ target_compile_options(loader_objs PRIVATE
   -funsigned-char
   -fshort-wchar
   -fpie
-  -mno-red-zone
-  -maccumulate-outgoing-args
-  -mno-avx
   -Wall
   -Wextra
   -Wno-pointer-sign
   -ggdb
 )
 
+if(ARCH STREQUAL "x86_64")
+  # x86_64-only: no red zone (interrupts/exceptions can clobber it before
+  # a real handler runs), pack outgoing-arg stack slots instead of
+  # sub/add-per-call (gnu-efi's calling convention expectation), and no
+  # AVX (SSE/AVX state isn't guaranteed usable this early in boot).
+  target_compile_options(loader_objs PRIVATE
+    -mno-red-zone
+    -maccumulate-outgoing-args
+    -mno-avx
+  )
+endif()
+
 target_compile_definitions(loader_objs PRIVATE
   EFI_FUNCTION_WRAPPER
-  CONFIG_x86_64
+  CONFIG_${ARCH}
 )
 
 add_custom_command(

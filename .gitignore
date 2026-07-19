@@ -427,7 +427,7 @@ uefi-xnu-loader.dir/
 uefi-xnu-loader.dir/*
 /uefi-xnu-loader/x64/*
 /uefi-xnu-loader/Debug/*
-result
+result*
 files
 .direnv/*
 output.txt
