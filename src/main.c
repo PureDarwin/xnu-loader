@@ -52,7 +52,35 @@ static VOID ReleaseBootInfoGuard(AppContext *ctx,
   *guard_pages = 0;
 }
 
-EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes) {
+EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes, UINT64 virt_base) {
+#if defined(__aarch64__)
+  UINT64 required_rem = virt_base & 0x1FFFFFULL;
+  UINTN total_pages = (UINTN)((span_bytes + 0x200000ULL + EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT);
+  EFI_PHYSICAL_ADDRESS base = 0x7FFFFFFF;
+
+  EFI_STATUS status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
+    AllocateMaxAddress, EfiLoaderData, total_pages, &base);
+  if (EFI_ERROR(status)) {
+    log_error(L"AllocKernelMemRegion: AllocatePages(%lu pages) failed: %r\r\n",
+              (UINT64)total_pages, status);
+    return status;
+  }
+
+  EFI_PHYSICAL_ADDRESS aligned = (base & ~0x1FFFFFULL) + required_rem;
+  if (aligned < base) {
+    aligned += 0x200000ULL;
+  }
+
+  SetMem((VOID *)(UINTN)base, (UINTN)((UINT64)total_pages << EFI_PAGE_SHIFT), 0);
+
+  ctx->kernel_region_base = aligned;
+  ctx->kernel_region_end  = aligned + span_bytes;
+
+  log_info(L"kernel staging: 0x%lx - 0x%lx (%lu pages, 2MB-aligned to virt_base rem 0x%lx)\r\n",
+       ctx->kernel_region_base, ctx->kernel_region_end, (UINT64)total_pages, required_rem);
+  return EFI_SUCCESS;
+#else
+  (VOID)virt_base;
   EFI_PHYSICAL_ADDRESS base = 0x7FFFFFFF;
   UINTN total_pages = (UINTN)((span_bytes + EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT);
 
@@ -72,6 +100,7 @@ EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes) {
   log_info(L"kernel staging: 0x%lx - 0x%lx (%lu pages)\r\n",
        ctx->kernel_region_base, ctx->kernel_region_end, (UINT64)total_pages);
   return EFI_SUCCESS;
+#endif
 }
 
 EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
@@ -185,7 +214,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   {
     UINT64 lo2 = 0, hi2 = 0;
     macho_compute_vm_range_pub(&image_info, &lo2, &hi2);
-    status = AllocKernelMemRegion(&ctx, hi2 - lo2);
+    status = AllocKernelMemRegion(&ctx, hi2 - lo2, lo2);
   }
   if (EFI_ERROR(status)) {
     log_error(L"AllocKernelMemRegion failed: %r\r\n", status);

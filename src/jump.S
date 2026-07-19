@@ -5,10 +5,10 @@
  * entry convention in osfmk/arm64/start.s:
  *   EXT(_start): b start_first_cpu
  *   start_first_cpu:
- *       mov x20, x0                    // boot_args ptr, everything else
+ *       mov x20, x0                     // boot_args ptr, everything else
  *       ldr x22, [x20, BA_VIRT_BASE]    // (virt/phys base, mem size, boot
  *       ldr x23, [x20, BA_PHYS_BASE]    // flags, page tables) is derived
- *       ...                            // FROM the boot_args struct and
+ *       ...                             // FROM the boot_args struct and
  *                                       // symbols baked into the kernel
  *                                       // image itself.
  *
@@ -23,12 +23,6 @@
  * so an earlier version of this code that only cleared SCTLR_EL1.M/C/I
  * did nothing useful when actually running at EL2: EL2's own MMU
  * (SCTLR_EL2.M) was still on and still faulting.
- *
- * Fixed by checking CurrentEL and, if at EL2, doing the standard ARM
- * bootloader EL2->EL1 drop (HCR_EL2 configured for a normal 64-bit EL1,
- * SPSR_EL2/ELR_EL2 set up, then `eret`) instead of a plain branch. If
- * already at EL1 (e.g. a firmware that already dropped down, or future
- * real hardware), falls through to the original plain-branch path.
  */
 .text
 .globl jump_to_xnu
@@ -40,10 +34,6 @@ jump_to_xnu:
     mov x10, x1     /* stash boot_args_phys the same way, ahead of clobbering x1 below */
     mov x11, x2     /* stash stack_top */
 
-    /* Mask all exceptions before touching system control state -
-     * start_first_cpu does this itself too (DAIFSet, #0xF), but we
-     * don't want an interrupt landing us back in UEFI/firmware code
-     * mid-transition. */
     msr daifset, #0xf
 
     mrs x0, CurrentEL
@@ -71,10 +61,6 @@ jump_to_xnu:
     msr sctlr_el2, x0
     isb
 
-    /* Give EL1 a clean (MMU/cache off) starting SCTLR_EL1 too, matching
-     * what start_first_cpu assumes - EL1 has never run yet on this path
-     * (u-boot ran entirely at EL2), so its reset-state assumption may not
-     * hold otherwise. */
     msr sctlr_el1, xzr
     isb
 
@@ -82,13 +68,10 @@ jump_to_xnu:
     msr spsr_el2, x0
     msr elr_el2, x9
     mov sp, x11
-    mov x0, x10         /* boot_args_phys, in the register XNU's entry expects it in */
+    mov x0, x10         /* boot_args_phys */
     eret
 
 1:
-    /* Already at EL1 (or lower - shouldn't happen for a bootloader, but
-     * there's nothing more privileged left to drop from either way):
-     * same MMU/cache teardown as before, plain branch. */
     mrs x1, sctlr_el1
     bic x1, x1, #1        /* M  */
     bic x1, x1, #(1 << 2) /* C  */
@@ -97,83 +80,8 @@ jump_to_xnu:
     isb
 
     mov sp, x11
-    mov x0, x10     /* boot_args_phys, in the register XNU's entry expects it in */
+    mov x0, x10     /* boot_args_phys */
     br x9
-
-/*
- * Entry point for secondary cores (1-3), released via the BCM2837
- * spin-table mechanism (see main.c's post-jump_to_xnu-adjacent release
- * code): a core sitting at its reset-vector spin loop reads a nonzero
- * value from its release-address slot and branches to it directly, with
- * NO register setup at all - unlike jump_to_xnu above, there's no
- * boot_args/entry/stack_top handed to us in x0-x2. Whatever XNU's real
- * entry point and boot_args physical address are, they have to come from
- * fixed memory locations main.c fills in before releasing the cores
- * (secondary_entry_target below), since there's nowhere else to get them
- * from.
- *
- * Each secondary core independently needs the SAME EL2->EL1 drop the
- * boot CPU gets in jump_to_xnu above - real Raspberry Pi firmware never
- * drops secondary cores out of EL2 for you, and XNU's own reset_vector
- * (osfmk/arm64/start.s) expects to already be at EL1 on every core, not
- * just the first one.
- */
-.globl secondary_entry_trampoline
-.type secondary_entry_trampoline, @function
-secondary_entry_trampoline:
-    msr daifset, #0xf
-
-    adrp x9, secondary_entry_target
-    add x9, x9, :lo12:secondary_entry_target
-    ldr x9, [x9]        /* phys_entry */
-    adrp x10, secondary_bootargs_phys
-    add x10, x10, :lo12:secondary_bootargs_phys
-    ldr x10, [x10]      /* boot_args_phys */
-
-    mrs x0, CurrentEL
-    lsr x0, x0, #2
-    cmp x0, #2
-    b.ne 1f
-
-    mov x0, #(1 << 31)
-    msr hcr_el2, x0
-
-    mrs x0, sctlr_el2
-    bic x0, x0, #1
-    bic x0, x0, #(1 << 2)
-    bic x0, x0, #(1 << 12)
-    msr sctlr_el2, x0
-    isb
-
-    msr sctlr_el1, xzr
-    isb
-
-    mov x0, #0x3c5
-    msr spsr_el2, x0
-    msr elr_el2, x9
-    mov x0, x10
-    eret
-
-1:
-    mrs x1, sctlr_el1
-    bic x1, x1, #1
-    bic x1, x1, #(1 << 2)
-    bic x1, x1, #(1 << 12)
-    msr sctlr_el1, x1
-    isb
-
-    mov x0, x10
-    br x9
-
-.data
-.align 3
-.globl secondary_entry_target
-secondary_entry_target:
-    .quad 0
-.globl secondary_bootargs_phys
-secondary_bootargs_phys:
-    .quad 0
-.text
 
 .section .note.GNU-stack,"",%progbits
 
