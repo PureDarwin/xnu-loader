@@ -12,16 +12,6 @@
 /*
  * Boot-info block layout (physical addresses).
  *
- * XNU's pmap_lowmem_finalize() unmaps EVERYTHING below phys 0x100000 (it does
- * pmap_remove(kernel_pmap, LOWGLOBAL_ALIAS+PAGE_SIZE, vm_kernel_base)), so any
- * boot structure XNU keeps referencing (boot_args, device tree, EFI system /
- * runtime tables, EFI memory map) MUST live at phys >= 0x100000.  XNU never
- * copies boot_args; it accesses it in place via the physmap, so we place all
- * of these in a fixed reserved block just above the kernel image and inflate
- * boot_args->ksize so XNU's physfree covers the block (making it static kernel
- * memory that is mapped and never freed).  This mirrors boot.efi's
- * AllocateKernelMemory scheme.
- *
  * The kernel image lands at [0x100000, ~0x1779000); this block sits above it.
  * Runtime-services VAs are packed above it (see boot.c SVAM) starting at
  * XNU_RT_VA_BASE; ksize is inflated so physfree covers everything.
@@ -41,18 +31,9 @@ extern EFI_PHYSICAL_ADDRESS g_xnu_bootinfo_base;
 #define XNU_EFITABLES_PHYS      (XNU_BOOTINFO_BASE + 0x01000) /* 1 page       */
 #define XNU_DEVTREE_PHYS        (XNU_BOOTINFO_BASE + 0x02000) /* 2 pages      */
 #if defined(__aarch64__)
-/*
- * arm64's real boot_args (see boot.h's arm64_boot_args) can't share
- * XNU_BOOTARGS_PHYS with the x86-shaped one: main.c still calls the
- * existing x86 boot_build_args() for its device-tree-building side
- * effect (dt_build), which allocates the x86 struct at XNU_BOOTARGS_PHYS
- * first: allocating the real arm64 struct at that same address right
- * after collided (AllocateAddress failing with EFI_NOT_FOUND, already
- * taken). Plenty of free space in this block between DEVTREE (ends at
- * +0x4000) and MEMMAP (+0x10000) for a second 1-page slot.
- */
 #define XNU_ARM64_BOOTARGS_PHYS (XNU_BOOTINFO_BASE + 0x04000) /* 1 page       */
 #endif
+#define XNU_TRUSTCACHE_PHYS     (XNU_BOOTINFO_BASE + 0x05000) /* 1 page       */
 #define XNU_MEMMAP_PHYS         (XNU_BOOTINFO_BASE + 0x10000) /* up to 16 pg  */
 #define XNU_BOOTINFO_END        (XNU_BOOTINFO_BASE + 0x20000) /* 128KB block  */
 #define XNU_RT_VA_BASE          0x3200000ULL   /* runtime-services VA pack base */

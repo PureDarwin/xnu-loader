@@ -90,9 +90,12 @@ if(ARCH STREQUAL "x86_64")
   )
 endif()
 
+option(XNU_LOADER_QEMU_VIRT "Target QEMU's generic virt machine (PL011 UART) instead of BCM2837" OFF)
+
 target_compile_definitions(loader_objs PRIVATE
   EFI_FUNCTION_WRAPPER
   CONFIG_${ARCH}
+  $<$<BOOL:${XNU_LOADER_QEMU_VIRT}>:XNU_LOADER_QEMU_VIRT>
 )
 
 add_custom_command(

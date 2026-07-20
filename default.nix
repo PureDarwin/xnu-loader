@@ -6,6 +6,7 @@
 , gnu-efi
 , mtools
 , arch ? "x86_64"
+, qemuVirt ? false
 }:
 
 assert arch == "x86_64" || arch == "aarch64";
@@ -33,7 +34,7 @@ stdenv.mkDerivation rec {
   cmakeFlags = [
     "-DGNU_EFI_DIR=${gnu-efi}"
     "-DARCH=${arch}"
-  ];
+  ] ++ lib.optional qemuVirt "-DXNU_LOADER_QEMU_VIRT=ON";
 
   installPhase = ''
     runHook preInstall

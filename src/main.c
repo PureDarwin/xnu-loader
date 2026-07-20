@@ -55,28 +55,51 @@ static VOID ReleaseBootInfoGuard(AppContext *ctx,
 EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes, UINT64 virt_base) {
 #if defined(__aarch64__)
   UINT64 required_rem = virt_base & 0x1FFFFFULL;
-  UINTN total_pages = (UINTN)((span_bytes + 0x200000ULL + EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT);
-  EFI_PHYSICAL_ADDRESS base = 0x7FFFFFFF;
+  /* Over-allocate by the boot-info block size so it can be carved out
+   * immediately after the image (see efi_main): XNU's bootstrap KVA mapping
+   * only covers [physBase, physBase+memSize), and arm_vm_init reclaims
+   * everything above topOfKernelData, so boot_args/DT/memmap must live
+   * directly after the kernel image, inside topOfKernelData - the same
+   * placement contract iBoot follows. */
+  UINTN total_pages = (UINTN)((span_bytes +
+                               (XNU_BOOTINFO_END - XNU_BOOTINFO_BASE) +
+                               EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT);
 
-  EFI_STATUS status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
-    AllocateMaxAddress, EfiLoaderData, total_pages, &base);
+  /* XNU treats [physBase, physBase+memSize) as its entire physical world, so
+   * the kernel must sit near the BOTTOM of RAM with all remaining RAM above
+   * it (the iBoot contract). Allocating from the top (AllocateMaxAddress)
+   * made XNU claim a 1GB window that ran past the end of RAM - the VM then
+   * handed out nonexistent pages and physmap writes corrupted kernel text.
+   * Walk upward from RAM base at 2MB steps (keeping phys ≡ virt_base mod
+   * 2MB) until the firmware gives us a fixed-address allocation. */
+#if defined(XNU_LOADER_QEMU_VIRT)
+  #define XNU_LOADER_RAM_BASE 0x40000000ULL
+#else
+  #define XNU_LOADER_RAM_BASE 0ULL
+#endif
+  EFI_PHYSICAL_ADDRESS base = 0;
+  EFI_STATUS status = EFI_NOT_FOUND;
+  for (UINT64 try = XNU_LOADER_RAM_BASE + 0x2000000ULL + required_rem;
+       try < XNU_LOADER_RAM_BASE + 0x2000000ULL + required_rem + 64ULL * 0x200000ULL;
+       try += 0x200000ULL) {
+    base = try;
+    status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
+      AllocateAddress, EfiLoaderData, total_pages, &base);
+    if (!EFI_ERROR(status))
+      break;
+  }
   if (EFI_ERROR(status)) {
-    log_error(L"AllocKernelMemRegion: AllocatePages(%lu pages) failed: %r\r\n",
+    log_error(L"AllocKernelMemRegion: no low-RAM slot for %lu pages: %r\r\n",
               (UINT64)total_pages, status);
     return status;
   }
 
-  EFI_PHYSICAL_ADDRESS aligned = (base & ~0x1FFFFFULL) + required_rem;
-  if (aligned < base) {
-    aligned += 0x200000ULL;
-  }
-
   SetMem((VOID *)(UINTN)base, (UINTN)((UINT64)total_pages << EFI_PAGE_SHIFT), 0);
 
-  ctx->kernel_region_base = aligned;
-  ctx->kernel_region_end  = aligned + span_bytes;
+  ctx->kernel_region_base = base;
+  ctx->kernel_region_end  = base + span_bytes;
 
-  log_info(L"kernel staging: 0x%lx - 0x%lx (%lu pages, 2MB-aligned to virt_base rem 0x%lx)\r\n",
+  log_info(L"kernel staging: 0x%lx - 0x%lx (%lu pages, low-RAM, virt_base rem 0x%lx)\r\n",
        ctx->kernel_region_base, ctx->kernel_region_end, (UINT64)total_pages, required_rem);
   return EFI_SUCCESS;
 #else
@@ -184,31 +207,18 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     log_info(L"phys_base=0x%lx kslide=0x%x span=0x%lx\r\n",
              (UINT64)ctx.phys_base, ctx.kslide, hi - lo);
 
-#if defined(__aarch64__)
-    /*
-     * Place the boot-info block 32MB below the kernel's own linked
-     * phys_base, 2MB-aligned - clear of both the kernel image itself and
-     * (empirically, under QEMU's raspi3b + u-boot) whatever u-boot/DTB
-     * carve-outs occupy low memory. See common.h's XNU_BOOTINFO_BASE
-     * comment for why this can't be the x86_64 fixed 0x2800000.
-     */
-    g_xnu_bootinfo_base = (ctx.phys_base > 0x2200000ULL)
-        ? ((ctx.phys_base - 0x2200000ULL) & ~0x1FFFFFULL)
-        : 0x2800000ULL;
-    log_info(L"arm64 bootinfo base=0x%lx\r\n", (UINT64)g_xnu_bootinfo_base);
-#endif
   }
 
-  /* Protect the fixed boot-info block before allocating the large contiguous
-   * staging image. Without this guard, AllocateMaxAddress may return a range
-   * that crosses XNU_BOOTINFO_BASE; debug kernels are large enough to expose
-   * that collision. The guard is released once staging is fixed in place,
-   * immediately before boot_build_args() claims the addresses for real. */
+#if !defined(__aarch64__)
+  /* x86: the boot-info block lives at a fixed low address (0x2800000);
+   * reserve it before the staging allocation can land on it. On arm64 the
+   * block is carved out of the staging region itself, after it exists. */
   status = ReserveBootInfoGuard(&ctx, &bootinfo_guard_base, &bootinfo_guard_pages);
   if (EFI_ERROR(status)) {
     file_free(&ctx, &kernel);
     return status;
   }
+#endif
 
   /* Allocate a high staging buffer for the kernel image. */
   {
@@ -223,6 +233,27 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   }
   /* phys_base = staging address; post-EBS copy moves it to 0x100000 */
   ctx.phys_base = ctx.kernel_region_base;
+
+#if defined(__aarch64__)
+  g_xnu_bootinfo_base = (ctx.kernel_region_end + EFI_PAGE_SIZE - 1) &
+                        ~(EFI_PHYSICAL_ADDRESS)(EFI_PAGE_SIZE - 1);
+  log_info(L"arm64 bootinfo base=0x%lx (after kernel image)\r\n",
+           (UINT64)g_xnu_bootinfo_base);
+  status = uefi_call_wrapper(ctx.bs->FreePages, 2, g_xnu_bootinfo_base,
+      (UINTN)((XNU_BOOTINFO_END - XNU_BOOTINFO_BASE) >> EFI_PAGE_SHIFT));
+  if (EFI_ERROR(status)) {
+    log_error(L"bootinfo: FreePages(0x%lx) failed: %r\r\n",
+              (UINT64)g_xnu_bootinfo_base, status);
+    file_free(&ctx, &kernel);
+    return status;
+  }
+
+  status = ReserveBootInfoGuard(&ctx, &bootinfo_guard_base, &bootinfo_guard_pages);
+  if (EFI_ERROR(status)) {
+    file_free(&ctx, &kernel);
+    return status;
+  }
+#endif
 
   /* Single contiguous allocation at phys_base, matching Apple's model */
   status = macho_load_segments_contiguous(&ctx, &image_info, ctx.phys_base, &load_result);
@@ -240,12 +271,6 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
       file_free(&ctx, &kernel);
       return status;
     }
-    /* Note: pstart's __HIB bootstrap immediates (CR3/BootPML4/GDT/stack/ljmp)
-     * and the GDT descriptor base ARE in the local reloc table as negative
-     * (signed) __DATA-relative entries, so macho_apply_kaslr_slide above
-     * already patched them once r_address is treated as signed.  No separate
-     * pstart fixup is needed, boot.efi doesn't do one either. */
-
     /* XNU rebuilds page tables from its embedded header; slide it too. */
     status = macho_patch_header_slide(&image_info, &load_result, ctx.kslide);
     if (EFI_ERROR(status)) {
@@ -345,30 +370,19 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   }
 
 #if defined(__aarch64__)
-  /*
-   * boot_state.args (the x86_64 boot_args struct boot_build_args just
-   * filled in) is unused scratch for arm64 from here on - only kept
-   * around because boot_collect_memory_map/exit_boot_services_retry
-   * below are shared EFI-bookkeeping machinery that happen to take a
-   * BootArgsState*. The struct arm64 XNU actually needs (see boot.h) is
-   * built here instead, reusing the device tree boot_build_args already
-   * built via dt_build() into boot_state.device_tree.
-   *
-   * Must happen before exit_boot_services_retry (below): it calls
-   * AllocatePages, which isn't legal once boot services have exited.
-   */
   LowMemBuffer arm64_args_buf = {0};
   arm64_boot_args *arm64_args = NULL;
   {
-    UINT64 image_size_aligned = (load_result.image_size + EFI_PAGE_SIZE - 1) &
-                                ~(UINT64)(EFI_PAGE_SIZE - 1);
     status = arm64_boot_build_args(
         &ctx,
         cmdline,
         load_result.lowest_vmaddr,               /* virtBase */
         ctx.kernel_region_base,                  /* physBase - staging IS final for arm64 */
-        app_detect_physical_memory_size(&ctx),   /* memSize */
-        ctx.kernel_region_base + image_size_aligned, /* topOfKernelData */
+        /* memSize: XNU's physical world is [physBase, physBase+memSize) and
+         * must not run past the end of real RAM. */
+        (XNU_LOADER_RAM_BASE + app_detect_physical_memory_size(&ctx))
+            - ctx.kernel_region_base,
+        XNU_BOOTINFO_END,                        /* topOfKernelData: covers boot-info block */
         (UINT64)(UINTN)boot_state.device_tree,
         boot_state.device_tree_size,
         &arm64_args_buf,

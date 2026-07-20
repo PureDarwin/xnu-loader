@@ -17,6 +17,10 @@
       arm64 = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./. {
         arch = "aarch64";
       };
+      arm64-virt = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./. {
+        arch = "aarch64";
+        qemuVirt = true;
+      };
     });
   };
 }
