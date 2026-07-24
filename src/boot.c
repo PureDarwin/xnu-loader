@@ -407,7 +407,7 @@ EFI_STATUS boot_build_args(
 
   args->efiMode = kBootArgsEfiMode64;
   args->debugMode = 0;
-  args->flags = kBootArgsFlagHiDPI | kBootArgsFlagBlackBg | kBootArgsFlagLoginUI;
+  args->flags = kBootArgsFlagBlackBg | kBootArgsFlagLoginUI;
 
   args->MemoryMap = (UINT32)(UINTN)state->memory_map;
   args->MemoryMapSize = (UINT32)state->memory_map_size;
