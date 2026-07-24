@@ -32,8 +32,47 @@ struct Boot_Video {
 };
 typedef struct Boot_Video Boot_Video;
 
-#define GRAPHICS_MODE 1
-#define FB_TEXT_MODE  2
+#define GRAPHICS_MODE         1
+#define FB_TEXT_MODE          2
+
+/* Struct describing an image passed in by the booter */
+struct boot_icon_element {
+	unsigned int    width;
+	unsigned int    height;
+	int             y_offset_from_center;
+	unsigned int    data_size;
+	unsigned int    __reserved1[4];
+	unsigned char   data[0];
+};
+typedef struct boot_icon_element boot_icon_element;
+
+/* Boot argument structure - passed into Mach kernel at boot time.
+ * "Revision" can be incremented for compatible changes
+ */
+#define kBootArgsRevision               0
+#define kBootArgsRevision0              kBootArgsRevision
+#define kBootArgsRevision1              1 /* added KC_hdrs_addr */
+#define kBootArgsVersion                2
+
+/* Snapshot constants of previous revisions that are supported */
+#define kBootArgsVersion1               1
+#define kBootArgsVersion2               2
+#define kBootArgsRevision2_0            0
+
+#define kBootArgsEfiMode32              32
+#define kBootArgsEfiMode64              64
+
+/* Bitfields for boot_args->flags */
+#define kBootArgsFlagRebootOnPanic      (1 << 0)
+#define kBootArgsFlagHiDPI              (1 << 1)
+#define kBootArgsFlagBlack              (1 << 2)
+#define kBootArgsFlagCSRActiveConfig    (1 << 3)
+#define kBootArgsFlagCSRConfigMode      (1 << 4)
+#define kBootArgsFlagCSRBoot            (1 << 5)
+#define kBootArgsFlagBlackBg            (1 << 6)
+#define kBootArgsFlagLoginUI            (1 << 7)
+#define kBootArgsFlagInstallUI          (1 << 8)
+#define kBootArgsFlagRecoveryBoot       (1 << 10)
 
 typedef struct boot_args {
   uint16_t Revision;

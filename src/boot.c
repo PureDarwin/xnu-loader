@@ -402,16 +402,12 @@ EFI_STATUS boot_build_args(
     }
   }
 
-  /* boot.efi sets Revision=kBootArgsRevision=1 and Version=kBootArgsVersion2=2.
-   * XNU checks Version to select struct layout; Version=2 enables efiMode/flags. */
-  args->Revision = 1;
-  args->Version  = 2;
+  args->Revision = kBootArgsRevision1;
+  args->Version  = kBootArgsVersion;
 
-  args->efiMode = 64;
+  args->efiMode = kBootArgsEfiMode64;
   args->debugMode = 0;
-  /* boot.efi always sets bit 0; additional bits come from boot-arg parsing.
-   * We set bit 0 (kBootArgsFlagHiDPI baseline) to match. */
-  args->flags = 1;
+  args->flags = kBootArgsFlagHiDPI | kBootArgsFlagBlackBg | kBootArgsFlagLoginUI;
 
   args->MemoryMap = (UINT32)(UINTN)state->memory_map;
   args->MemoryMapSize = (UINT32)state->memory_map_size;
