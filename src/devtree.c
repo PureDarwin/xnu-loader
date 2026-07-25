@@ -1,5 +1,6 @@
 #include "devtree.h"
 #include "console.h"
+#include "app.h"
 #include <efiprot.h>
 
 #ifndef EFI_RNG_PROTOCOL_GUID
@@ -897,6 +898,63 @@ EFI_STATUS dt_build(
     dt_prop_u32(ctx, chosen, "IOFDEUserMatched", io_fde_user_matched);
   }
 
+#if defined(__aarch64__)
+  /*
+   * dram-base / dram-size: the *actual* physical RAM base/size as iBoot
+   * would report it - distinct from boot_args physBase/memSize, which only
+   * cover kernel-managed memory. arm_init() (osfmk/arm/arm_init.c) reads
+   * these unconditionally and panics if either is missing; gDramBase/
+   * gDramSize feed real_avail_end/pmap accounting downstream.
+   */
+#if defined(XNU_LOADER_QEMU_VIRT)
+  #define XNU_LOADER_DRAM_BASE 0x40000000ULL
+#else
+  #define XNU_LOADER_DRAM_BASE 0ULL
+#endif
+  {
+    UINT64 dram_base = XNU_LOADER_DRAM_BASE;
+    UINT64 dram_size = app_detect_physical_memory_size(ctx);
+    dt_prop(ctx, chosen, "dram-base", &dram_base, sizeof(dram_base));
+    dt_prop(ctx, chosen, "dram-size", &dram_size, sizeof(dram_size));
+  }
+
+  {
+    typedef struct {
+      UINT32 version;
+      UINT8  uuid[16];
+      UINT32 num_entries;
+    } TrustCacheModule1Empty;
+
+    typedef struct {
+      UINT64 paddr;
+      UINT64 length;
+    } MemoryMapFileInfo;
+
+    EFI_PHYSICAL_ADDRESS tc_phys = XNU_TRUSTCACHE_PHYS;
+    EFI_STATUS tc_status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
+        AllocateAddress, EfiLoaderData, 1, &tc_phys);
+    if (!EFI_ERROR(tc_status)) {
+      TrustCacheModule1Empty *tc = (TrustCacheModule1Empty *)(UINTN)tc_phys;
+      SetMem(tc, EFI_PAGE_SIZE, 0);
+      tc->version = 1;
+      tc->num_entries = 0;
+
+      DeviceTreeNode *memory_map = dt_create_node(ctx);
+      dt_prop_str(ctx, memory_map, "name", "memory-map");
+
+      MemoryMapFileInfo tc_info;
+      tc_info.paddr = (UINT64)tc_phys;
+      tc_info.length = sizeof(TrustCacheModule1Empty);
+      dt_prop(ctx, memory_map, "TrustCache", &tc_info, sizeof(tc_info));
+
+      dt_add_child(ctx, chosen, memory_map);
+      log_info(L"DT: empty static TrustCache at 0x%lx\r\n", (UINT64)tc_phys);
+    } else {
+      log_info(L"DT: TrustCache page alloc failed: %r (skipping)\r\n", tc_status);
+    }
+  }
+#endif
+
   DeviceTreeNode *platform = dt_create_node(ctx);
   dt_prop_str(ctx, platform, "name", "platform");
 
@@ -1041,6 +1099,60 @@ EFI_STATUS dt_build(
   dt_add_child(ctx, efi, rt_svcs);
   dt_add_child(ctx, efi, kcompat);
 
+#if defined(__aarch64__)
+  DeviceTreeNode *cpus = dt_create_node(ctx);
+  dt_prop_str(ctx, cpus, "name", "cpus");
+  DeviceTreeNode *cpu0 = dt_create_node(ctx);
+  dt_prop_str(ctx, cpu0, "name", "cpu0");
+  dt_prop_str(ctx, cpu0, "state", "running");
+  dt_prop_u32(ctx, cpu0, "reg", 0);
+  {
+    UINT64 cntfrq;
+    __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(cntfrq));
+    dt_prop_u32(ctx, cpu0, "timebase-frequency", (UINT32)cntfrq);
+  }
+  dt_add_child(ctx, cpus, cpu0);
+
+  DeviceTreeNode *armio = dt_create_node(ctx);
+  dt_prop_str(ctx, armio, "name", "arm-io");
+#if defined(XNU_LOADER_QEMU_VIRT)
+  dt_prop_str(ctx, armio, "device_type", "qemuvirt-io");
+  {
+    UINT64 ranges[3] = { 0, 0x08000000ULL, 0x08000000ULL };
+    dt_prop(ctx, armio, "ranges", ranges, sizeof(ranges));
+  }
+  {
+    DeviceTreeNode *uart0 = dt_create_node(ctx);
+    dt_prop_str(ctx, uart0, "name", "uart0");
+    UINT64 uart_reg[2] = { 0x01000000ULL, 0x1000ULL };
+    dt_prop(ctx, uart0, "reg", uart_reg, sizeof(uart_reg));
+    dt_add_child(ctx, armio, uart0);
+  }
+  {
+    DeviceTreeNode *intc = dt_create_node(ctx);
+    dt_prop_str(ctx, intc, "name", "interrupt-controller");
+    dt_prop_str(ctx, intc, "interrupt-controller", "master");
+    UINT64 intc_reg[2] = { 0x00000000ULL, 0x10000ULL }; /* GICD: arm-io base + 0 */
+    dt_prop(ctx, intc, "reg", intc_reg, sizeof(intc_reg));
+    dt_add_child(ctx, armio, intc);
+  }
+  {
+    DeviceTreeNode *timer = dt_create_node(ctx);
+    dt_prop_str(ctx, timer, "name", "timer");
+    dt_prop_str(ctx, timer, "device_type", "timer");
+    UINT64 timer_reg[2] = { 0x000a0000ULL, 0x00f60000ULL }; /* GICR: arm-io base + 0xa0000 */
+    dt_prop(ctx, timer, "reg", timer_reg, sizeof(timer_reg));
+    dt_add_child(ctx, armio, timer);
+  }
+#else
+  dt_prop_str(ctx, armio, "device_type", "bcm2837-io");
+  {
+    UINT64 ranges[3] = { 0, 0x3F000000ULL, 0x01000000ULL };
+    dt_prop(ctx, armio, "ranges", ranges, sizeof(ranges));
+  }
+#endif
+#endif
+
   DeviceTreeNode *root = dt_create_node(ctx);
   dt_prop_str(ctx, root, "name", "device-tree");
   /* IOKit matches the platform driver (AppleI386GenericPlatform) on these two
@@ -1049,6 +1161,25 @@ EFI_STATUS dt_build(
   dt_prop_str(ctx, root, "compatible", "ACPI");
   dt_prop_str(ctx, root, "model", "ACPI");
   dt_add_child(ctx, root, chosen);
+#if defined(__aarch64__)
+  dt_add_child(ctx, root, cpus);
+  dt_add_child(ctx, root, armio);
+
+  /*
+   * /defaults: real iBoot always provides this node (even when empty).
+   * pmap_bootstrap() -> pmap_compute_io_rgns() (osfmk/arm/pmap.c) does
+   * SecureDTLookupEntry(NULL, "/defaults", &entry) unconditionally, guarded
+   * only by assert() (compiled out in RELEASE, live in DEBUG/DEVELOPMENT).
+   * The "pmap-io-ranges" property lookup under it is already handled
+   * gracefully (falls back to "no I/O regions" if missing) - it's just the
+   * node's *existence* that's required.
+   */
+  {
+    DeviceTreeNode *defaults = dt_create_node(ctx);
+    dt_prop_str(ctx, defaults, "name", "defaults");
+    dt_add_child(ctx, root, defaults);
+  }
+#endif
   dt_add_child(ctx, root, efi);
 
   log_info(L"DT: flattening into %lu-byte buffer\r\n", (UINT64)dt_size);

@@ -72,18 +72,32 @@ static VOID serial_putc(CHAR8 c) {
   uart_putc(SERIAL_BASE, c);
 }
 
+#elif defined(__aarch64__) && defined(XNU_LOADER_QEMU_VIRT)
+
+#define QEMUVIRT_UART_BASE 0x09000000ULL
+#define PL011_DR  (*(volatile UINT32 *)(QEMUVIRT_UART_BASE + 0x00))
+#define PL011_FR  (*(volatile UINT32 *)(QEMUVIRT_UART_BASE + 0x18))
+#define PL011_FR_TXFF (1U << 5)
+
+static VOID uart_putc(CHAR8 c) {
+  while ((PL011_FR & PL011_FR_TXFF) != 0) {
+    /* spin until the transmit FIFO has room */
+  }
+  PL011_DR = (UINT32)(UINT8)c;
+}
+
+VOID serial_init(VOID) {
+  /* QEMU's virt PL011 comes up already enabled by firmware/reset; just
+   * start using it directly. */
+  serial_ready = TRUE;
+}
+
+static VOID serial_putc(CHAR8 c) {
+  uart_putc(c);
+}
+
 #elif defined(__aarch64__)
 
-/*
- * PUREDARWIN: compile-only arm64/BCM2837 scaffold - x86's port-mapped
- * 16550 (outb/inb) doesn't exist on this hardware at all. BCM2837's
- * "mini UART" (the one wired to the same GPIO 14/15 pins as the real
- * PL011, and what's usually mapped to /dev/ttyS0 as a console) is a
- * handful of plain MMIO registers instead - real and correct (not a
- * stub), but this loader doesn't yet know its own load address relative
- * to the peripheral base, or whether MMU/UART clock setup has already
- * happened by the time we run, so it's not wired into serial_init() yet.
- */
 #define BCM2837_PERIPHERAL_BASE 0x3F000000ULL
 #define AUX_ENABLES     (*(volatile UINT32 *)(BCM2837_PERIPHERAL_BASE + 0x215004))
 #define AUX_MU_IO_REG   (*(volatile UINT32 *)(BCM2837_PERIPHERAL_BASE + 0x215040))
