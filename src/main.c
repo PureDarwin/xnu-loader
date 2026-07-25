@@ -434,8 +434,27 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   log_info(L"[D] before exit_boot_services\r\n");
 #if defined(__aarch64__)
   log_info(L"boot_args phys = 0x%lx\r\n", (UINT64)(UINTN)arm64_args);
+  log_info(L"handoff entry_vmaddr=0x%lx host_entry=0x%lx phys_entry=0x%lx\r\n",
+           entry_vmaddr, (UINT64)(UINTN)host_entry, (UINT64)(UINTN)host_entry);
+  log_info(L"handoff phys_real=0x%lx vm_base=0x%lx\r\n",
+           (UINT64)ctx.kernel_region_base, load_result.lowest_vmaddr);
+  log_info(L"handoff physBase=0x%lx topOfKernelData=0x%lx\r\n",
+           arm64_args->physBase, arm64_args->topOfKernelData);
 #else
   log_info(L"boot_args phys = 0x%lx\r\n", (UINT64)(UINTN)boot_state.args);
+  {
+    UINT64 handoff_phys_real = 0x100000ULL + ctx.kslide;
+    INT64 handoff_vm_slide = (INT64)handoff_phys_real -
+                             (INT64)load_result.lowest_vmaddr;
+    UINT64 handoff_phys_entry = (UINT64)((INT64)entry_vmaddr +
+                                         handoff_vm_slide);
+    log_info(L"handoff entry_vmaddr=0x%lx host_entry=0x%lx phys_entry=0x%lx\r\n",
+             entry_vmaddr, (UINT64)(UINTN)host_entry, handoff_phys_entry);
+    log_info(L"handoff phys_real=0x%lx vm_base=0x%lx kslide=0x%x\r\n",
+             handoff_phys_real, load_result.lowest_vmaddr, ctx.kslide);
+    log_info(L"handoff kaddr=0x%lx ksize=0x%x\r\n",
+             handoff_phys_real, boot_state.args->ksize);
+  }
 #endif
   log_info(L"stack_top = 0x%lx\r\n",      (UINT64)(UINTN)stack_top);
   log_info(L"entry     = 0x%lx\r\n",      (UINT64)(UINTN)host_entry);
