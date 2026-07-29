@@ -15,7 +15,7 @@
 
 #define KASLR_SLIDE_GRANULE 0x200000ULL   /* 2 MB per slide unit */
 
-#define MACHO_MAX_SEGMENTS 32
+#define MACHO_MAX_SEGMENTS 256
 #define EFI_PAGE_SHIFT 12
 
 #define X86_THREAD_STATE64 4
