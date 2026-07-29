@@ -54,24 +54,11 @@ static VOID ReleaseBootInfoGuard(AppContext *ctx,
 
 EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes, UINT64 virt_base) {
 #if defined(__aarch64__)
-  UINT64 required_rem = virt_base & 0x1FFFFFULL;
-  /* Over-allocate by the boot-info block size so it can be carved out
-   * immediately after the image (see efi_main): XNU's bootstrap KVA mapping
-   * only covers [physBase, physBase+memSize), and arm_vm_init reclaims
-   * everything above topOfKernelData, so boot_args/DT/memmap must live
-   * directly after the kernel image, inside topOfKernelData - the same
-   * placement contract iBoot follows. */
+  UINT64 required_rem = virt_base & (XNU_L2_BLOCK_SIZE - 1);
   UINTN total_pages = (UINTN)((span_bytes +
                                (XNU_BOOTINFO_END - XNU_BOOTINFO_BASE) +
+                               XNU_BOOTINFO_ALIGN +
                                EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT);
-
-  /* XNU treats [physBase, physBase+memSize) as its entire physical world, so
-   * the kernel must sit near the BOTTOM of RAM with all remaining RAM above
-   * it (the iBoot contract). Allocating from the top (AllocateMaxAddress)
-   * made XNU claim a 1GB window that ran past the end of RAM - the VM then
-   * handed out nonexistent pages and physmap writes corrupted kernel text.
-   * Walk upward from RAM base at 2MB steps (keeping phys ≡ virt_base mod
-   * 2MB) until the firmware gives us a fixed-address allocation. */
 #if defined(XNU_LOADER_QEMU_VIRT)
   #define XNU_LOADER_RAM_BASE 0x40000000ULL
 #else
@@ -79,9 +66,10 @@ EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes, UINT64 virt_
 #endif
   EFI_PHYSICAL_ADDRESS base = 0;
   EFI_STATUS status = EFI_NOT_FOUND;
-  for (UINT64 try = XNU_LOADER_RAM_BASE + 0x2000000ULL + required_rem;
-       try < XNU_LOADER_RAM_BASE + 0x2000000ULL + required_rem + 64ULL * 0x200000ULL;
-       try += 0x200000ULL) {
+  for (UINT64 try = XNU_LOADER_RAM_BASE + XNU_L2_BLOCK_SIZE + required_rem;
+       try < XNU_LOADER_RAM_BASE + XNU_L2_BLOCK_SIZE + required_rem +
+             64ULL * XNU_L2_BLOCK_SIZE;
+       try += XNU_L2_BLOCK_SIZE) {
     base = try;
     status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
       AllocateAddress, EfiLoaderData, total_pages, &base);
@@ -235,8 +223,26 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   ctx.phys_base = ctx.kernel_region_base;
 
 #if defined(__aarch64__)
-  g_xnu_bootinfo_base = (ctx.kernel_region_end + EFI_PAGE_SIZE - 1) &
-                        ~(EFI_PHYSICAL_ADDRESS)(EFI_PAGE_SIZE - 1);
+  if (ctx.kernel_region_base < XNU_BOOTINFO_ALIGN) {
+    log_error(L"trustcache: kernel staging address is too low\r\n");
+    file_free(&ctx, &kernel);
+    return EFI_OUT_OF_RESOURCES;
+  }
+  ctx.trustcache_phys = ctx.kernel_region_base - XNU_BOOTINFO_ALIGN;
+  status = uefi_call_wrapper(ctx.bs->AllocatePages, 4,
+      AllocateAddress, EfiLoaderData,
+      (UINTN)(XNU_BOOTINFO_ALIGN >> EFI_PAGE_SHIFT), &ctx.trustcache_phys);
+  if (EFI_ERROR(status)) {
+    log_error(L"trustcache: AllocateAddress(0x%lx) failed: %r\r\n",
+              (UINT64)ctx.trustcache_phys, status);
+    file_free(&ctx, &kernel);
+    return status;
+  }
+  log_info(L"arm64 trustcache page=0x%lx (below kernel)\r\n",
+           (UINT64)ctx.trustcache_phys);
+
+  g_xnu_bootinfo_base = (ctx.kernel_region_end + XNU_BOOTINFO_ALIGN - 1) &
+                        ~(EFI_PHYSICAL_ADDRESS)(XNU_BOOTINFO_ALIGN - 1);
   log_info(L"arm64 bootinfo base=0x%lx (after kernel image)\r\n",
            (UINT64)g_xnu_bootinfo_base);
   status = uefi_call_wrapper(ctx.bs->FreePages, 2, g_xnu_bootinfo_base,
@@ -373,15 +379,16 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   LowMemBuffer arm64_args_buf = {0};
   arm64_boot_args *arm64_args = NULL;
   {
+    UINT64 arm64_phys_base = ctx.kernel_region_base - XNU_BOOTINFO_ALIGN;
+    UINT64 arm64_physical_mem_size =
+        (XNU_LOADER_RAM_BASE + app_detect_physical_memory_size(&ctx))
+        - arm64_phys_base;
     status = arm64_boot_build_args(
         &ctx,
         cmdline,
-        load_result.lowest_vmaddr,               /* virtBase */
-        ctx.kernel_region_base,                  /* physBase - staging IS final for arm64 */
-        /* memSize: XNU's physical world is [physBase, physBase+memSize) and
-         * must not run past the end of real RAM. */
-        (XNU_LOADER_RAM_BASE + app_detect_physical_memory_size(&ctx))
-            - ctx.kernel_region_base,
+        load_result.lowest_vmaddr - XNU_BOOTINFO_ALIGN,  /* virtBase */
+        arm64_phys_base,                         /* physBase - staging IS final for arm64 */
+        arm64_physical_mem_size,
         XNU_BOOTINFO_END,                        /* topOfKernelData: covers boot-info block */
         (UINT64)(UINTN)boot_state.device_tree,
         boot_state.device_tree_size,
@@ -391,6 +398,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
       log_error(L"failed to build arm64 boot_args: %r\r\n", status);
       return status;
     }
+    arm64_args->memSizeActual = arm64_physical_mem_size;
   }
 #endif
 

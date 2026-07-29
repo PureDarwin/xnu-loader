@@ -463,7 +463,7 @@ static BOOLEAN read_hfs_uuid_from_blockio(XnuBlockIoProtocol *bio, CHAR8 uuid_st
     0x00,0x53,0x46,0x48,0x00,0x00,0xAA,0x11,
     0xAA,0x11,0x00,0x30,0x65,0x43,0xEC,0xAC
   };
-  UINT8 block[512];
+  UINT8 block[512] __attribute__((aligned(512)));
   UINT8 hfs_uuid[8];
   UINT64 part_lba = 0;
   UINT64 entries_lba;
@@ -541,17 +541,12 @@ static BOOLEAN find_hfs_boot_uuid(AppContext *ctx, CHAR8 uuid_str[37]) {
   return FALSE;
 }
 
-/* Read the ext4 superblock UUID from the first Linux-filesystem GPT partition
- * on this block device. ext4's superblock lives at byte offset 1024 (LBA 2 of
- * the partition); s_magic (le16) is at offset 0x38 and s_uuid (a full 16-byte
- * UUID) at 0x68. The kernel-side Ext4FileSystemDriver reads the same s_uuid and
- * publishes boot-uuid-media when it equals this. */
 static BOOLEAN read_ext4_uuid_from_blockio(XnuBlockIoProtocol *bio, CHAR8 uuid_str[37]) {
   static const UINT8 linux_fs_guid[16] = {
     0xAF,0x3D,0xC6,0x0F,0x83,0x84,0x72,0x47,
     0x8E,0x79,0x3D,0x69,0xD8,0x47,0x7D,0xE4
   };
-  UINT8 block[512];
+  UINT8 block[512] __attribute__((aligned(512)));
   UINT64 entries_lba;
   UINT32 entry_size, entry_count, media_id;
   UINT64 part_lba = 0;
@@ -683,6 +678,9 @@ EFI_STATUS dt_build(
 
   dt_prop_str(ctx, chosen, "name", "chosen");
   dt_prop_str(ctx, chosen, "boot-args", boot_args);
+
+  /* IODTNVRAM obtains its backing-store size from /chosen. */
+  dt_prop_u32(ctx, chosen, "nvram-total-size", 0x2000);
 
   /* boot-uuid / apfs-preboot-uuid: prefer an explicit root UUID.  The EFI
    * image is loaded from the ESP, so the boot-volume device path is usually
@@ -930,9 +928,13 @@ EFI_STATUS dt_build(
       UINT64 length;
     } MemoryMapFileInfo;
 
-    EFI_PHYSICAL_ADDRESS tc_phys = XNU_TRUSTCACHE_PHYS;
-    EFI_STATUS tc_status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
-        AllocateAddress, EfiLoaderData, 1, &tc_phys);
+    EFI_PHYSICAL_ADDRESS tc_phys = ctx->trustcache_phys;
+    EFI_STATUS tc_status = EFI_SUCCESS;
+    if (tc_phys == 0) {
+      tc_phys = XNU_TRUSTCACHE_PHYS;
+      tc_status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
+          AllocateAddress, EfiLoaderData, 1, &tc_phys);
+    }
     if (!EFI_ERROR(tc_status)) {
       TrustCacheModule1Empty *tc = (TrustCacheModule1Empty *)(UINTN)tc_phys;
       SetMem(tc, EFI_PAGE_SIZE, 0);
@@ -1102,10 +1104,23 @@ EFI_STATUS dt_build(
 #if defined(__aarch64__)
   DeviceTreeNode *cpus = dt_create_node(ctx);
   dt_prop_str(ctx, cpus, "name", "cpus");
+
+  /*
+   * Keep this node compatible with the ARM device-tree binding.  XNU's
+   * topology parser currently accepts a 32-bit reg, but other consumers use
+   * the parent cell sizes when decoding CPU IDs.
+   */
+  dt_prop_u32(ctx, cpus, "#address-cells", 2);
+  dt_prop_u32(ctx, cpus, "#size-cells", 0);
+
   DeviceTreeNode *cpu0 = dt_create_node(ctx);
-  dt_prop_str(ctx, cpu0, "name", "cpu0");
+  dt_prop_str(ctx, cpu0, "name", "cpu@0");
+  dt_prop_str(ctx, cpu0, "device_type", "cpu");
   dt_prop_str(ctx, cpu0, "state", "running");
-  dt_prop_u32(ctx, cpu0, "reg", 0);
+  {
+    UINT64 cpu_id = 0;
+    dt_prop_u64(ctx, cpu0, "reg", cpu_id);
+  }
   {
     UINT64 cntfrq;
     __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(cntfrq));
@@ -1128,27 +1143,24 @@ EFI_STATUS dt_build(
     dt_prop(ctx, uart0, "reg", uart_reg, sizeof(uart_reg));
     dt_add_child(ctx, armio, uart0);
   }
-  {
-    DeviceTreeNode *intc = dt_create_node(ctx);
-    dt_prop_str(ctx, intc, "name", "interrupt-controller");
-    dt_prop_str(ctx, intc, "interrupt-controller", "master");
-    UINT64 intc_reg[2] = { 0x00000000ULL, 0x10000ULL }; /* GICD: arm-io base + 0 */
-    dt_prop(ctx, intc, "reg", intc_reg, sizeof(intc_reg));
-    dt_add_child(ctx, armio, intc);
-  }
-  {
-    DeviceTreeNode *timer = dt_create_node(ctx);
-    dt_prop_str(ctx, timer, "name", "timer");
-    dt_prop_str(ctx, timer, "device_type", "timer");
-    UINT64 timer_reg[2] = { 0x000a0000ULL, 0x00f60000ULL }; /* GICR: arm-io base + 0xa0000 */
-    dt_prop(ctx, timer, "reg", timer_reg, sizeof(timer_reg));
-    dt_add_child(ctx, armio, timer);
-  }
 #else
   dt_prop_str(ctx, armio, "device_type", "bcm2837-io");
   {
     UINT64 ranges[3] = { 0, 0x3F000000ULL, 0x01000000ULL };
     dt_prop(ctx, armio, "ranges", ranges, sizeof(ranges));
+  }
+#endif
+
+#if defined(XNU_LOADER_QEMU_VIRT)
+  DeviceTreeNode *pci = dt_create_node(ctx);
+  dt_prop_str(ctx, pci, "name", "pci");
+  dt_prop_str(ctx, pci, "device_type", "pci");
+  dt_prop_str(ctx, pci, "compatible", "pci-host-ecam-generic");
+  dt_prop_u32(ctx, pci, "#address-cells", 3);
+  dt_prop_u32(ctx, pci, "#size-cells", 2);
+  {
+    UINT32 bus_range[2] = { 0, 255 };
+    dt_prop(ctx, pci, "bus-range", bus_range, sizeof(bus_range));
   }
 #endif
 #endif
@@ -1161,9 +1173,21 @@ EFI_STATUS dt_build(
   dt_prop_str(ctx, root, "compatible", "ACPI");
   dt_prop_str(ctx, root, "model", "ACPI");
   dt_add_child(ctx, root, chosen);
+
+  /* XNU's IODTPlatformExpert requires the standard NVRAM options node. */
+  {
+    DeviceTreeNode *options = dt_create_node(ctx);
+    dt_prop_str(ctx, options, "name", "options");
+    dt_add_child(ctx, root, options);
+  }
 #if defined(__aarch64__)
   dt_add_child(ctx, root, cpus);
+#if !defined(XNU_LOADER_QEMU_VIRT)
   dt_add_child(ctx, root, armio);
+#else
+  dt_add_child(ctx, root, armio);
+  dt_add_child(ctx, root, pci);
+#endif
 
   /*
    * /defaults: real iBoot always provides this node (even when empty).
