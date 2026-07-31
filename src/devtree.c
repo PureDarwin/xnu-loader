@@ -137,6 +137,114 @@ static void dt_prop_u32(AppContext *ctx, DeviceTreeNode *node, const CHAR8 *name
   dt_prop(ctx, node, name, &val, 4);
 }
 
+/*
+ * SMBIOS system UUID -> /options platform-uuid.
+ *
+ * XNU's IOPlatformExpertDevice::generatePlatformUUID() reads a 16-byte
+ * "platform-uuid" OSData from /options on x86_64
+ */
+static BOOLEAN smbios_system_uuid(AppContext *ctx, UINT8 out[16]) {
+  static const EFI_GUID smbios_guid  =
+    {0xeb9d2d31,0x2d88,0x11d3,{0x9a,0x16,0x00,0x90,0x27,0x3f,0xc1,0x4d}};
+  static const EFI_GUID smbios3_guid =
+    {0xf2fd1544,0x9794,0x4a2c,{0x99,0x2e,0xe5,0xbb,0xcf,0x20,0xe3,0x94}};
+
+  UINT8 *tables = NULL;
+  UINTN  tables_len = 0;
+
+  for (UINTN i = 0; i < ctx->st->NumberOfTableEntries; i++) {
+    EFI_CONFIGURATION_TABLE *e = &ctx->st->ConfigurationTable[i];
+    UINT8 *ep = (UINT8 *)e->VendorTable;
+    if (!ep) continue;
+
+    if (!CompareMem(&e->VendorGuid, &smbios3_guid, sizeof(EFI_GUID))) {
+      /* SMBIOS 3.x entry point: "_SM3_", 8-byte table address at 0x10. */
+      if (ep[0]=='_' && ep[1]=='S' && ep[2]=='M' && ep[3]=='3' && ep[4]=='_') {
+        UINT64 addr = 0;
+        CopyMem(&addr, ep + 0x10, sizeof(addr));
+        UINT32 maxlen = 0;
+        CopyMem(&maxlen, ep + 0x0C, sizeof(maxlen));
+        tables = (UINT8 *)(UINTN)addr;
+        tables_len = maxlen;
+        break;
+      }
+    } else if (!CompareMem(&e->VendorGuid, &smbios_guid, sizeof(EFI_GUID))) {
+      /* SMBIOS 2.x entry point: "_SM_", 4-byte table address at 0x18. */
+      if (ep[0]=='_' && ep[1]=='S' && ep[2]=='M' && ep[3]=='_') {
+        UINT32 addr = 0;
+        CopyMem(&addr, ep + 0x18, sizeof(addr));
+        UINT16 len = 0;
+        CopyMem(&len, ep + 0x16, sizeof(len));
+        tables = (UINT8 *)(UINTN)addr;
+        tables_len = len;
+        /* keep looking: prefer a 3.x entry point if one also exists */
+      }
+    }
+  }
+
+  if (!tables || tables_len < 4) return FALSE;
+
+  /* Walk the structure table for Type 1 (System Information). */
+  UINT8 *p   = tables;
+  UINT8 *end = tables + tables_len;
+  while (p + 4 <= end) {
+    UINT8 type = p[0];
+    UINT8 hdr  = p[1];
+    if (hdr < 4) break;
+    if (p + hdr > end) break;
+
+    if (type == 127) break;                  /* end-of-table */
+    if (type == 1 && hdr >= 0x18) {          /* UUID lives at offset 0x08 */
+      UINT8 *u = p + 0x08;
+      /* Reject the all-zero / all-ones "not settable" encodings. */
+      BOOLEAN all0 = TRUE, all1 = TRUE;
+      for (UINTN i = 0; i < 16; i++) {
+        if (u[i] != 0x00) all0 = FALSE;
+        if (u[i] != 0xFF) all1 = FALSE;
+      }
+      if (!all0 && !all1) {
+        /* SMBIOS >= 2.6 stores the first three fields little-endian; swap them
+         * so the value matches what the host reports for this machine. */
+        out[0]=u[3]; out[1]=u[2]; out[2]=u[1]; out[3]=u[0];
+        out[4]=u[5]; out[5]=u[4];
+        out[6]=u[7]; out[7]=u[6];
+        for (UINTN i = 8; i < 16; i++) out[i] = u[i];
+        return TRUE;
+      }
+    }
+
+    /* Skip the formatted area, then the string set (double NUL terminated). */
+    p += hdr;
+    while (p + 1 < end && !(p[0] == 0 && p[1] == 0)) p++;
+    p += 2;
+  }
+  return FALSE;
+}
+
+/* Parse "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" into 16 raw bytes. */
+static BOOLEAN uuid_str_to_bytes(const CHAR8 *str, UINT8 out[16]) {
+  UINTN oi = 0;
+  for (UINTN i = 0; str[i] && oi < 16; i++) {
+    if (str[i] == '-') continue;
+    CHAR8 hi = str[i], lo = str[i + 1];
+    if (!lo) return FALSE;
+    UINT8 v = 0;
+    for (UINTN half = 0; half < 2; half++) {
+      CHAR8 c = half ? lo : hi;
+      UINT8 n;
+      if (c >= '0' && c <= '9') n = (UINT8)(c - '0');
+      else if (c >= 'a' && c <= 'f') n = (UINT8)(c - 'a' + 10);
+      else if (c >= 'A' && c <= 'F') n = (UINT8)(c - 'A' + 10);
+      else return FALSE;
+      v = (UINT8)((v << 4) | n);
+    }
+    out[oi++] = v;
+    i++;
+  }
+  return oi == 16;
+}
+
+
 static void dt_prop_u64(AppContext *ctx, DeviceTreeNode *node, const CHAR8 *name, UINT64 val) {
   dt_prop(ctx, node, name, &val, 8);
 }
@@ -675,6 +783,10 @@ EFI_STATUS dt_build(
   SetMem(dt_base, dt_size, 0);
 
   DeviceTreeNode *chosen = dt_create_node(ctx);
+  /* Kept at function scope so the /options platform-uuid fallback below can
+   * reuse it; the uuid_str that computes it is scoped to an inner block. */
+  CHAR8 boot_uuid_str[37];
+  boot_uuid_str[0] = '\0';
 
   dt_prop_str(ctx, chosen, "name", "chosen");
   dt_prop_str(ctx, chosen, "boot-args", boot_args);
@@ -712,6 +824,7 @@ EFI_STATUS dt_build(
       for (UINTN _i = 0; _i < 37; _i++) uuid_str[_i] = fallback[_i];
     }
     dt_prop_str(ctx, chosen, "boot-uuid", uuid_str);
+    for (UINTN _u = 0; _u < 37; _u++) boot_uuid_str[_u] = uuid_str[_u];
     dt_prop_str(ctx, chosen, "apfs-preboot-uuid", uuid_str);
 
     /* root-matching: UUID-based only for an explicit root UUID.  For an HFS
@@ -1178,6 +1291,14 @@ EFI_STATUS dt_build(
   {
     DeviceTreeNode *options = dt_create_node(ctx);
     dt_prop_str(ctx, options, "name", "options");
+
+    {
+      UINT8 pu[16];
+      BOOLEAN have = smbios_system_uuid(ctx, pu);
+      if (!have && boot_uuid_str[0]) have = uuid_str_to_bytes(boot_uuid_str, pu);
+      if (have) dt_prop(ctx, options, "platform-uuid", pu, sizeof(pu));
+    }
+
     dt_add_child(ctx, root, options);
   }
 #if defined(__aarch64__)
