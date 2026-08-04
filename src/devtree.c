@@ -1211,6 +1211,7 @@ EFI_STATUS dt_build(
   dt_prop_str(ctx, efi, "firmware-abi", "EFI64");
 
   dt_add_child(ctx, efi, platform);
+  dt_add_child(ctx, efi, cfg_tbl);
   dt_add_child(ctx, efi, rt_svcs);
   dt_add_child(ctx, efi, kcompat);
 
