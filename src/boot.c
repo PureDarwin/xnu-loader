@@ -245,6 +245,24 @@ EFI_STATUS boot_set_command_line(BootArgsState *state, boot_args *args, const CH
   return EFI_SUCCESS;
 }
 
+static BOOLEAN boot_cmdline_has_flag(const CHAR8 *cmdline, const CHAR8 *flag) {
+  if (!cmdline || !flag)
+    return FALSE;
+
+  UINTN flen = boot_ascii_len(flag);
+  for (UINTN i = 0; cmdline[i]; i++) {
+    if (i != 0 && cmdline[i - 1] != ' ')
+      continue;
+
+    UINTN j = 0;
+    while (j < flen && cmdline[i + j] == flag[j])
+      j++;
+    if (j == flen && (cmdline[i + j] == '\0' || cmdline[i + j] == ' '))
+      return TRUE;
+  }
+  return FALSE;
+}
+
 EFI_STATUS boot_build_args(
     AppContext *ctx,
     const CHAR8 *cmdline,
@@ -551,12 +569,11 @@ EFI_STATUS boot_fill_video(
            width, height, stride, fb_base, (UINT32)pixel_fmt);
 #endif // VERBOSE_BOOT
 
-  /* This extended Boot_Video (offset 1192, 64-bit v_baseAddr at 1240) is the
-   * struct XNU's PE_init_platform actually consumes.  v_rotate is the DISPLAY
-   * ROTATION (0/1/2/3 = 0/90/180/270 deg), XNU swaps v_width/v_height when
-   * it is 1 or 3.  It is NOT the pixel format; it MUST be 0 or the panel is
-   * rotated and the geometry transposed. */
-  args->Video.v_display  = GRAPHICS_MODE;
+  UINT32 v_display = boot_cmdline_has_flag(args->CommandLine, (const CHAR8 *)"-v")
+                         ? FB_TEXT_MODE
+                         : GRAPHICS_MODE;
+
+  args->Video.v_display  = v_display;
   args->Video.v_rowBytes = stride;
   args->Video.v_width    = width;
   args->Video.v_height   = height;
@@ -573,7 +590,7 @@ EFI_STATUS boot_fill_video(
     log_error(L"boot_fill_video: WARNING framebuffer 0x%lx > 4GB, truncated\r\n",
               fb_base);
   args->VideoV1.v_baseAddr = (UINT32)fb_base;
-  args->VideoV1.v_display  = GRAPHICS_MODE;
+  args->VideoV1.v_display  = v_display;
   args->VideoV1.v_rowBytes = stride;
   args->VideoV1.v_width    = width;
   args->VideoV1.v_height   = height;
