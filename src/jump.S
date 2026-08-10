@@ -89,6 +89,24 @@ jump_to_xnu:
 
 .text
 .code64
+.globl pd_call_on_stack
+.type pd_call_on_stack, @function
+
+/*
+ * pd_call_on_stack(void *new_sp, void (*fn)(void *), void *arg)
+ *
+ * Move to a caller-supplied stack and call fn there
+ * SysV: rdi = new_sp, rsi = fn, rdx = arg.
+ */
+pd_call_on_stack:
+    mov %rdi, %rsp
+    and $~0xF, %rsp        /* ABI wants rsp 16-byte aligned at the call */
+    xor %rbp, %rbp         /* terminate frame-pointer chains on the new stack */
+    mov %rdx, %rdi         /* arg becomes fn's first parameter */
+    call *%rsi
+1:  hlt                    /* fn is noreturn; trap if it ever comes back */
+    jmp 1b
+
 .globl jump_to_xnu
 .type jump_to_xnu, @function
 

@@ -5,6 +5,45 @@
 #include "fileio.h"
 #include "macho.h"
 #include "jump.h"
+#include "serial.h"
+
+static VOID   *g_jump_entry;
+static UINT64  g_jump_args;
+static VOID   *g_jump_stack;
+static UINT64  g_copy_src;
+static UINT64  g_copy_dst;
+static UINT64  g_copy_bytes;
+
+#if defined(__x86_64__)
+static VOID finish_boot_and_jump(VOID *unused)
+{
+  UINT64 *src64 = (UINT64 *)(UINTN)g_copy_src;
+  UINT64 *dst64 = (UINT64 *)(UINTN)g_copy_dst;
+  UINTN   words = (UINTN)((g_copy_bytes + 7) >> 3);
+
+  (VOID)unused;
+
+  serial_trace((CONST CHAR8 *)"copy src   ", g_copy_src);
+  serial_trace((CONST CHAR8 *)"copy dst   ", g_copy_dst);
+  serial_trace((CONST CHAR8 *)"copy end   ", g_copy_dst + g_copy_bytes);
+  serial_trace((CONST CHAR8 *)"loader sp  ", (UINT64)(UINTN)&words);
+
+  for (UINTN i = 0; i < words; i++)
+    dst64[i] = src64[i];
+
+  /* Low memory can be shadowed, decoded elsewhere or simply not backed by RAM
+   * on real hardware, in which case the stores above are dropped and the kernel
+   * we jump to is whatever was already there. */
+  if (dst64[0] != src64[0] || dst64[words - 1] != src64[words - 1]) {
+    serial_mark((CONST CHAR8 *)"FATAL kernel copy did not land");
+    for (;;) { }
+  }
+  serial_mark((CONST CHAR8 *)"copy verified");
+  serial_mark((CONST CHAR8 *)"jumping to kernel");
+
+  jump_to_xnu(g_jump_entry, g_jump_args, g_jump_stack);
+}
+#endif
 
 #if defined(__aarch64__)
 EFI_PHYSICAL_ADDRESS g_xnu_bootinfo_base;
@@ -475,6 +514,8 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     return status;
   }
 
+  serial_mark((CONST CHAR8 *)"exit_boot_services returned");
+
 #if defined(__x86_64__)
   /* Copy staged kernel image to its SLID physical base (0x100000 + kslide).
    * boot.efi physically relocates the whole image: each segment goes to
@@ -487,12 +528,6 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
    * be the slid base too.
    * OVMF's memory (0x800000-0x1780000) is now reclaimed as conventional. */
   UINT64 phys_real  = 0x100000ULL + ctx.kslide;
-  {
-    UINT64 *src64 = (UINT64 *)(UINTN)ctx.kernel_region_base;
-    UINT64 *dst64 = (UINT64 *)(UINTN)phys_real;
-    UINTN   words = (UINTN)((load_result.image_size + 7) >> 3);
-    for (UINTN i = 0; i < words; i++) dst64[i] = src64[i];
-  }
 
   /* kaddr = slid physical base so vm_kernel_slide == kslide; entry runs at
    * the slid low-identity physical (pstart immediates were relocated). */
@@ -568,11 +603,30 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
         d->Type = EfiConventionalMemory;
     }
 
+    serial_trace((CONST CHAR8 *)"mmap src   ", (UINT64)(UINTN)src);
+    serial_trace((CONST CHAR8 *)"mmap dst   ", (UINT64)mm_fixed);
+    serial_trace((CONST CHAR8 *)"mmap bytes ", (UINT64)sz);
+    serial_trace((CONST CHAR8 *)"mmap dsz   ", (UINT64)dsz);
+    serial_trace((CONST CHAR8 *)"mmap in    ", (UINT64)n);
+
+    /* The relocated map must fit the 16 pages reserved at XNU_MEMMAP_PHYS. */
+    if (sz > 16 * EFI_PAGE_SIZE) {
+      serial_trace((CONST CHAR8 *)"FATAL mmap exceeds reserved bytes ",
+                   (UINT64)(16 * EFI_PAGE_SIZE));
+      for (;;) { }
+    }
+
     UINTN out = 0;
     for (UINTN i = 0; i < n; i++) {
-      EFI_MEMORY_DESCRIPTOR *cur  = (EFI_MEMORY_DESCRIPTOR *)(dst + i  * dsz);
-      EFI_MEMORY_DESCRIPTOR *prev = (EFI_MEMORY_DESCRIPTOR *)(dst + out * dsz);
-      if (out > 0 &&
+      EFI_MEMORY_DESCRIPTOR *cur  = (EFI_MEMORY_DESCRIPTOR *)(dst + i * dsz);
+      /* `out` is the next free slot, so the previously emitted descriptor is
+       * at out-1. Using `out` here made prev and cur the same pointer on every
+       * iteration (out stayed equal to i precisely because nothing ever
+       * merged), so every comparison was a descriptor against itself and the
+       * coalescing pass silently did nothing. */
+      EFI_MEMORY_DESCRIPTOR *prev =
+          out > 0 ? (EFI_MEMORY_DESCRIPTOR *)(dst + (out - 1) * dsz) : NULL;
+      if (prev != NULL &&
           cur->Type      == prev->Type &&
           cur->Attribute == prev->Attribute &&
           cur->PhysicalStart ==
@@ -588,16 +642,55 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
       }
     }
 
+    serial_trace((CONST CHAR8 *)"mmap out   ", (UINT64)out);
+
+    if (out > 128)
+      serial_trace((CONST CHAR8 *)"WARNING descriptors exceed XNU limit 128, out=",
+                   (UINT64)out);
+
     boot_state.args->MemoryMap     = (UINT32)mm_fixed;
     boot_state.args->MemoryMapSize = (UINT32)(out * dsz);
   }
 
-  jump_to_xnu(
-      phys_entry,
+  serial_trace((CONST CHAR8 *)"boot_args  ", (UINT64)(UINTN)boot_state.args);
+  serial_trace((CONST CHAR8 *)"entry      ", (UINT64)(UINTN)phys_entry);
+  serial_trace((CONST CHAR8 *)"stack_top  ", (UINT64)(UINTN)stack_top);
+
+  g_jump_entry = phys_entry;
 #if defined(__aarch64__)
-      (UINT64)(UINTN)arm64_args,
+  g_jump_args  = (UINT64)(UINTN)arm64_args;
 #else
-      (UINT64)(UINTN)boot_state.args,
+  g_jump_args  = (UINT64)(UINTN)boot_state.args;
 #endif
-      stack_top);
+  g_jump_stack = stack_top;
+
+#if defined(__x86_64__)
+  /* The destination is fixed at 0x100000 while the boot-info block sits at
+   * XNU_BOOTINFO_BASE, so a large enough kernel silently overwrites boot_args,
+   * the device tree and the relocated memory map - and the only symptom is an
+   * unexplained early hang. Nothing else checks this. */
+  if (phys_real + load_result.image_size > XNU_BOOTINFO_BASE) {
+    serial_trace((CONST CHAR8 *)"FATAL kernel overruns bootinfo at ",
+                 XNU_BOOTINFO_BASE);
+    for (;;) { }
+  }
+
+  g_copy_src   = ctx.kernel_region_base;
+  g_copy_dst   = phys_real;
+  g_copy_bytes = load_result.image_size;
+
+  {
+    UINT64 probe = (UINT64)(UINTN)&phys_real;
+    serial_trace((CONST CHAR8 *)"firmware sp", probe);
+    if (probe >= phys_real && probe < phys_real + load_result.image_size)
+      serial_mark((CONST CHAR8 *)"NOTE firmware stack is inside the copy destination, switching stacks");
+  }
+
+  /* Do the copy from a stack we own, clear of the destination. */
+  pd_call_on_stack(stack_top, finish_boot_and_jump, NULL);
+#else
+  serial_mark((CONST CHAR8 *)"jumping to kernel");
+  jump_to_xnu(g_jump_entry, g_jump_args, g_jump_stack);
+#endif
 }
+

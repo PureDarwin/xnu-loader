@@ -45,9 +45,13 @@ static VOID uart_program(UINT16 b) {
   io_outb(b + UART_MCR, 0x0B);                 /* DTR | RTS | OUT2                   */
 }
 
+#define UART_TX_SPIN_LIMIT 100000u
+
 static VOID uart_putc(UINT16 b, CHAR8 c) {
+  UINT32 spins = 0;
   while ((io_inb(b + UART_LSR) & LSR_THRE) == 0) {
-    /* spin until the transmit holding register drains */
+    if (++spins >= UART_TX_SPIN_LIMIT)
+      return;  /* drop the byte rather than wedge the caller */
   }
   io_outb(b + UART_THR, (UINT8)c);
 }
@@ -68,6 +72,11 @@ VOID serial_init(VOID) {
   serial_ready = TRUE;
 }
 
+VOID serial_reinit(VOID) {
+  uart_program(SERIAL_BASE);
+  serial_ready = TRUE;
+}
+
 static VOID serial_putc(CHAR8 c) {
   uart_putc(SERIAL_BASE, c);
 }
@@ -80,8 +89,10 @@ static VOID serial_putc(CHAR8 c) {
 #define PL011_FR_TXFF (1U << 5)
 
 static VOID uart_putc(CHAR8 c) {
+  UINT32 spins = 0;
   while ((PL011_FR & PL011_FR_TXFF) != 0) {
-    /* spin until the transmit FIFO has room */
+    if (++spins >= 100000u)
+      return;  /* bounded: see the x86 uart_putc comment */
   }
   PL011_DR = (UINT32)(UINT8)c;
 }
@@ -89,6 +100,10 @@ static VOID uart_putc(CHAR8 c) {
 VOID serial_init(VOID) {
   /* QEMU's virt PL011 comes up already enabled by firmware/reset; just
    * start using it directly. */
+  serial_ready = TRUE;
+}
+
+VOID serial_reinit(VOID) {
   serial_ready = TRUE;
 }
 
@@ -108,8 +123,10 @@ static VOID serial_putc(CHAR8 c) {
 #define AUX_MU_BAUD_REG (*(volatile UINT32 *)(BCM2837_PERIPHERAL_BASE + 0x215068))
 
 static VOID uart_putc(CHAR8 c) {
+  UINT32 spins = 0;
   while ((AUX_MU_LSR_REG & 0x20) == 0) {
-    /* spin until the transmit holding register drains */
+    if (++spins >= 100000u)
+      return;  /* bounded: see the x86 uart_putc comment */
   }
   AUX_MU_IO_REG = (UINT32)(UINT8)c;
 }
@@ -123,6 +140,10 @@ VOID serial_init(VOID) {
   AUX_MU_CNTL_REG = 3;   /* enable tx+rx */
 
   serial_ready = TRUE;
+}
+
+VOID serial_reinit(VOID) {
+  serial_init();
 }
 
 static VOID serial_putc(CHAR8 c) {
@@ -147,4 +168,35 @@ VOID serial_put16(CONST CHAR16 *s) {
    * through; narrow any non-ASCII unit to '?'. */
   for (; *s; ++s)
     serial_putc((*s > 0x7F) ? (CHAR8)'?' : (CHAR8)*s);
+}
+
+VOID serial_puthex(UINT64 v) {
+  CONST CHAR8 *digits = (CONST CHAR8 *)"0123456789ABCDEF";
+  CHAR8 buf[17];
+  int i = 16;
+
+  buf[16] = 0;
+  if (v == 0) {
+    serial_puts8((CONST CHAR8 *)"0");
+    return;
+  }
+  while (v != 0 && i > 0) {
+    buf[--i] = digits[v & 0xF];
+    v >>= 4;
+  }
+  serial_puts8(&buf[i]);
+}
+
+VOID serial_trace(CONST CHAR8 *tag, UINT64 v) {
+  serial_puts8((CONST CHAR8 *)"[EBS] ");
+  serial_puts8(tag);
+  serial_puts8((CONST CHAR8 *)" 0x");
+  serial_puthex(v);
+  serial_puts8((CONST CHAR8 *)"\r\n");
+}
+
+VOID serial_mark(CONST CHAR8 *tag) {
+  serial_puts8((CONST CHAR8 *)"[EBS] ");
+  serial_puts8(tag);
+  serial_puts8((CONST CHAR8 *)"\r\n");
 }

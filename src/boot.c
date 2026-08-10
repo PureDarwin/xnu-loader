@@ -2,6 +2,7 @@
 #include "console.h"
 #include "devtree.h"
 #include "fileio.h"
+#include "serial.h"
 #include <efiprot.h>
 
 /* IRQ mask/unmask, real on both architectures (not stubs) - x86's
@@ -15,6 +16,10 @@
 #else
 #error "boot.c: unsupported architecture"
 #endif
+
+/* Attempts allowed before ExitBootServices is declared unworkable. Firmware
+ * that is going to accept a key does so within the first couple of tries. */
+#define EBS_MAX_ATTEMPTS 16
 
 static UINT64 align_up_u64(UINT64 v, UINT64 a) {
   return (v + (a - 1)) & ~(a - 1);
@@ -696,23 +701,26 @@ EFI_STATUS exit_boot_services_retry(
 
   boot_update_args_memory_map(ctx, state);
 
-  for (;;) {
+  /*
+   * Bounded so a firmware that never validates our key fails loudly instead of
+   * spinning here forever with no output, which is indistinguishable from a
+   * dead machine.
+   */
+  UINTN attempt = 0;
+  for (attempt = 0; attempt < EBS_MAX_ATTEMPTS; attempt++) {
     UINTN map_size = state->memory_map_buf.pages << EFI_PAGE_SHIFT;
     UINTN key = 0;
     UINTN desc_size = 0;
     UINT32 desc_ver = 0;
+    BOOLEAN mask_irqs = (attempt > 0);
 
-    /*
-     * Disable hardware interrupts so the 8254 timer cannot fire between
-     * GetMemoryMap capturing the key and ExitBootServices validating it.
-     * OVMF DEBUG fires 14+ memory-map-change events inside GetMemoryMap
-     * (debug callbacks that AllocatePool), so the key returned is already
-     * "post-events". Without CLI the periodic timer interrupt fires
-     * between GM return and EBS, incrementing the key one more time and
-     * causing perpetual EFI_INVALID_PARAMETER in QEMU TCG where each
-     * instruction takes longer in wall-clock time.
-     */
-    IRQ_DISABLE();
+    serial_puts8((CONST CHAR8 *)"[EBS] attempt ");
+    serial_puthex((UINT64)attempt);
+    serial_puts8(mask_irqs ? (CONST CHAR8 *)" (irqs masked)\r\n"
+                           : (CONST CHAR8 *)" (irqs enabled)\r\n");
+
+    if (mask_irqs)
+      IRQ_DISABLE();
 
     status = uefi_call_wrapper(
         ctx->bs->GetMemoryMap,
@@ -724,7 +732,12 @@ EFI_STATUS exit_boot_services_retry(
         &desc_ver);
 
     if (EFI_ERROR(status)) {
-      IRQ_ENABLE();
+      if (mask_irqs)
+        IRQ_ENABLE();
+      serial_trace((CONST CHAR8 *)"GetMemoryMap failed, status ", (UINT64)status);
+      serial_trace((CONST CHAR8 *)"  need bytes ", (UINT64)map_size);
+      serial_trace((CONST CHAR8 *)"  have bytes ",
+                   (UINT64)(state->memory_map_buf.pages << EFI_PAGE_SHIFT));
       return status;
     }
 
@@ -745,31 +758,8 @@ EFI_STATUS exit_boot_services_retry(
         key);
 
     if (status == EFI_SUCCESS) {
-      /*
-       * Call SetVirtualAddressMap now that boot services are gone.
-       *
-       * Assign EFI runtime virtual addresses the way boot.efi does: a single
-       * CONTIGUOUS, PACKED range placed just above the kernel image, in
-       * ascending physical order.  This is the only scheme that satisfies BOTH
-       * constraints imposed by XNU's efi_init (osfmk/i386/AT386/model_dep.c):
-       *
-       *   - efi_init maps each runtime descriptor with pmap_map_bd(), which
-       *     requires the target VA to already have a page-table page and
-       *     PANICS ("pmap_map_bd: Invalid kernel address") otherwise.  The
-       *     bootstrap kernel pmap only has NKPT (=500) page tables, covering
-       *     VA [KERNEL_BASE, KERNEL_BASE + 500*2MB) = up to +0x3E800000.  So a
-       *     runtime VA must be BELOW 0x3E800000.  (A per-descriptor
-       *     PhysicalStart & 0x3FFFFFFF map fails here: a runtime page at phys
-       *     ~0x3eb3f000 lands just past the NKPT edge.)
-       *   - efi_init OR-s low VAs into VM_MIN_KERNEL_ADDRESS and maps
-       *     VirtualStart -> PhysicalStart in the kernel's own address space, so
-       *     the VA must NOT overlap the kernel image [kaddr, kaddr+ksize) or it
-       *     clobbers kernel text.
-       *
-       * The window (kaddr+ksize, 0x3E800000) has page tables (NKPT) with empty
-       * PTEs, so packing there is both PT-backed and collision-free.  Pages are
-       * not moved physically; only their VA mapping is assigned.
-       */
+      serial_reinit();
+      serial_mark((CONST CHAR8 *)"ExitBootServices returned SUCCESS");
       EFI_RUNTIME_SERVICES *rt = ctx->st->RuntimeServices;
       UINT8 *rmap = (UINT8 *)state->memory_map_buf.ptr;
       UINTN rdesc_sz = state->descriptor_size;
@@ -796,12 +786,6 @@ EFI_STATUS exit_boot_services_retry(
        * relative to it, otherwise pmap_map_bd sees VAs with no page table.
        */
       UINT64 kaddr    = 0x100000ULL + ctx->kslide;
-      /*
-       * Pack runtime VAs above the boot-info block (XNU_RT_VA_BASE), not just
-       * above the kernel image: the boot-info block [XNU_BOOTINFO_BASE,
-       * XNU_BOOTINFO_END) holds boot_args/DT/EFI-tables/memmap and must not be
-       * clobbered by efi_init's runtime PTE writes.
-       */
       UINT64 va_base  = XNU_RT_VA_BASE;
 
       UINT64 va_cursor   = va_base;
@@ -810,21 +794,9 @@ EFI_STATUS exit_boot_services_retry(
         EFI_MEMORY_DESCRIPTOR *d = (EFI_MEMORY_DESCRIPTOR *)(rmap + roff);
         if (!(d->Attribute & EFI_MEMORY_RUNTIME))
           continue;
-
-        BOOLEAN pack = (d->Type == EfiRuntimeServicesCode ||
-                d->Type == EfiRuntimeServicesData ||
-                d->Type == EfiMemoryMappedIO ||
-                d->Type == EfiMemoryMappedIOPortSpace);
-
-        if (pack) {
-          UINT64 sz = (UINT64)d->NumberOfPages << EFI_PAGE_SHIFT;
-          d->VirtualStart = va_cursor;
-          va_cursor += sz;
-        } else {
-          /* Identity: VA == PA. efi_init OR-s VM_MIN_KERNEL_ADDRESS on
-          * any VA below it, landing safely within the NKPT window. */
-          d->VirtualStart = d->PhysicalStart;
-        }
+        UINT64 sz = (UINT64)d->NumberOfPages << EFI_PAGE_SHIFT;
+        d->VirtualStart = va_cursor;
+        va_cursor += sz;
 
         UINT32 vpg = (UINT32)(d->VirtualStart >> EFI_PAGE_SHIFT);
         if (vpg < rmin_virt_pg) rmin_virt_pg = vpg;
@@ -834,9 +806,23 @@ EFI_STATUS exit_boot_services_retry(
       UINT64 new_kend = (va_cursor + 0x1FFFFFULL) & ~0x1FFFFFULL;
       state->args->ksize = (UINT32)(new_kend - kaddr);
 
+      serial_trace((CONST CHAR8 *)"SVAM va_base   ", va_base);
+      serial_trace((CONST CHAR8 *)"SVAM va_cursor ", va_cursor);
+      serial_trace((CONST CHAR8 *)"SVAM new_kend  ", new_kend);
+      serial_trace((CONST CHAR8 *)"SVAM ksize     ", (UINT64)state->args->ksize);
+      if (va_cursor > 0x3E800000ULL) {
+        serial_trace((CONST CHAR8 *)"FATAL runtime VA window passes NKPT edge 0x3E800000, cursor ",
+                     va_cursor);
+        for (;;) { }
+      }
+      serial_mark((CONST CHAR8 *)"calling SetVirtualAddressMap");
+
       rt->SetVirtualAddressMap(rmap_sz, rdesc_sz,
                                state->descriptor_version,
                                (EFI_MEMORY_DESCRIPTOR *)rmap);
+
+      serial_reinit();
+      serial_mark((CONST CHAR8 *)"SetVirtualAddressMap returned");
 
       /* Update boot_args: virtual page start only.
        * efiSystemTable was already set to the conventional-memory copy
@@ -850,11 +836,24 @@ EFI_STATUS exit_boot_services_retry(
       return EFI_SUCCESS;
     }
 
-    IRQ_ENABLE();
+    if (mask_irqs)
+      IRQ_ENABLE();
+
+    /* Reporting happens here, with interrupts back on and the window closed,
+     * so the diagnostics cannot themselves widen the race being diagnosed. */
+    serial_trace((CONST CHAR8 *)"ExitBootServices rejected, status ",
+                 (UINT64)status);
+    serial_trace((CONST CHAR8 *)"  key       ", (UINT64)key);
+    serial_trace((CONST CHAR8 *)"  map bytes ", (UINT64)map_size);
+    serial_trace((CONST CHAR8 *)"  desc size ", (UINT64)desc_size);
 
     if (status != EFI_INVALID_PARAMETER)
       return status;
   }
+
+  serial_trace((CONST CHAR8 *)"FATAL ExitBootServices never accepted our key after attempts ",
+               (UINT64)EBS_MAX_ATTEMPTS);
+  return EFI_INVALID_PARAMETER;
 }
 
 #if defined(__aarch64__)

@@ -702,6 +702,40 @@ static BOOLEAN read_ext4_uuid_from_blockio(XnuBlockIoProtocol *bio, CHAR8 uuid_s
   return TRUE;
 }
 
+static UINTN dp_total_size(EFI_DEVICE_PATH *dp) {
+  EFI_DEVICE_PATH *n = dp;
+  UINTN len = 0;
+  while (n && !(n->Type == 0x7F)) {
+    UINTN nlen = (UINTN)n->Length[0] | ((UINTN)n->Length[1] << 8);
+    if (nlen < 4) break;                 /* malformed; stop rather than spin */
+    len += nlen;
+    n = (EFI_DEVICE_PATH *)((UINT8 *)n + nlen);
+  }
+  return len;
+}
+
+static BOOLEAN dp_is_boot_disk(AppContext *ctx, EFI_HANDLE cand) {
+  static EFI_GUID dp_guid = EFI_DEVICE_PATH_PROTOCOL_GUID;
+  EFI_DEVICE_PATH *boot_dp = NULL, *cand_dp = NULL;
+
+  if (!ctx->boot_volume) return FALSE;
+  if (EFI_ERROR(uefi_call_wrapper(ctx->bs->HandleProtocol, 3,
+                                  ctx->boot_volume, &dp_guid, (VOID **)&boot_dp)))
+    return FALSE;
+  if (EFI_ERROR(uefi_call_wrapper(ctx->bs->HandleProtocol, 3,
+                                  cand, &dp_guid, (VOID **)&cand_dp)))
+    return FALSE;
+
+  UINTN cand_len = dp_total_size(cand_dp);
+  if (cand_len == 0 || cand_len > dp_total_size(boot_dp)) return FALSE;
+
+  /* The disk handle's path must be a proper prefix of the ESP's path. */
+  for (UINTN i = 0; i < cand_len; i++) {
+    if (((UINT8 *)cand_dp)[i] != ((UINT8 *)boot_dp)[i]) return FALSE;
+  }
+  return TRUE;
+}
+
 static BOOLEAN find_ext4_boot_uuid(AppContext *ctx, CHAR8 uuid_str[37]) {
   static EFI_GUID block_io_guid =
       { 0x964e5b21, 0x6459, 0x11d2, { 0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b } };
@@ -712,14 +746,23 @@ static BOOLEAN find_ext4_boot_uuid(AppContext *ctx, CHAR8 uuid_str[37]) {
                                   ByProtocol, &block_io_guid, NULL, &count, &handles)))
     return FALSE;
 
-  for (UINTN i = 0; i < count; i++) {
-    XnuBlockIoProtocol *bio = NULL;
-    if (EFI_ERROR(uefi_call_wrapper(ctx->bs->HandleProtocol, 3,
-                                    handles[i], &block_io_guid, (VOID **)&bio)))
-      continue;
-    if (read_ext4_uuid_from_blockio(bio, uuid_str)) {
-      uefi_call_wrapper(ctx->bs->FreePool, 1, handles);
-      return TRUE;
+  for (UINTN pass = 0; pass < 2; pass++) {
+    for (UINTN i = 0; i < count; i++) {
+      XnuBlockIoProtocol *bio = NULL;
+      BOOLEAN on_boot_disk = dp_is_boot_disk(ctx, handles[i]);
+
+      if (pass == 0 && !on_boot_disk) continue;
+      if (pass == 1 && on_boot_disk) continue;   /* already tried */
+
+      if (EFI_ERROR(uefi_call_wrapper(ctx->bs->HandleProtocol, 3,
+                                      handles[i], &block_io_guid, (VOID **)&bio)))
+        continue;
+      if (read_ext4_uuid_from_blockio(bio, uuid_str)) {
+        log_info(L"DT: ext4 root found on %a disk\r\n",
+                 pass == 0 ? "boot" : "non-boot (fallback)");
+        uefi_call_wrapper(ctx->bs->FreePool, 1, handles);
+        return TRUE;
+      }
     }
   }
 
