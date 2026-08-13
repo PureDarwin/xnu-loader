@@ -14,6 +14,87 @@ static UINT64  g_copy_src;
 static UINT64  g_copy_dst;
 static UINT64  g_copy_bytes;
 
+static BOOLEAN boot_args_has_rd(const CHAR8 *args) {
+  if (!args)
+    return FALSE;
+  for (const CHAR8 *p = args; *p; p++) {
+    if ((p == args || p[-1] == ' ') && p[0] == 'r' && p[1] == 'd' && p[2] == '=')
+      return TRUE;
+  }
+  return FALSE;
+}
+
+static EFI_STATUS append_ramdisk_boot_arg(
+    AppContext *ctx, const CHAR8 **cmdline, BOOLEAN *owned) {
+  const CHAR8 suffix[] = " rd=md0";
+  UINTN len = 0;
+  CHAR8 *copy = NULL;
+
+  if (!ctx || !cmdline || !*cmdline || !owned)
+    return EFI_INVALID_PARAMETER;
+  if (boot_args_has_rd(*cmdline))
+    return EFI_SUCCESS;
+
+  while ((*cmdline)[len] != '\0')
+    len++;
+  UINTN suffix_len = sizeof(suffix) - 1;
+  EFI_STATUS status = app_alloc_pool(ctx, len + suffix_len + 1, (VOID **)&copy);
+  if (EFI_ERROR(status))
+    return status;
+
+  CopyMem(copy, *cmdline, len);
+  CopyMem(copy + len, suffix, suffix_len + 1);
+  if (*owned)
+    app_free_pool(ctx, (VOID *)(UINTN)*cmdline);
+  *cmdline = copy;
+  *owned = TRUE;
+  return EFI_SUCCESS;
+}
+
+static EFI_STATUS load_ramdisk(AppContext *ctx) {
+  EFI_FILE_PROTOCOL *root = NULL;
+  FileBuffer image = {0};
+  LowMemBuffer storage = {0};
+  EFI_STATUS status;
+
+  status = app_open_self_volume(ctx, &root);
+  if (!EFI_ERROR(status)) {
+    status = file_read_all(ctx, root, L"\\ramdisk.img", &image);
+    uefi_call_wrapper(root->Close, 1, root);
+  }
+
+  if (EFI_ERROR(status)) {
+    log_info(L"no local ramdisk.img (%r); trying TFTP\r\n", status);
+    status = file_read_all_via_tftp(ctx, (CONST CHAR8 *)"ramdisk.img", &image);
+  }
+
+  if (EFI_ERROR(status)) {
+    log_info(L"no ramdisk.img found (%r); continuing without RAMDisk\r\n", status);
+    return EFI_SUCCESS;
+  }
+
+  if (image.size == 0) {
+    file_free(ctx, &image);
+    log_info(L"ramdisk.img is empty; continuing without RAMDisk\r\n");
+    return EFI_SUCCESS;
+  }
+
+  status = lowmem_alloc_pages(ctx, image.size, EfiLoaderData, &storage);
+  if (EFI_ERROR(status)) {
+    file_free(ctx, &image);
+    log_error(L"failed to allocate RAMDisk pages: %r\r\n", status);
+    return status;
+  }
+
+  CopyMem(storage.ptr, image.data, image.size);
+  file_free(ctx, &image);
+  ctx->ramdisk_phys = storage.phys;
+  ctx->ramdisk_size = (UINT64)(storage.pages << EFI_PAGE_SHIFT);
+  log_info(L"loaded ramdisk.img RAMDisk phys=0x%lx size=0x%lx\r\n",
+           (UINT64)ctx->ramdisk_phys, ctx->ramdisk_size);
+  return EFI_SUCCESS;
+}
+
 #if defined(__x86_64__)
 static VOID finish_boot_and_jump(VOID *unused)
 {
@@ -360,6 +441,10 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
 
   log_info(L"entry vm=0x%lx -> host=0x%lx\r\n", entry_vmaddr, (UINT64)(UINTN)host_entry);
 
+  status = load_ramdisk(&ctx);
+  if (EFI_ERROR(status))
+    return status;
+
   BootArgsState boot_state = {0};
 
   ReleaseBootInfoGuard(&ctx, &bootinfo_guard_base, &bootinfo_guard_pages);
@@ -375,6 +460,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   }
 
   CONST CHAR8 *cmdline = "-v debug=0x219 -nogzalloc_mode keepsyms=1 serial=3 gopconsole=1";
+  BOOLEAN cmdline_owned = FALSE;
   FileBuffer boot_args_file = {0};
   EFI_STATUS args_status = file_read_all_from_any_volume(
       &ctx,
@@ -398,6 +484,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
         CopyMem(copy, bytes, len);
         copy[len] = '\0';
         cmdline = copy;
+        cmdline_owned = TRUE;
         log_info(L"boot-args.txt: using \"%a\"\r\n", cmdline);
       } else {
         log_error(L"boot-args.txt: AllocatePool failed (%r), using default\r\n", status);
@@ -406,6 +493,14 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     file_free(&ctx, &boot_args_file);
   } else {
     log_info(L"no boot-args.txt found (%r); using default boot args\r\n", args_status);
+  }
+
+  if (ctx.ramdisk_size != 0) {
+    status = append_ramdisk_boot_arg(&ctx, &cmdline, &cmdline_owned);
+    if (EFI_ERROR(status)) {
+      log_error(L"failed to append rd=md0: %r\r\n", status);
+      return status;
+    }
   }
 
   status = boot_build_args(&ctx, cmdline, &load_result, &boot_state);
@@ -440,6 +535,9 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     arm64_args->memSizeActual = arm64_physical_mem_size;
   }
 #endif
+
+  if (cmdline_owned)
+    app_free_pool(&ctx, (VOID *)(UINTN)cmdline);
 
   EFI_PHYSICAL_ADDRESS stack_base = 0xFFFFFFFFULL;
   UINTN stack_pages = 16;
@@ -693,4 +791,3 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   jump_to_xnu(g_jump_entry, g_jump_args, g_jump_stack);
 #endif
 }
-

@@ -491,12 +491,24 @@ EFI_STATUS boot_build_args(
   return EFI_SUCCESS;
 }
 
-EFI_STATUS boot_fill_video(
+/*
+ * Locate the firmware's GOP and settle on a linear mode, reporting the result
+ * in width/height/stride/base. found is left FALSE for every "no display here"
+ * outcome - no GOP at all, or only Blt-only modes - which is not an error: XNU
+ * boots fine on the serial console with v_display zeroed.
+ *
+ * Split out from boot_fill_video() because arm64's Boot_Video is the same six
+ * fields at 64 bits wide, so only the probe can be shared, not the assignment.
+ */
+static EFI_STATUS boot_probe_video(
     AppContext *ctx,
-    boot_args *args)
+    const CHAR8 *cmdline,
+    boot_video_info *out)
 {
-  if (!ctx || !args)
+  if (!ctx || !out)
       return EFI_INVALID_PARAMETER;
+
+  SetMem(out, sizeof(*out), 0);
 
   EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
 
@@ -514,7 +526,7 @@ EFI_STATUS boot_fill_video(
    * located are treated as fatal, since those indicate a broken GOP rather
    * than its absence. */
   if (EFI_ERROR(status) || !gop || !gop->Mode || !gop->Mode->Info) {
-    log_info(L"boot_fill_video: no usable GOP (%r), continuing headless\r\n", status);
+    log_info(L"boot_probe_video: no usable GOP (%r), continuing headless\r\n", status);
     return EFI_SUCCESS;
   }
 
@@ -547,15 +559,15 @@ EFI_STATUS boot_fill_video(
         }
       }
       if (best_mode == gop->Mode->MaxMode) {
-        log_info(L"boot_fill_video: current mode not linear and no linear mode "
+        log_info(L"boot_probe_video: current mode not linear and no linear mode "
                  L"found, continuing headless\r\n");
         return EFI_SUCCESS;
       }
-      log_info(L"boot_fill_video: current mode not linear, switching to mode %u\r\n",
+      log_info(L"boot_probe_video: current mode not linear, switching to mode %u\r\n",
                best_mode);
       status = uefi_call_wrapper(gop->SetMode, 2, gop, best_mode);
       if (EFI_ERROR(status)) {
-        log_info(L"boot_fill_video: SetMode(%u) failed: %r, continuing headless\r\n",
+        log_info(L"boot_probe_video: SetMode(%u) failed: %r, continuing headless\r\n",
                  best_mode, status);
         return EFI_SUCCESS;
       }
@@ -570,39 +582,93 @@ EFI_STATUS boot_fill_video(
   UINT8 pixel_fmt = (UINT8)gop->Mode->Info->PixelFormat;
 
 #ifdef VERBOSE_BOOT
-  log_info(L"boot_fill_video: %ux%u stride=%u fb=0x%lx pixfmt=%u\r\n",
+  log_info(L"boot_probe_video: %ux%u stride=%u fb=0x%lx pixfmt=%u\r\n",
            width, height, stride, fb_base, (UINT32)pixel_fmt);
 #endif // VERBOSE_BOOT
 
-  UINT32 v_display = boot_cmdline_has_flag(args->CommandLine, (const CHAR8 *)"-v")
-                         ? FB_TEXT_MODE
-                         : GRAPHICS_MODE;
-
-  args->Video.v_display  = v_display;
-  args->Video.v_rowBytes = stride;
-  args->Video.v_width    = width;
-  args->Video.v_height   = height;
-  args->Video.v_depth    = 32;
-  args->Video.v_rotate   = 0;
-  args->Video.v_baseAddr = fb_base;
+  out->found     = TRUE;
+  out->base_addr = fb_base;
+  out->row_bytes = stride;
+  out->width     = width;
+  out->height    = height;
+  out->depth     = 32;
+  out->display   = boot_cmdline_has_flag(cmdline, (const CHAR8 *)"-v")
+                       ? FB_TEXT_MODE
+                       : GRAPHICS_MODE;
   (void)pixel_fmt;
+
+  return EFI_SUCCESS;
+}
+
+EFI_STATUS boot_fill_video(
+    AppContext *ctx,
+    boot_args *args)
+{
+  boot_video_info vi;
+  EFI_STATUS status;
+
+  if (!ctx || !args)
+      return EFI_INVALID_PARAMETER;
+
+  status = boot_probe_video(ctx, args->CommandLine, &vi);
+  if (EFI_ERROR(status) || !vi.found)
+    return status;
+
+  args->Video.v_display  = (UINT32)vi.display;
+  args->Video.v_rowBytes = (UINT32)vi.row_bytes;
+  args->Video.v_width    = (UINT32)vi.width;
+  args->Video.v_height   = (UINT32)vi.height;
+  args->Video.v_depth    = (UINT32)vi.depth;
+  args->Video.v_rotate   = 0;
+  args->Video.v_baseAddr = vi.base_addr;
 
   /* VideoV1 (the struct XNU reads at boot_args+1048): base addr is 32-bit.
    * XNU's Boot_Video.v_baseAddr is 32-bit, so a framebuffer above 4GB cannot
    * be described, warn (some discrete GPUs place the FB high, but Macs and
    * most laptop iGPUs keep it below 4GB). */
-  if (fb_base > 0xFFFFFFFFULL)
+  if (vi.base_addr > 0xFFFFFFFFULL)
     log_error(L"boot_fill_video: WARNING framebuffer 0x%lx > 4GB, truncated\r\n",
-              fb_base);
-  args->VideoV1.v_baseAddr = (UINT32)fb_base;
-  args->VideoV1.v_display  = v_display;
-  args->VideoV1.v_rowBytes = stride;
-  args->VideoV1.v_width    = width;
-  args->VideoV1.v_height   = height;
-  args->VideoV1.v_depth    = 32;
+              vi.base_addr);
+  args->VideoV1.v_baseAddr = (UINT32)vi.base_addr;
+  args->VideoV1.v_display  = (UINT32)vi.display;
+  args->VideoV1.v_rowBytes = (UINT32)vi.row_bytes;
+  args->VideoV1.v_width    = (UINT32)vi.width;
+  args->VideoV1.v_height   = (UINT32)vi.height;
+  args->VideoV1.v_depth    = (UINT32)vi.depth;
 
   return EFI_SUCCESS;
 }
+
+#if defined(__aarch64__)
+/*
+ * arm64's Boot_Video is 64-bit throughout and has no VideoV1 companion, so it
+ * can carry a framebuffer anywhere in the address space without the 4GB
+ * truncation the x86 struct suffers.
+ */
+EFI_STATUS arm64_boot_fill_video(
+    AppContext *ctx,
+    arm64_boot_args *args)
+{
+  boot_video_info vi;
+  EFI_STATUS status;
+
+  if (!ctx || !args)
+      return EFI_INVALID_PARAMETER;
+
+  status = boot_probe_video(ctx, (const CHAR8 *)args->CommandLine, &vi);
+  if (EFI_ERROR(status) || !vi.found)
+    return status;
+
+  args->Video.v_baseAddr = vi.base_addr;
+  args->Video.v_display  = (vi.display == FB_TEXT_MODE) ? 0 : 1;
+  args->Video.v_rowBytes = vi.row_bytes;
+  args->Video.v_width    = vi.width;
+  args->Video.v_height   = vi.height;
+  args->Video.v_depth    = vi.depth;
+
+  return EFI_SUCCESS;
+}
+#endif /* __aarch64__ */
 
 VOID boot_free_args(
     AppContext *ctx,
@@ -912,6 +978,11 @@ EFI_STATUS arm64_boot_build_args(
     CopyMem(args->CommandLine, cmdline, len);
     args->CommandLine[len] = '\0';
   }
+
+  /* After CommandLine: the probe reads -v from it to pick text vs graphics
+   * mode. Leaving Video zeroed (v_display = 0) is what happens when there is
+   * no linear framebuffer, and is how this booted before - serial only. */
+  (VOID)arm64_boot_fill_video(ctx, args);
 
   *out_args_buf = args_buf;
   *out_args = args;

@@ -226,7 +226,22 @@ EFI_STATUS boot_set_command_line(BootArgsState *state,  boot_args *args, const C
 
 EFI_STATUS boot_build_args(AppContext *ctx, const CHAR8 *cmdline, MachoLoadResult *load_result, BootArgsState *state);
 
+/* Result of probing the firmware's GOP, in the widest form either boot_args
+ * flavour needs. found == FALSE means "no display", which is not an error. */
+typedef struct boot_video_info {
+  BOOLEAN found;
+  UINT64  base_addr;
+  UINT64  display;
+  UINT64  row_bytes;
+  UINT64  width;
+  UINT64  height;
+  UINT64  depth;
+} boot_video_info;
+
 EFI_STATUS boot_fill_video(AppContext *ctx, boot_args *args);
+#if defined(__aarch64__)
+EFI_STATUS arm64_boot_fill_video(AppContext *ctx, arm64_boot_args *args);
+#endif
 
 VOID boot_free_args(AppContext *ctx, BootArgsState *state);
 

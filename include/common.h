@@ -84,6 +84,9 @@ typedef struct AppContext {
   UINT64 phys_base;
   EFI_PHYSICAL_ADDRESS kernel_region_base;
   EFI_PHYSICAL_ADDRESS kernel_region_end;
+  /* Page-rounded RAMDisk retained through ExitBootServices. */
+  EFI_PHYSICAL_ADDRESS ramdisk_phys;
+  UINT64 ramdisk_size;
 #if defined(__aarch64__)
   /* Release XNU expects the trust-cache EXTRADATA range below the KC. */
   EFI_PHYSICAL_ADDRESS trustcache_phys;

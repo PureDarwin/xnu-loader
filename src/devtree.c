@@ -1052,6 +1052,13 @@ EFI_STATUS dt_build(
     dt_prop_u32(ctx, chosen, "IOFDEUserMatched", io_fde_user_matched);
   }
 
+  typedef struct {
+    UINT64 paddr;
+    UINT64 length;
+  } MemoryMapFileInfo;
+
+  DeviceTreeNode *memory_map = NULL;
+
 #if defined(__aarch64__)
   /*
    * dram-base / dram-size: the *actual* physical RAM base/size as iBoot
@@ -1079,11 +1086,6 @@ EFI_STATUS dt_build(
       UINT32 num_entries;
     } TrustCacheModule1Empty;
 
-    typedef struct {
-      UINT64 paddr;
-      UINT64 length;
-    } MemoryMapFileInfo;
-
     EFI_PHYSICAL_ADDRESS tc_phys = ctx->trustcache_phys;
     EFI_STATUS tc_status = EFI_SUCCESS;
     if (tc_phys == 0) {
@@ -1097,21 +1099,39 @@ EFI_STATUS dt_build(
       tc->version = 1;
       tc->num_entries = 0;
 
-      DeviceTreeNode *memory_map = dt_create_node(ctx);
-      dt_prop_str(ctx, memory_map, "name", "memory-map");
+      if (memory_map == NULL) {
+        memory_map = dt_create_node(ctx);
+        dt_prop_str(ctx, memory_map, "name", "memory-map");
+      }
 
       MemoryMapFileInfo tc_info;
       tc_info.paddr = (UINT64)tc_phys;
       tc_info.length = sizeof(TrustCacheModule1Empty);
       dt_prop(ctx, memory_map, "TrustCache", &tc_info, sizeof(tc_info));
 
-      dt_add_child(ctx, chosen, memory_map);
       log_info(L"DT: empty static TrustCache at 0x%lx\r\n", (UINT64)tc_phys);
     } else {
       log_info(L"DT: TrustCache page alloc failed: %r (skipping)\r\n", tc_status);
     }
   }
 #endif
+
+  if (ctx->ramdisk_size != 0) {
+    if (memory_map == NULL) {
+      memory_map = dt_create_node(ctx);
+      dt_prop_str(ctx, memory_map, "name", "memory-map");
+    }
+
+    MemoryMapFileInfo ramdisk_info;
+    ramdisk_info.paddr = (UINT64)ctx->ramdisk_phys;
+    ramdisk_info.length = ctx->ramdisk_size;
+    dt_prop(ctx, memory_map, "RAMDisk", &ramdisk_info, sizeof(ramdisk_info));
+    log_info(L"DT: RAMDisk at 0x%lx size=0x%lx\r\n",
+             (UINT64)ctx->ramdisk_phys, ctx->ramdisk_size);
+  }
+
+  if (memory_map != NULL)
+    dt_add_child(ctx, chosen, memory_map);
 
   DeviceTreeNode *platform = dt_create_node(ctx);
   dt_prop_str(ctx, platform, "name", "platform");
