@@ -1116,19 +1116,18 @@ EFI_STATUS dt_build(
   }
 #endif
 
-  if (ctx->ramdisk_size != 0) {
-    if (memory_map == NULL) {
-      memory_map = dt_create_node(ctx);
-      dt_prop_str(ctx, memory_map, "name", "memory-map");
-    }
-
-    MemoryMapFileInfo ramdisk_info;
-    ramdisk_info.paddr = (UINT64)ctx->ramdisk_phys;
-    ramdisk_info.length = ctx->ramdisk_size;
-    dt_prop(ctx, memory_map, "RAMDisk", &ramdisk_info, sizeof(ramdisk_info));
-    log_info(L"DT: RAMDisk at 0x%lx size=0x%lx\r\n",
-             (UINT64)ctx->ramdisk_phys, ctx->ramdisk_size);
-  }
+  //if (ctx->ramdisk_size != 0) {
+  //  if (memory_map == NULL) {
+  //    memory_map = dt_create_node(ctx);
+  //    dt_prop_str(ctx, memory_map, "name", "memory-map");
+  //  }
+  //  MemoryMapFileInfo ramdisk_info;
+  //  ramdisk_info.paddr = (UINT64)ctx->ramdisk_phys;
+  //  ramdisk_info.length = ctx->ramdisk_size;
+  //  dt_prop(ctx, memory_map, "RAMDisk", &ramdisk_info, sizeof(ramdisk_info));
+  //  log_info(L"DT: RAMDisk at 0x%lx size=0x%lx\r\n",
+  //           (UINT64)ctx->ramdisk_phys, ctx->ramdisk_size);
+  //}
 
   if (memory_map != NULL)
     dt_add_child(ctx, chosen, memory_map);

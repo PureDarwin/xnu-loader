@@ -26,7 +26,7 @@ static BOOLEAN boot_args_has_rd(const CHAR8 *args) {
 
 static EFI_STATUS append_ramdisk_boot_arg(
     AppContext *ctx, const CHAR8 **cmdline, BOOLEAN *owned) {
-  const CHAR8 suffix[] = " rd=md0";
+  const CHAR8 suffix[] = " ";
   UINTN len = 0;
   CHAR8 *copy = NULL;
 
@@ -96,8 +96,7 @@ static EFI_STATUS load_ramdisk(AppContext *ctx) {
 }
 
 #if defined(__x86_64__)
-static VOID finish_boot_and_jump(VOID *unused)
-{
+static VOID finish_boot_and_jump(VOID *unused) {
   UINT64 *src64 = (UINT64 *)(UINTN)g_copy_src;
   UINT64 *dst64 = (UINT64 *)(UINTN)g_copy_dst;
   UINTN   words = (UINTN)((g_copy_bytes + 7) >> 3);
@@ -441,9 +440,9 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
 
   log_info(L"entry vm=0x%lx -> host=0x%lx\r\n", entry_vmaddr, (UINT64)(UINTN)host_entry);
 
-  status = load_ramdisk(&ctx);
-  if (EFI_ERROR(status))
-    return status;
+  //status = load_ramdisk(&ctx);
+  //if (EFI_ERROR(status))
+  //  return status;
 
   BootArgsState boot_state = {0};
 
@@ -495,13 +494,14 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     log_info(L"no boot-args.txt found (%r); using default boot args\r\n", args_status);
   }
 
-  if (ctx.ramdisk_size != 0) {
-    status = append_ramdisk_boot_arg(&ctx, &cmdline, &cmdline_owned);
-    if (EFI_ERROR(status)) {
-      log_error(L"failed to append rd=md0: %r\r\n", status);
-      return status;
-    }
-  }
+  // disabled until things work right
+  //if (ctx.ramdisk_size != 0) {
+  //  status = append_ramdisk_boot_arg(&ctx, &cmdline, &cmdline_owned);
+  //  if (EFI_ERROR(status)) {
+  //    log_error(L"failed to append rd=md0: %r\r\n", status);
+  //    return status;
+  //  }
+  //}
 
   status = boot_build_args(&ctx, cmdline, &load_result, &boot_state);
   if (EFI_ERROR(status)) {
