@@ -39,7 +39,12 @@ extern EFI_PHYSICAL_ADDRESS g_xnu_bootinfo_base;
 
 #define XNU_BOOTARGS_PHYS       (XNU_BOOTINFO_BASE + 0x00000) /* 1 page       */
 #define XNU_EFITABLES_PHYS      (XNU_BOOTINFO_BASE + 0x01000) /* 1 page       */
-#define XNU_DEVTREE_PHYS        (XNU_BOOTINFO_BASE + 0x02000) /* 2 pages      */
+/* 8 pages: /chosen carries an nvram-proxy-data blob the size of one NVRAM
+ * bank, which alone is twice the old 2-page budget. Sits in the hole between
+ * the trustcache page and the memory map rather than growing in place, so
+ * XNU_ARM64_BOOTARGS_PHYS and XNU_TRUSTCACHE_PHYS keep their addresses. */
+#define XNU_DEVTREE_PHYS        (XNU_BOOTINFO_BASE + 0x06000) /* 8 pages      */
+#define XNU_DEVTREE_PAGES       8
 #if defined(__aarch64__)
 #define XNU_ARM64_BOOTARGS_PHYS (XNU_BOOTINFO_BASE + 0x04000) /* 1 page       */
 #endif

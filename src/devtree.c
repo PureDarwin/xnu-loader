@@ -3,6 +3,13 @@
 #include "app.h"
 #include <efiprot.h>
 
+/* One NVRAM bank. 0x2000 is the conventional CHRP size and leaves room for the
+ * 0x800 common partition plus headers. */
+#define XNU_NVRAM_BANK_SIZE 0x2000
+
+/* Arbitrary but stable: /defaults serial-device points at /arm-io/uart0. */
+#define XNU_LOADER_UART0_PHANDLE 1
+
 #ifndef EFI_RNG_PROTOCOL_GUID
 #define EFI_RNG_PROTOCOL_GUID \
   { 0x3152bca5, 0xeade, 0x433d, { 0x86, 0x2e, 0xc0, 0x1c, 0xdc, 0x29, 0x1f, 0x44 }}
@@ -13,6 +20,77 @@ typedef struct _EFI_RNG_PROTOCOL {
       EFI_GUID *Algorithm, UINTN ValueLength, UINT8 *Value);
 } EFI_RNG_PROTOCOL;
 #endif
+
+/*
+ * Build one blank but *valid* CHRP NVRAM bank.
+ *
+ * It has to be valid, not merely zeroed. IONVRAMCHRPHandler::unserializeImage
+ * bails at validateNVRAMVersion leaving _commonPartitionOffset = 0xFFFFFFFF
+ * while _commonPartitionSize keeps its 0x800 constructor default, so
+ * unserializeVariables then reads _nvramImage + 0xFFFFFFFF and the kernel takes
+ * a data abort with far=0xffffffff. Real iBoot always hands over a valid image,
+ * so XNU never guards that path.
+ *
+ * Layout: a 2-block "nvram" apple header partition, then a "common" partition
+ * covering the rest of the bank with an empty (all-zero) variable area.
+ */
+#define CHRP_BLOCK 0x10
+
+static UINT8 chrp_hdr_checksum(const UINT8 *hdr) {
+  /* sum of sig + the len and name bytes, folded to 8 bits; cksum excluded */
+  UINT16 sum = hdr[0];
+  for (UINTN i = 2; i < CHRP_BLOCK; i++)
+    sum += hdr[i];
+  while (sum > 0xff)
+    sum = (sum & 0xff) + (sum >> 8);
+  return (UINT8)(sum & 0xff);
+}
+
+static UINT32 chrp_adler32(const UINT8 *buf, UINTN len) {
+  UINT32 a = 1, b = 0;
+  for (UINTN i = 0; i < len; i++) {
+    a = (a + buf[i]) % 65521;
+    b = (b + a) % 65521;
+  }
+  return (b << 16) | a;
+}
+
+static VOID chrp_build_blank_bank(UINT8 *bank, UINTN size) {
+  const CHAR8 *hdr_name = (const CHAR8 *)"nvram";
+  const CHAR8 *com_name = (const CHAR8 *)"common";
+  UINTN i;
+
+  SetMem(bank, size, 0);
+
+  /* apple_nvram_header: chrp(16) + adler(4) + generation(4) + padding(8) */
+  bank[0] = 0x5a;                       /* sig */
+  bank[2] = 2; bank[3] = 0;             /* len, in 16-byte blocks */
+  for (i = 0; hdr_name[i]; i++)
+    bank[4 + i] = (UINT8)hdr_name[i];
+  bank[1] = chrp_hdr_checksum(bank);
+  /* generation at +20; adler at +16 is filled in last, over [+20, size) */
+  bank[20] = 1;
+
+  /* common partition fills the remainder */
+  {
+    UINT8 *com = bank + 2 * CHRP_BLOCK;
+    UINT16 blocks = (UINT16)((size - 2 * CHRP_BLOCK) / CHRP_BLOCK);
+    com[0] = 0x70;
+    com[2] = (UINT8)(blocks & 0xff);
+    com[3] = (UINT8)(blocks >> 8);
+    for (i = 0; com_name[i]; i++)
+      com[4 + i] = (UINT8)com_name[i];
+    com[1] = chrp_hdr_checksum(com);
+  }
+
+  {
+    UINT32 adler = chrp_adler32(bank + 20, size - 20);
+    bank[16] = (UINT8)(adler & 0xff);
+    bank[17] = (UINT8)((adler >> 8) & 0xff);
+    bank[18] = (UINT8)((adler >> 16) & 0xff);
+    bank[19] = (UINT8)((adler >> 24) & 0xff);
+  }
+}
 
 static UINTN dt_align4(UINTN v) {
   return (v + 3) & ~((UINTN)3);
@@ -814,14 +892,14 @@ EFI_STATUS dt_build(
   EFI_STATUS status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
       AllocateAddress,
       EfiLoaderData,
-      2,
+      XNU_DEVTREE_PAGES,
       &dt_addr);
   if (EFI_ERROR(status)) {
     log_info(L"DT: AllocatePages failed: %r\n", status);
     return status;
   }
 
-  UINTN dt_size = EFI_PAGE_SIZE * 2;
+  UINTN dt_size = EFI_PAGE_SIZE * XNU_DEVTREE_PAGES;
   UINT8 *dt_base = (UINT8 *)(UINTN)dt_addr;
   SetMem(dt_base, dt_size, 0);
 
@@ -834,8 +912,30 @@ EFI_STATUS dt_build(
   dt_prop_str(ctx, chosen, "name", "chosen");
   dt_prop_str(ctx, chosen, "boot-args", boot_args);
 
-  /* IODTNVRAM obtains its backing-store size from /chosen. */
-  dt_prop_u32(ctx, chosen, "nvram-total-size", 0x2000);
+  /* IODTNVRAM obtains its backing-store geometry from /chosen. xnu 12377 wants
+   * the bank triple, not just the old nvram-total-size, and
+   * IODTNVRAMFormatHandler::getNVRAMProperties fails the whole handler if any
+   * one is missing - which reaches XNU as a bare
+   * "IONVRAMCHRPHandler creation failed" panic. nvram-proxy-data must be
+   * exactly nvram-bank-size bytes or CHRP init rejects the length. A blank
+   * image is fine: it fails isValidImage (so we get the CHRP handler, not V3)
+   * and unserializeImage only logs. */
+  {
+    static UINT8 nvram_blank[XNU_NVRAM_BANK_SIZE];
+    chrp_build_blank_bank(nvram_blank, sizeof(nvram_blank));
+    dt_prop_u32(ctx, chosen, "nvram-total-size",   XNU_NVRAM_BANK_SIZE);
+    dt_prop_u32(ctx, chosen, "nvram-bank-size",    XNU_NVRAM_BANK_SIZE);
+    dt_prop_u32(ctx, chosen, "nvram-bank-count",   1);
+    dt_prop_u32(ctx, chosen, "nvram-current-bank", 0);
+    dt_prop(ctx, chosen, "nvram-proxy-data", nvram_blank, sizeof(nvram_blank));
+  }
+
+  /* ml_unsafe_kernel_text_init() (osfmk/arm64/machine_routines.c) reads this
+   * and leaves _unsafe_kernel_text_initialized false when it is absent, so
+   * ml_unsafe_kernel_text() then trips its own assert on DEVELOPMENT/DEBUG.
+   * Zero means "CTRR will not be enabled", which is the truth here: QEMU virt
+   * has no CTRR/KTRR and the board is built NO_MONITOR. */
+  dt_prop_u32(ctx, chosen, "kernel-ctrr-to-be-enabled", 0);
 
   /* boot-uuid / apfs-preboot-uuid: prefer an explicit root UUID.  The EFI
    * image is loaded from the ESP, so the boot-volume device path is usually
@@ -990,10 +1090,12 @@ EFI_STATUS dt_build(
     dt_prop(ctx, chosen, "boot-kernelcache-adler32", &adler, 4);
   }
 
-  /* 64 entropy bytes for PE_get_random_seed().
+  /* Entropy bytes for PE_get_random_seed().
    * Use EFI_RNG_PROTOCOL if present, else mix TSC with a simple xorshift. */
   {
-    UINT8 seed[64];
+    /* 256 bytes: arm64 xnu asks for 4*SHA512_DIGEST_LENGTH and panics in
+     * bootseed_init_bootloader if it gets less. x86_64 only reads 64. */
+    UINT8 seed[256];
     static EFI_GUID rng_guid = EFI_RNG_PROTOCOL_GUID;
     EFI_RNG_PROTOCOL *rng = NULL;
     BOOLEAN got_rng = FALSE;
@@ -1005,7 +1107,7 @@ EFI_STATUS dt_build(
        * args in the wrong registers -> firmware faults. QEMU/OVMF has no RNG
        * protocol so this path only ever ran on real hardware (where it crashed
        * right after "found HFS boot UUID"). */
-      if (!EFI_ERROR(uefi_call_wrapper(rng->GetRNG, 4, rng, NULL, 64, seed)))
+      if (!EFI_ERROR(uefi_call_wrapper(rng->GetRNG, 4, rng, NULL, sizeof(seed), seed)))
         got_rng = TRUE;
     }
 
@@ -1015,7 +1117,7 @@ EFI_STATUS dt_build(
       UINT64 state = rdtsc64_raw();
       if (!state)
         state = 0xDEADBEEFCAFEBABEULL;
-      for (UINTN si = 0; si < 64; si++) {
+      for (UINTN si = 0; si < sizeof(seed); si++) {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
@@ -1023,7 +1125,7 @@ EFI_STATUS dt_build(
       }
     }
 
-    dt_prop(ctx, chosen, "random-seed", seed, 64);
+    dt_prop(ctx, chosen, "random-seed", seed, sizeof(seed));
   }
 
   /* booter-name: boot.efi writes "boot.efi" (9 bytes incl null) */
@@ -1313,8 +1415,13 @@ EFI_STATUS dt_build(
     dt_prop(ctx, armio, "ranges", ranges, sizeof(ranges));
   }
   {
+    /* xnu 12377's serial_init picks a driver by matching "compatible" on the
+     * node named by /defaults serial-device, so the node needs both that
+     * string and a phandle to be reachable at all. */
     DeviceTreeNode *uart0 = dt_create_node(ctx);
     dt_prop_str(ctx, uart0, "name", "uart0");
+    dt_prop_str(ctx, uart0, "compatible", "arm,pl011");
+    dt_prop_u32(ctx, uart0, "AAPL,phandle", XNU_LOADER_UART0_PHANDLE);
     UINT64 uart_reg[2] = { 0x01000000ULL, 0x1000ULL };
     dt_prop(ctx, uart0, "reg", uart_reg, sizeof(uart_reg));
     dt_add_child(ctx, armio, uart0);
@@ -1385,6 +1492,10 @@ EFI_STATUS dt_build(
   {
     DeviceTreeNode *defaults = dt_create_node(ctx);
     dt_prop_str(ctx, defaults, "name", "defaults");
+#if defined(XNU_LOADER_QEMU_VIRT)
+    /* Without this serial_init() returns early and the kernel is silent. */
+    dt_prop_u32(ctx, defaults, "serial-device", XNU_LOADER_UART0_PHANDLE);
+#endif
     dt_add_child(ctx, root, defaults);
   }
 #endif
@@ -1394,7 +1505,7 @@ EFI_STATUS dt_build(
   UINT32 used = dt_flatten_node(root, dt_base);
   if (used > dt_size) {
     log_info(L"DT: overflow %u > %u\n", used, (UINT32)dt_size);
-    uefi_call_wrapper(ctx->bs->FreePages, 2, dt_addr, 2);
+    uefi_call_wrapper(ctx->bs->FreePages, 2, dt_addr, XNU_DEVTREE_PAGES);
     return EFI_BUFFER_TOO_SMALL;
   }
 

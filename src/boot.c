@@ -967,7 +967,10 @@ EFI_STATUS arm64_boot_build_args(
   args->memSize = mem_size;
   args->topOfKernelData = top_of_kernel_data;
   args->machineType = 0; /* unused by this kernel's pe_arm_init path */
-  args->deviceTreeP = device_tree_phys;
+  /* Virtual, not physical: pexpert/arm/pe_init.c hands deviceTreeP straight to
+   * SecureDTInit with no ptov, so iBoot's contract is a kernel VA. The DT sits
+   * below topOfKernelData, so arm_vm_init has it mapped at virtBase + delta. */
+  args->deviceTreeP = virt_base + (device_tree_phys - phys_base);
   args->deviceTreeLength = device_tree_len;
   args->bootFlags = 0;
   args->memSizeActual = 0; /* 0 == "same as memSize", per real XNU's convention */

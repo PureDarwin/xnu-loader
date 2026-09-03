@@ -174,9 +174,11 @@ static VOID ReleaseBootInfoGuard(AppContext *ctx,
 EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes, UINT64 virt_base) {
 #if defined(__aarch64__)
   UINT64 required_rem = virt_base & (XNU_L2_BLOCK_SIZE - 1);
+  /* Two XNU_BOOTINFO_ALIGN slacks: one below base for the trustcache page,
+   * one above to keep the bootinfo block inside this allocation. */
   UINTN total_pages = (UINTN)((span_bytes +
                                (XNU_BOOTINFO_END - XNU_BOOTINFO_BASE) +
-                               XNU_BOOTINFO_ALIGN +
+                               2 * XNU_BOOTINFO_ALIGN +
                                EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT);
 #if defined(XNU_LOADER_QEMU_VIRT)
   #define XNU_LOADER_RAM_BASE 0x40000000ULL
@@ -189,11 +191,15 @@ EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes, UINT64 virt_
        try < XNU_LOADER_RAM_BASE + XNU_L2_BLOCK_SIZE + required_rem +
              64ULL * XNU_L2_BLOCK_SIZE;
        try += XNU_L2_BLOCK_SIZE) {
-    base = try;
+    /* Claim the trustcache page below the image as part of this allocation;
+     * grabbing it separately afterwards fails whenever UEFI already owns it. */
+    base = try - XNU_BOOTINFO_ALIGN;
     status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
       AllocateAddress, EfiLoaderData, total_pages, &base);
-    if (!EFI_ERROR(status))
+    if (!EFI_ERROR(status)) {
+      base = try;
       break;
+    }
   }
   if (EFI_ERROR(status)) {
     log_error(L"AllocKernelMemRegion: no low-RAM slot for %lu pages: %r\r\n",
@@ -201,7 +207,8 @@ EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes, UINT64 virt_
     return status;
   }
 
-  SetMem((VOID *)(UINTN)base, (UINTN)((UINT64)total_pages << EFI_PAGE_SHIFT), 0);
+  SetMem((VOID *)(UINTN)(base - XNU_BOOTINFO_ALIGN),
+         (UINTN)((UINT64)total_pages << EFI_PAGE_SHIFT), 0);
 
   ctx->kernel_region_base = base;
   ctx->kernel_region_end  = base + span_bytes;
@@ -347,16 +354,8 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     file_free(&ctx, &kernel);
     return EFI_OUT_OF_RESOURCES;
   }
+  /* Already inside the staging allocation; see AllocKernelMemRegion. */
   ctx.trustcache_phys = ctx.kernel_region_base - XNU_BOOTINFO_ALIGN;
-  status = uefi_call_wrapper(ctx.bs->AllocatePages, 4,
-      AllocateAddress, EfiLoaderData,
-      (UINTN)(XNU_BOOTINFO_ALIGN >> EFI_PAGE_SHIFT), &ctx.trustcache_phys);
-  if (EFI_ERROR(status)) {
-    log_error(L"trustcache: AllocateAddress(0x%lx) failed: %r\r\n",
-              (UINT64)ctx.trustcache_phys, status);
-    file_free(&ctx, &kernel);
-    return status;
-  }
   log_info(L"arm64 trustcache page=0x%lx (below kernel)\r\n",
            (UINT64)ctx.trustcache_phys);
 
