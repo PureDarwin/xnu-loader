@@ -531,6 +531,21 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
       log_error(L"failed to build arm64 boot_args: %r\r\n", status);
       return status;
     }
+    /*
+     * QEMU's ramfb is allocated from the top of system RAM. XNU derives its
+     * managed-page aperture from physBase/memSize rather than the EFI memory
+     * map, so including the framebuffer there makes later IOMemoryDescriptor
+     * mappings treat device memory as managed RAM. End managed memory at the
+     * framebuffer when firmware placed it inside that aperture.
+     */
+    UINT64 arm64_fb_phys = arm64_args->Video.v_baseAddr & ~3ULL;
+    if (arm64_fb_phys > arm64_phys_base &&
+        arm64_fb_phys <
+            arm64_phys_base + arm64_physical_mem_size) {
+      arm64_physical_mem_size =
+          arm64_fb_phys - arm64_phys_base;
+      arm64_args->memSize = arm64_physical_mem_size;
+    }
     arm64_args->memSizeActual = arm64_physical_mem_size;
   }
 #endif

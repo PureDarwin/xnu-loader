@@ -15,6 +15,13 @@ Deploy it to the ESP with:
 
 CMake directly needs `gnu-efi` installed and `GNU_EFI_DIR` set.
 
+## Legacy BIOS
+
+`nix build .#legacy-boot` builds the original x86 BIOS bootstrap port
+(`stage1.bin`, `stage2.bin`, the shared loader payload, and a combined
+`legacy-boot.img`). See [legacy/README.md](legacy/README.md) for the disk
+layout, supported firmware services, and current hardware scope.
+
 ## Why?
 PureDarwin.
 

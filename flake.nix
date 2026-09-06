@@ -21,6 +21,7 @@
         arch = "aarch64";
         qemuVirt = true;
       };
+      legacy-boot = pkgs.callPackage ./legacy { };
     });
   };
 }

@@ -4,6 +4,9 @@
 #include "fileio.h"
 #include "serial.h"
 #include <efiprot.h>
+#if defined(LEGACY_BIOS)
+#include "firmware.h"
+#endif
 
 /* IRQ mask/unmask, real on both architectures (not stubs) - x86's
  * cli/sti and arm64's DAIF.I bit are each a single instruction. */
@@ -620,7 +623,11 @@ EFI_STATUS boot_fill_video(
   args->Video.v_height   = (UINT32)vi.height;
   args->Video.v_depth    = (UINT32)vi.depth;
   args->Video.v_rotate   = 0;
-  args->Video.v_baseAddr = vi.base_addr;
+  /* ARM reaches PE_create_console() after kernel_map exists. XNU therefore
+   * interprets an untagged v_baseAddr as an already-mapped kernel VA; bit 0
+   * is its explicit "physical address, map this" tag (initialize_screen()
+   * masks the low two bits before ml_io_map_unmappable()). */
+  args->Video.v_baseAddr = vi.base_addr | 1ULL;
 
   /* VideoV1 (the struct XNU reads at boot_args+1048): base addr is 32-bit.
    * XNU's Boot_Video.v_baseAddr is 32-bit, so a framebuffer above 4GB cannot
@@ -660,7 +667,11 @@ EFI_STATUS arm64_boot_fill_video(
     return status;
 
   args->Video.v_baseAddr = vi.base_addr;
-  args->Video.v_display  = (vi.display == FB_TEXT_MODE) ? 0 : 1;
+  /* ARM's PE_create_console() treats zero as "no graphics console" and any
+   * nonzero value as a framebuffer-backed console. Preserve FB_TEXT_MODE here
+   * just as the x86 handoff does; translating it to zero made verbose ARM
+   * boots discard an otherwise valid GOP framebuffer. */
+  args->Video.v_display  = vi.display;
   args->Video.v_rowBytes = vi.row_bytes;
   args->Video.v_width    = vi.width;
   args->Video.v_height   = vi.height;
@@ -886,6 +897,13 @@ EFI_STATUS exit_boot_services_retry(
       rt->SetVirtualAddressMap(rmap_sz, rdesc_sz,
                                state->descriptor_version,
                                (EFI_MEMORY_DESCRIPTOR *)rmap);
+
+#if defined(LEGACY_BIOS)
+      /* This table was pinned before SVAM, so update its function pointers to
+       * the virtual mapping selected for the shim's runtime image. */
+      legacy_runtime_fixup(
+          (EFI_RUNTIME_SERVICES *)(UINTN)state->rt_table_phys);
+#endif
 
       serial_reinit();
       serial_mark((CONST CHAR8 *)"SetVirtualAddressMap returned");
