@@ -56,6 +56,6 @@ stdenv.mkDerivation rec {
 
   meta = with lib; {
     description = "GNU-EFI XNU loader experiment";
-    platforms = platforms.linux;
+    platforms = platforms.unix;
   };
 }
