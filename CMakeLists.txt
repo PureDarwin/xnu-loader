@@ -33,8 +33,10 @@ set(GNU_EFI_CRT ${GNU_EFI_LIB_DIR}/crt0-efi-${ARCH}.o)
 
 if(ARCH STREQUAL "x86_64")
   set(ARCH_M_FLAG -m64)
+  set(EFI_INPUT_TARGET elf64-x86-64)
 else()
   set(ARCH_M_FLAG "")
+  set(EFI_INPUT_TARGET elf64-littleaarch64)
 endif()
 
 execute_process(
@@ -125,6 +127,7 @@ add_custom_command(
 add_custom_command(
   OUTPUT xnu-loader.efi
   COMMAND ${CMAKE_OBJCOPY}
+          --input-target=${EFI_INPUT_TARGET}
           -j .text
           -j .sdata
           -j .data
@@ -134,7 +137,7 @@ add_custom_command(
           -j .rel
           -j .rela
           -j .reloc
-          --target=efi-app-${ARCH}
+          --output-target=efi-app-${ARCH}
           xnu-loader.so xnu-loader.efi
   DEPENDS xnu-loader.so
   VERBATIM

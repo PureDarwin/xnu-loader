@@ -55,7 +55,7 @@ stdenv.mkDerivation rec {
   '';
 
   meta = with lib; {
-    description = "GNU-EFI XNU loader experiment";
+    description = "PureDarwin's XNU bootloader";
     platforms = platforms.unix;
   };
 }
