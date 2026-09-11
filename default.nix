@@ -34,6 +34,10 @@ stdenv.mkDerivation rec {
   cmakeFlags = [
     "-DGNU_EFI_DIR=${gnu-efi}"
     "-DARCH=${arch}"
+    # Cross binutils installs only target-prefixed tools in bin/, so CMake's
+    # own search for "ld" settles on a path that does not exist and the link
+    # fails with "No such file or directory". Name the linker explicitly.
+    "-DCMAKE_LINKER=${stdenv.cc.bintools}/bin/${stdenv.cc.targetPrefix}ld"
   ] ++ lib.optional qemuVirt "-DXNU_LOADER_QEMU_VIRT=ON";
 
   installPhase = ''
