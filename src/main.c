@@ -95,7 +95,7 @@ static EFI_STATUS load_ramdisk(AppContext *ctx) {
   return EFI_SUCCESS;
 }
 
-#if defined(__x86_64__)
+#if defined(PD_ARCH_X86)
 static VOID finish_boot_and_jump(VOID *unused) {
   UINT64 *src64 = (UINT64 *)(UINTN)g_copy_src;
   UINT64 *dst64 = (UINT64 *)(UINTN)g_copy_dst;
@@ -628,7 +628,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
 
   serial_mark((CONST CHAR8 *)"exit_boot_services returned");
 
-#if defined(__x86_64__)
+#if defined(PD_ARCH_X86)
   /* Copy staged kernel image to its SLID physical base (0x100000 + kslide).
    * boot.efi physically relocates the whole image: each segment goes to
    * (vmaddr + kslide) & 0x3FFFFFFF, and the local relocs (base = __HIB) patch
@@ -776,7 +776,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
 #endif
   g_jump_stack = stack_top;
 
-#if defined(__x86_64__)
+#if defined(PD_ARCH_X86)
   /* The destination is fixed at 0x100000 while the boot-info block sits at
    * XNU_BOOTINFO_BASE, so a large enough kernel silently overwrites boot_args,
    * the device tree and the relocated memory map - and the only symptom is an

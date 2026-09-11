@@ -5,7 +5,7 @@
 
 VOID jump_to_xnu(VOID *entry, UINT64 boot_args_phys, VOID *stack_top) __attribute__((noreturn));
 
-#if defined(__x86_64__)
+#if defined(PD_ARCH_X86)
 /*
  * Switch to `new_sp` and call fn(arg) there. Used to get off the
  * firmware-provided stack before copying the kernel image over low memory,

@@ -327,7 +327,7 @@ static void dt_prop_u64(AppContext *ctx, DeviceTreeNode *node, const CHAR8 *name
   dt_prop(ctx, node, name, &val, 8);
 }
 
-#if defined(__x86_64__)
+#if defined(PD_ARCH_X86)
 static UINT64 rdtsc64_raw(void) {
   UINT32 lo, hi;
   __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
@@ -626,7 +626,7 @@ static void hfs_uuid_from_finder_info(const UINT8 hfs_uuid[8], CHAR8 uuid_str[37
 }
 
 typedef struct {
-  UINT32 Revision;
+  UINT64 Revision;
   EFI_BLOCK_IO_MEDIA *MediaInfo;
   EFI_STATUS (EFIAPI *Reset)(VOID *This, BOOLEAN ExtendedVerification);
   EFI_STATUS (EFIAPI *ReadBlocks)(VOID *This, UINT32 MediaId, EFI_LBA LBA,
@@ -1343,7 +1343,8 @@ EFI_STATUS dt_build(
 
   DeviceTreeNode *kcompat = dt_create_node(ctx);
   dt_prop_str(ctx, kcompat, "name", "kernel-compatibility");
-#if defined(__x86_64__)
+/* Describes the kernel, not the loader: an ia32 loader still boots x86_64. */
+#if defined(CONFIG_x86_64)
   dt_prop_u32(ctx, kcompat, "x86_64", 1);
 #elif defined(__aarch64__)
   /* a real arm64/BCM2837 boot needs its own tree (FDT-derived board info,

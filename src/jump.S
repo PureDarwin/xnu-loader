@@ -85,6 +85,115 @@ jump_to_xnu:
 
 .section .note.GNU-stack,"",%progbits
 
+#elif defined(__i386__)
+
+/*
+ * IA32 firmware handoff.
+ *
+ * XNU's x86_64 entry point is entered in 32-bit protected mode with paging
+ * off and boot_args in %eax - the kernel's own pstart does the switch to long
+ * mode. The 64-bit loader therefore has to leave long mode before jumping
+ * (see the .code64 version below, which clears EFER.LME and CR0.PG).
+ *
+ * A 32-bit UEFI implementation is already in that state, so there is no mode
+ * transition to perform here: establish flat segments from our own GDT in
+ * case the firmware left something exotic loaded, make sure paging is off,
+ * and jump. This is the whole reason an ia32 loader is viable on a 64-bit
+ * CPU without a long-mode trampoline.
+ */
+.text
+.code32
+.globl pd_call_on_stack
+.type pd_call_on_stack, @function
+
+/*
+ * pd_call_on_stack(void *new_sp, void (*fn)(void *), void *arg)
+ * cdecl: 4(%esp)=new_sp, 8(%esp)=fn, 12(%esp)=arg.
+ */
+pd_call_on_stack:
+    mov 4(%esp), %eax      /* new_sp */
+    mov 8(%esp), %edx      /* fn */
+    mov 12(%esp), %ecx     /* arg */
+    mov %eax, %esp
+    and $~0xF, %esp        /* keep the ABI's 16-byte alignment at the call */
+    xor %ebp, %ebp         /* terminate frame-pointer chains on the new stack */
+    sub $12, %esp          /* so esp+4 lands 16-byte aligned after the push */
+    push %ecx              /* arg becomes fn's first parameter */
+    call *%edx
+1:  hlt                    /* fn is noreturn; trap if it ever comes back */
+    jmp 1b
+
+.globl jump_to_xnu
+.type jump_to_xnu, @function
+
+/*
+ * jump_to_xnu(void *entry, UINT64 boot_args_phys, void *stack_top)
+ * cdecl: 4(%esp)=entry, 8(%esp)=boot_args_phys (64-bit, low half at 8),
+ *        16(%esp)=stack_top.
+ */
+jump_to_xnu:
+    cli
+
+    mov 4(%esp), %ebx      /* entry */
+    mov 8(%esp), %ebp      /* boot_args_phys, low 32 bits - the block is
+                            * allocated below 4GB, which 32-bit firmware
+                            * cannot exceed anyway */
+    mov 16(%esp), %esp     /* stack_top */
+    and $~0xF, %esp
+
+    /* Build the GDT *and* its GDTR on the stack. The 64-bit path can keep the
+     * table in .data and reach it with a RIP-relative lea; i386 has no such
+     * addressing, and naming the symbol emits an absolute relocation, which in
+     * a shared object means DT_TEXTREL and the link is --fatal-warnings.
+     * Three flat descriptors: null, 32-bit code, 32-bit data. */
+    sub $24, %esp
+    movl $0, 0(%esp)
+    movl $0, 4(%esp)
+    movl $0x0000ffff, 8(%esp)    /* code: limit 0xffff, base 0 */
+    movl $0x00cf9a00, 12(%esp)   /* G=1 D=1 P=1 DPL=0, type=code r/x */
+    movl $0x0000ffff, 16(%esp)   /* data: limit 0xffff, base 0 */
+    movl $0x00cf9200, 20(%esp)   /* G=1 B=1 P=1 DPL=0, type=data r/w */
+    mov %esp, %ecx               /* &gdt */
+
+    sub $8, %esp
+    movw $23, 0(%esp)            /* limit = 3*8 - 1 */
+    movl %ecx, 2(%esp)
+    lgdt 0(%esp)
+    add $8, %esp                 /* esp now points at the GDT, which must stay
+                                  * live until the segment loads below - so
+                                  * nothing may push between here and there */
+
+    /* Reload CS from our own GDT. A direct ljmp needs an absolute target
+     * address, which is a relocation in .text - DT_TEXTREL again. Compute the
+     * destination PC-relatively instead and far-return to it: the label
+     * difference is within .text, so it assembles to a constant. */
+    call 1f
+1:  pop %eax                 /* eax = address of label 1 */
+    add $(2f - 1b), %eax     /* eax = address of label 2 */
+    push $0x08               /* CS */
+    push %eax                /* EIP - lret pops EIP first, then CS */
+    lret
+2:
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %fs
+    mov %ax, %gs
+    mov %ax, %ss
+
+    /* IA32 firmware may run with paging enabled and identity-mapped; XNU
+     * wants it off. */
+    mov %cr0, %eax
+    and $0x7fffffff, %eax
+    mov %eax, %cr0
+
+    jmp 3f                 /* pipeline flush */
+3:
+    mov %ebp, %eax         /* boot_args to the kernel */
+    jmp *%ebx
+
+.section .note.GNU-stack,"",@progbits
+
 #else
 
 .text

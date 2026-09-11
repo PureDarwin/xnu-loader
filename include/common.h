@@ -5,6 +5,14 @@
 #include <efilib.h>
 #include <string.h>
 
+/* Firmware CPU family. A 32-bit UEFI implementation runs on the same x86 CPU
+ * as a 64-bit one, so port I/O, cli/sti and rdtsc are shared - only pointer
+ * width and the kernel handoff differ. Kept separate from CONFIG_x86_64, which
+ * describes the kernel being booted rather than the code doing the booting. */
+#if defined(__x86_64__) || defined(__i386__)
+#define PD_ARCH_X86 1
+#endif
+
 #define VERBOSE_MACHO
 #define VERBOSE_BOOT
 //#define KASLR_ENABLED

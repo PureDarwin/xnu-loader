@@ -2,7 +2,7 @@
 
 static BOOLEAN serial_ready = FALSE;
 
-#if defined(__x86_64__)
+#if defined(PD_ARCH_X86)
 
 /* Standard ISA I/O bases. */
 #define COM1_BASE 0x3F8

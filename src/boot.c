@@ -10,7 +10,7 @@
 
 /* IRQ mask/unmask, real on both architectures (not stubs) - x86's
  * cli/sti and arm64's DAIF.I bit are each a single instruction. */
-#if defined(__x86_64__)
+#if defined(PD_ARCH_X86)
 #define IRQ_DISABLE() __asm__ volatile ("cli")
 #define IRQ_ENABLE()  __asm__ volatile ("sti")
 #elif defined(__aarch64__)
@@ -360,10 +360,86 @@ EFI_STATUS boot_build_args(
         st_copy->NumberOfTableEntries = ctx->st->NumberOfTableEntries;
         log_info(L"EFI config table: %lu entries copied to 0x%lx\r\n",
                  ctx->st->NumberOfTableEntries, (UINT64)(UINTN)cfg_copy);
+
+        /*
+         * XNU's configuration-table walk (efi_get_cfgtbl_by_guid, reached from
+         * efi_get_rsdp_physaddr) reads the *64-bit* EFI_SYSTEM_TABLE layout
+         * unconditionally - it does not consult boot_args->efiMode the way
+         * efi_init's efi_set_tables_32/64 split does.
+         *
+         * God, I hate Apple sometimes.
+         */
+        if (sizeof(VOID *) == 4) {
+          UINT8  *st_bytes = (UINT8 *)st_copy;
+          UINT8  *wide     = (UINT8 *)(page + 0x800);
+          UINTN   entries  = ctx->st->NumberOfTableEntries;
+          UINTN   i;
+
+          /* One page is allocated for all of this, so the widened array has
+           * 0x1000 - 0x800 bytes to live in. Firmware reports ~10 entries;
+           * refuse rather than run off the page if that ever grows. */
+          if (entries > (0x1000 - 0x800) / 24) {
+            serial_trace((CONST CHAR8 *)"WARNING cfg entries exceed page, clamping ",
+                         (UINT64)entries);
+            entries = (0x1000 - 0x800) / 24;
+          }
+
+          /* Widen each entry to the 64-bit layout: GUID (16) + 8-byte
+           * VendorTable, giving the 24-byte stride the walk steps by. */
+          for (i = 0; i < entries; i++) {
+            UINT8 *src = (UINT8 *)ctx->st->ConfigurationTable +
+                         i * sizeof(EFI_CONFIGURATION_TABLE);
+            UINT8 *dst = wide + i * 24;
+            UINTN  b;
+            UINT64 vendor_table;
+
+            for (b = 0; b < 16; b++)      /* VendorGuid */
+              dst[b] = src[b];
+
+            vendor_table = (UINT64)(UINTN)((EFI_CONFIGURATION_TABLE *)src)->VendorTable;
+            for (b = 0; b < 8; b++)
+              dst[16 + b] = (UINT8)(vendor_table >> (8 * b));
+          }
+
+          /* The 64-bit aliases, written past the 32-bit struct's end. */
+          {
+            UINT64 wide_entries = (UINT64)entries;
+            UINT64 wide_table   = (UINT64)(UINTN)wide;
+            UINTN  b;
+
+            for (b = 0; b < 8; b++) {
+              st_bytes[0x68 + b] = (UINT8)(wide_entries >> (8 * b));
+              st_bytes[0x70 + b] = (UINT8)(wide_table   >> (8 * b));
+            }
+          }
+
+          /*
+           * Complete the 64-bit presentation. XNU's 64-bit path reads only
+           * Hdr, RuntimeServices (0x58), NumberOfTableEntries (0x68) and
+           * ConfigurationTable (0x70), so aliasing those is enough to make the
+           * table readable as 64-bit; the 32-bit fields below 0x48 stay put
+           * and do not collide.
+           */
+          {
+            UINT64 rt_va = 0xFFFFFF8000000000ULL | (UINT64)(UINTN)rt_copy;
+            UINTN  b;
+
+            for (b = 0; b < 8; b++)
+              st_bytes[0x58 + b] = (UINT8)(rt_va >> (8 * b));
+
+            /* Every consumer CRCs HeaderSize bytes, so it has to cover the
+             * aliases now that they carry meaning. */
+            st_copy->Hdr.HeaderSize = 0x78;
+          }
+
+          serial_trace((CONST CHAR8 *)"cfg64 table", (UINT64)(UINTN)wide);
+          serial_trace((CONST CHAR8 *)"cfg64 count", (UINT64)entries);
+          serial_trace((CONST CHAR8 *)"cfg64 rt   ", (UINT64)(UINTN)rt_copy);
+        }
       }
 
       /* Recompute the EFI_SYSTEM_TABLE CRC32 after modifying RuntimeServices
-       * and ConfigurationTable.  XNU verifies CRC32 in both efi_set_tables_64
+       * and ConfigurationTable. XNU verifies CRC32 in both efi_set_tables_64
        * and efi_get_cfgtbl_by_guid; a stale checksum makes both return early,
        * breaking ACPI RSDP lookup and EFI runtime services setup. */
       {
@@ -431,6 +507,13 @@ EFI_STATUS boot_build_args(
   args->Revision = kBootArgsRevision1;
   args->Version  = kBootArgsVersion;
 
+  /*
+   * This is 64 even on 32-bit platforms.
+   *
+   * The reason behind this is because 32-bit EFI in XNU has rotted heavily,
+   * and if PureDarwin ever decides to implement decompression in xnu-loader to
+   * boot Apple kernels, this allows for that.
+   */
   args->efiMode = kBootArgsEfiMode64;
   args->debugMode = 0;
   args->flags = kBootArgsFlagBlackBg | kBootArgsFlagLoginUI;

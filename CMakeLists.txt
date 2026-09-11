@@ -13,27 +13,54 @@ endif()
 if(NOT ARCH)
   set(ARCH x86_64)
 endif()
-set(ARCH "${ARCH}" CACHE STRING "Target architecture (x86_64 or aarch64)")
+set(ARCH "${ARCH}" CACHE STRING "Kernel/payload architecture (x86_64 or aarch64)")
 
 if(NOT ARCH STREQUAL "x86_64" AND NOT ARCH STREQUAL "aarch64")
   message(FATAL_ERROR "ARCH must be x86_64 or aarch64, got '${ARCH}'")
 endif()
 
+# The firmware's own architecture, which is not always the kernel's: a 32-bit
+# UEFI implementation on a 64-bit CPU only loads IA32 PE images, so the loader
+# is built for ia32 while the kernel it hands off to stays x86_64. Defaults to
+# ARCH, which is every case where the two agree.
+if(NOT LOADER_ARCH)
+  set(LOADER_ARCH ${ARCH})
+endif()
+set(LOADER_ARCH "${LOADER_ARCH}" CACHE STRING "Firmware architecture (x86_64, aarch64 or ia32)")
+
+if(NOT LOADER_ARCH STREQUAL "x86_64" AND NOT LOADER_ARCH STREQUAL "aarch64"
+   AND NOT LOADER_ARCH STREQUAL "ia32")
+  message(FATAL_ERROR "LOADER_ARCH must be x86_64, aarch64 or ia32, got '${LOADER_ARCH}'")
+endif()
+
+if(LOADER_ARCH STREQUAL "ia32" AND NOT ARCH STREQUAL "x86_64")
+  message(FATAL_ERROR "LOADER_ARCH=ia32 only boots an x86_64 kernel, not '${ARCH}'")
+endif()
+
+message(STATUS "loader arch: ${LOADER_ARCH}, kernel arch: ${ARCH}")
+
 set(GNU_EFI_INC
   ${GNU_EFI_DIR}/include
   ${GNU_EFI_DIR}/include/efi
-  ${GNU_EFI_DIR}/include/efi/${ARCH}
+  ${GNU_EFI_DIR}/include/efi/${LOADER_ARCH}
   ${GNU_EFI_DIR}/include/protocol
   ${GNU_EFI_DIR}/include/efi/protocol
 )
 
 set(GNU_EFI_LIB_DIR ${GNU_EFI_DIR}/lib)
-set(GNU_EFI_LDS ${GNU_EFI_LIB_DIR}/elf_${ARCH}_efi.lds)
-set(GNU_EFI_CRT ${GNU_EFI_LIB_DIR}/crt0-efi-${ARCH}.o)
+set(GNU_EFI_LDS ${GNU_EFI_LIB_DIR}/elf_${LOADER_ARCH}_efi.lds)
+set(GNU_EFI_CRT ${GNU_EFI_LIB_DIR}/crt0-efi-${LOADER_ARCH}.o)
 
-if(ARCH STREQUAL "x86_64")
+set(EFI_LINK_EMULATION "")
+
+if(LOADER_ARCH STREQUAL "x86_64")
   set(ARCH_M_FLAG -m64)
   set(EFI_INPUT_TARGET elf64-x86-64)
+elseif(LOADER_ARCH STREQUAL "ia32")
+  set(ARCH_M_FLAG -m32)
+  set(EFI_INPUT_TARGET elf32-i386)
+  # ld defaults to the 64-bit emulation when the toolchain is x86_64.
+  set(EFI_LINK_EMULATION -m elf_i386)
 else()
   set(ARCH_M_FLAG "")
   set(EFI_INPUT_TARGET elf64-littleaarch64)
@@ -80,16 +107,21 @@ target_compile_options(loader_objs PRIVATE
   -ggdb
 )
 
-if(ARCH STREQUAL "x86_64")
-  # x86_64-only: no red zone (interrupts/exceptions can clobber it before
-  # a real handler runs), pack outgoing-arg stack slots instead of
-  # sub/add-per-call (gnu-efi's calling convention expectation), and no
-  # AVX (SSE/AVX state isn't guaranteed usable this early in boot).
+if(LOADER_ARCH STREQUAL "x86_64" OR LOADER_ARCH STREQUAL "ia32")
+  # Pack outgoing-arg stack slots instead of sub/add-per-call (gnu-efi's
+  # calling convention expectation), and no AVX (SSE/AVX state isn't
+  # guaranteed usable this early in boot).
   target_compile_options(loader_objs PRIVATE
-    -mno-red-zone
+    ${ARCH_M_FLAG}
     -maccumulate-outgoing-args
     -mno-avx
   )
+endif()
+
+if(LOADER_ARCH STREQUAL "x86_64")
+  # No red zone: interrupts/exceptions can clobber it before a real handler
+  # runs. 32-bit has no red zone to disable.
+  target_compile_options(loader_objs PRIVATE -mno-red-zone)
 endif()
 
 option(XNU_LOADER_QEMU_VIRT "Target QEMU's generic virt machine (PL011 UART) instead of BCM2837" OFF)
@@ -97,6 +129,7 @@ option(XNU_LOADER_QEMU_VIRT "Target QEMU's generic virt machine (PL011 UART) ins
 target_compile_definitions(loader_objs PRIVATE
   EFI_FUNCTION_WRAPPER
   CONFIG_${ARCH}
+  CONFIG_LOADER_${LOADER_ARCH}
   $<$<BOOL:${XNU_LOADER_QEMU_VIRT}>:XNU_LOADER_QEMU_VIRT>
 )
 
@@ -110,6 +143,7 @@ add_custom_command(
           --fatal-warnings
           --no-warn-rwx-segments
           -znocombreloc
+          ${EFI_LINK_EMULATION}
           -shared
           -Bsymbolic
           -L${GNU_EFI_LIB_DIR}
@@ -137,7 +171,7 @@ add_custom_command(
           -j .rel
           -j .rela
           -j .reloc
-          --output-target=efi-app-${ARCH}
+          --output-target=efi-app-${LOADER_ARCH}
           xnu-loader.so xnu-loader.efi
   DEPENDS xnu-loader.so
   VERBATIM

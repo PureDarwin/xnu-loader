@@ -6,16 +6,23 @@
 , gnu-efi
 , mtools
 , arch ? "x86_64"
+, loaderArch ? arch
 , qemuVirt ? false
 }:
 
 assert arch == "x86_64" || arch == "aarch64";
+assert loaderArch == "x86_64" || loaderArch == "aarch64" || loaderArch == "ia32";
+# ia32 firmware is only ever paired with an x86_64 kernel.
+assert loaderArch != "ia32" || arch == "x86_64";
 
 let
   # UEFI's spec-mandated removable-media fallback path name differs per
   # arch (BOOTX64.EFI, BOOTAA64.EFI, ...) - real firmware only looks for
-  # its own arch's name here.
-  bootFileName = if arch == "x86_64" then "BOOTX64.EFI" else "BOOTAA64.EFI";
+  # its own arch's name here, and it is the *firmware's* arch that decides.
+  bootFileName =
+    if loaderArch == "x86_64" then "BOOTX64.EFI"
+    else if loaderArch == "ia32" then "BOOTIA32.EFI"
+    else "BOOTAA64.EFI";
 in
 stdenv.mkDerivation rec {
   pname = "xnu-loader";
@@ -34,6 +41,7 @@ stdenv.mkDerivation rec {
   cmakeFlags = [
     "-DGNU_EFI_DIR=${gnu-efi}"
     "-DARCH=${arch}"
+    "-DLOADER_ARCH=${loaderArch}"
   ] ++ lib.optional qemuVirt "-DXNU_LOADER_QEMU_VIRT=ON";
 
   # Cross binutils installs only target-prefixed tools in bin/, so CMake's own

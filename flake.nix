@@ -21,6 +21,15 @@
         arch = "aarch64";
         qemuVirt = true;
       };
+      # 32-bit UEFI on a 64-bit CPU: the EFI binary must be IA32 while the
+      # kernel it boots is x86_64. Built from the i686 package set so libgcc,
+      # gnu-efi and binutils are all 32-bit; a 64-bit toolchain has no 32-bit
+      # libgcc and its ld defaults to the wrong emulation.
+      ia32 = pkgs.pkgsi686Linux.callPackage ./. {
+        arch = "x86_64";
+        loaderArch = "ia32";
+      };
+
       legacy-boot = pkgs.callPackage ./legacy { };
     });
   };
