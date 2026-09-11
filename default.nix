@@ -34,11 +34,16 @@ stdenv.mkDerivation rec {
   cmakeFlags = [
     "-DGNU_EFI_DIR=${gnu-efi}"
     "-DARCH=${arch}"
-    # Cross binutils installs only target-prefixed tools in bin/, so CMake's
-    # own search for "ld" settles on a path that does not exist and the link
-    # fails with "No such file or directory". Name the linker explicitly.
-    "-DCMAKE_LINKER=${stdenv.cc.bintools}/bin/${stdenv.cc.targetPrefix}ld"
   ] ++ lib.optional qemuVirt "-DXNU_LOADER_QEMU_VIRT=ON";
+
+  # Cross binutils installs only target-prefixed tools in bin/, so CMake's own
+  # search for "ld" settles on ${binutils}/bin/ld, which does not exist, and the
+  # link dies with "No such file or directory". $LD is the name the wrapper
+  # actually provides; resolving it here is what nixpkgs' own cmake hook does
+  # for AR and RANLIB, and it works native and cross without naming store paths.
+  preConfigure = ''
+    cmakeFlagsArray+=("-DCMAKE_LINKER=$(command -v $LD)")
+  '';
 
   installPhase = ''
     runHook preInstall
