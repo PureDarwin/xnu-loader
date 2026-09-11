@@ -37,12 +37,15 @@ stdenv.mkDerivation rec {
   ] ++ lib.optional qemuVirt "-DXNU_LOADER_QEMU_VIRT=ON";
 
   # Cross binutils installs only target-prefixed tools in bin/, so CMake's own
-  # search for "ld" settles on ${binutils}/bin/ld, which does not exist, and the
-  # link dies with "No such file or directory". $LD is the name the wrapper
-  # actually provides; resolving it here is what nixpkgs' own cmake hook does
-  # for AR and RANLIB, and it works native and cross without naming store paths.
+  # search settles on ${binutils}/bin/<tool>, which does not exist, and the
+  # build dies with "No such file or directory". Every binutils tool this
+  # CMakeLists drives has to be named explicitly - the linker and objcopy
+  # today. $LD/$OBJCOPY are the names the wrapper provides, which is how
+  # nixpkgs' own cmake hook handles AR, RANLIB and STRIP, and it works native
+  # and cross without naming store paths.
   preConfigure = ''
     cmakeFlagsArray+=("-DCMAKE_LINKER=$(command -v $LD)")
+    cmakeFlagsArray+=("-DCMAKE_OBJCOPY=$(command -v $OBJCOPY)")
   '';
 
   installPhase = ''
