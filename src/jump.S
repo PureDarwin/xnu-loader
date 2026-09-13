@@ -51,7 +51,12 @@ jump_to_xnu:
      * SPSR_EL2/ELR_EL2 tell it "return to EL1h resuming at this address,
      * with these interrupt masks."
      */
-    mov x0, #(1 << 31) /* HCR_EL2.RW = 1 (EL1 is AArch64) */
+    /* RW=1 plus API/APK=1 (bits 41/40): with these clear, EL1's own PAuth
+     * instructions trap to EL2 - which has no vector table once we ERET
+     * away below, not "no PAuth". */
+    mov x0, #(1 << 31)
+    orr x0, x0, #(1 << 41) /* HCR_EL2.API */
+    orr x0, x0, #(1 << 40) /* HCR_EL2.APK */
     msr hcr_el2, x0
 
     mrs x0, sctlr_el2
