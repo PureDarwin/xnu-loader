@@ -814,6 +814,89 @@ static BOOLEAN dp_is_boot_disk(AppContext *ctx, EFI_HANDLE cand) {
   return TRUE;
 }
 
+/*
+ * The CONTAINER uuid is used, not a volume uuid, because it sits at a fixed
+ * offset in a single block; reaching a volume superblock would mean walking
+ * the checkpoint ring and an object map here in the loader.
+ */
+static BOOLEAN read_apfs_uuid_from_blockio(XnuBlockIoProtocol *bio, CHAR8 uuid_str[37]) {
+  UINT8 block[512] __attribute__((aligned(512)));
+  UINT64 entries_lba;
+  UINT32 entry_size, entry_count, media_id;
+
+  if (!bio || !bio->MediaInfo || bio->MediaInfo->BlockSize != 512)
+    return FALSE;
+
+  media_id = bio->MediaInfo->MediaId;
+  if (EFI_ERROR(uefi_call_wrapper(bio->ReadBlocks, 5,
+                                  bio, media_id, 1, sizeof(block), block)))
+    return FALSE;
+  if (CompareMem(block, "EFI PART", 8) != 0)
+    return FALSE;
+
+  entries_lba = rd64le(block + 72);
+  entry_count = rd32le(block + 80);
+  entry_size = rd32le(block + 84);
+  if (entry_size < 128 || entry_size > 512 || entry_count == 0)
+    return FALSE;
+
+  for (UINT32 idx = 0; idx < entry_count && idx < 128; idx++) {
+    UINT64 lba = entries_lba + ((UINT64)idx * entry_size) / 512;
+    UINTN off = (UINTN)(((UINT64)idx * entry_size) % 512);
+    UINT64 part_lba;
+
+    if (EFI_ERROR(uefi_call_wrapper(bio->ReadBlocks, 5,
+                                    bio, media_id, lba, sizeof(block), block)))
+      return FALSE;
+    part_lba = rd64le(block + off + 32);
+    if (part_lba == 0)
+      continue;                          /* unused entry */
+
+    if (EFI_ERROR(uefi_call_wrapper(bio->ReadBlocks, 5,
+                                    bio, media_id, part_lba, sizeof(block), block)))
+      continue;
+    if (CompareMem(block + 32, "NXSB", 4) != 0)
+      continue;
+
+    fmt_uuid_bytes(block + 72, uuid_str);
+    log_info(L"DT: found APFS container UUID %a at GPT LBA %lu\r\n", uuid_str, part_lba);
+    return TRUE;
+  }
+  return FALSE;
+}
+
+static BOOLEAN find_apfs_boot_uuid(AppContext *ctx, CHAR8 uuid_str[37]) {
+  static EFI_GUID block_io_guid =
+      { 0x964e5b21, 0x6459, 0x11d2, { 0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b } };
+  EFI_HANDLE *handles = NULL;
+  UINTN count = 0;
+
+  if (EFI_ERROR(uefi_call_wrapper(ctx->bs->LocateHandleBuffer, 5,
+                                  ByProtocol, &block_io_guid, NULL, &count, &handles)))
+    return FALSE;
+
+  /* Prefer the disk we booted from, as the ext4 scan does. */
+  for (UINTN pass = 0; pass < 2; pass++) {
+    for (UINTN i = 0; i < count; i++) {
+      XnuBlockIoProtocol *bio = NULL;
+      BOOLEAN on_boot_disk = dp_is_boot_disk(ctx, handles[i]);
+
+      if ((pass == 0) != (on_boot_disk != FALSE))
+        continue;
+      if (EFI_ERROR(uefi_call_wrapper(ctx->bs->HandleProtocol, 3,
+                                      handles[i], &block_io_guid, (VOID **)&bio)))
+        continue;
+      if (read_apfs_uuid_from_blockio(bio, uuid_str)) {
+        uefi_call_wrapper(ctx->bs->FreePool, 1, handles);
+        return TRUE;
+      }
+    }
+  }
+
+  uefi_call_wrapper(ctx->bs->FreePool, 1, handles);
+  return FALSE;
+}
+
 static BOOLEAN find_ext4_boot_uuid(AppContext *ctx, CHAR8 uuid_str[37]) {
   static EFI_GUID block_io_guid =
       { 0x964e5b21, 0x6459, 0x11d2, { 0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b } };
@@ -946,6 +1029,7 @@ EFI_STATUS dt_build(
                        boot_arg_get_uuid(boot_args, "root-uuid", uuid_str);
     BOOLEAN got_hfs_uuid = FALSE;
     BOOLEAN got_ext4_uuid = FALSE;
+    BOOLEAN got_apfs_uuid = FALSE;
     BOOLEAN got_boot_volume_uuid = FALSE;
 
     if (!got_uuid) {
@@ -958,11 +1042,18 @@ EFI_STATUS dt_build(
       got_ext4_uuid = find_ext4_boot_uuid(ctx, uuid_str);
     }
 
+    /* Then an APFS container root (ApfsFileSystemDriver publishes
+     * boot-uuid-media for it, matching nx_uuid from block zero). */
     if (!got_uuid && !got_hfs_uuid && !got_ext4_uuid) {
+      got_apfs_uuid = find_apfs_boot_uuid(ctx, uuid_str);
+    }
+
+    if (!got_uuid && !got_hfs_uuid && !got_ext4_uuid && !got_apfs_uuid) {
       got_boot_volume_uuid = dp_get_partition_uuid(ctx, uuid_str);
     }
 
-    if (!got_uuid && !got_hfs_uuid && !got_ext4_uuid && !got_boot_volume_uuid) {
+    if (!got_uuid && !got_hfs_uuid && !got_ext4_uuid && !got_apfs_uuid &&
+        !got_boot_volume_uuid) {
       CHAR8 fallback[] = "dd5c6498-90d9-4b35-a95f-1944ebc01791";
       for (UINTN _i = 0; _i < 37; _i++) uuid_str[_i] = fallback[_i];
     }
