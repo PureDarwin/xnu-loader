@@ -1,4 +1,7 @@
-#include "firmware.h"
+/* EFI boot/runtime services on top of whatever a boot protocol handed us,
+ * so the shared loader in src/ runs unchanged. */
+#include "efi_emulation.h"
+#include "serial.h"
 #include <efilib.h>
 
 #undef SetMem
@@ -10,8 +13,8 @@ static void native_set_mem(void *ptr, UINTN size, UINT8 value) {
 #define SetMem(ptr, size, value) native_set_mem((ptr), (size), (value))
 
 extern EFI_STATUS efi_main(EFI_HANDLE, EFI_SYSTEM_TABLE *);
-extern UINT8 legacy_entry;
-extern UINT8 __bss_end;
+extern UINT8 __kernel_start;
+extern UINT8 __kernel_end;
 
 #define MAX_RANGES 192
 #define PAGE_SIZE 4096ULL
@@ -51,22 +54,7 @@ static void io_out8(UINT16 port, UINT8 v) {
   __asm__ volatile("outb %0,%1" : : "a"(v), "Nd"(port));
 }
 
-static void debug_putc(char c) {
-  __asm__ volatile("outb %0, $0xe9" : : "a"(c));
-  if (c == '\n') {
-    while (!(io_in8(0x3fd) & 0x20)) {
-    }
-    io_out8(0x3f8, '\r');
-  }
-  while (!(io_in8(0x3fd) & 0x20)) {
-  }
-  io_out8(0x3f8, (UINT8)c);
-}
-
-static void debug_string(const char *s) {
-  while (*s)
-    debug_putc(*s++);
-}
+#define debug_string efiemu_debug_string
 
 static void format_char(CHAR16 **cursor, CHAR16 *end, CHAR16 value) {
   if (*cursor < end)
@@ -262,11 +250,46 @@ static VOID *find_anchor(UINTN begin, UINTN end, const CHAR8 *sig, UINTN siglen,
   }
   return NULL;
 }
-static void discover_config_tables(void) {
+/* UEFI firmware keeps ACPI and SMBIOS outside the legacy BIOS areas; its
+ * configuration table (still valid after ExitBootServices) points at them. */
+static void firmware_config_tables(EfiEmuBootInfo *info, VOID **rsdp,
+                                   VOID **sm3, VOID **sm) {
+  static EFI_GUID acpi20 = ACPI_20_TABLE_GUID;
+  static EFI_GUID acpi10 = ACPI_TABLE_GUID;
+  static EFI_GUID smbios3 = SMBIOS3_TABLE_GUID;
+  static EFI_GUID smbios = SMBIOS_TABLE_GUID;
+  if (!info->efi_system_table || info->efi_system_table >= 0x100000000ULL)
+    return;
+  EFI_SYSTEM_TABLE *st = (EFI_SYSTEM_TABLE *)(UINTN)info->efi_system_table;
+  if (st->Hdr.Signature != EFI_SYSTEM_TABLE_SIGNATURE ||
+      (UINT64)(UINTN)st->ConfigurationTable >= 0x100000000ULL)
+    return;
+  VOID *acpi1 = NULL;
+  for (UINTN i = 0; i < st->NumberOfTableEntries && i < 64; ++i) {
+    EFI_CONFIGURATION_TABLE *c = &st->ConfigurationTable[i];
+    if (CompareMem(&c->VendorGuid, &acpi20, sizeof(EFI_GUID)) == 0 && !*rsdp)
+      *rsdp = c->VendorTable;
+    else if (CompareMem(&c->VendorGuid, &acpi10, sizeof(EFI_GUID)) == 0)
+      acpi1 = c->VendorTable;
+    else if (CompareMem(&c->VendorGuid, &smbios3, sizeof(EFI_GUID)) == 0)
+      *sm3 = c->VendorTable;
+    else if (CompareMem(&c->VendorGuid, &smbios, sizeof(EFI_GUID)) == 0)
+      *sm = c->VendorTable;
+  }
+  if (!*rsdp)
+    *rsdp = acpi1;
+  if (*rsdp)
+    debug_string("efi-emulation: ACPI from the firmware system table\n");
+}
+
+static void discover_config_tables(EfiEmuBootInfo *info) {
   UINTN n = 0;
-  VOID *rsdp = NULL;
+  VOID *rsdp = info->rsdp;
+  VOID *sm3 = NULL;
+  VOID *sm = NULL;
+  firmware_config_tables(info, &rsdp, &sm3, &sm);
   UINT16 ebda = *(volatile UINT16 *)0x40e;
-  if (ebda)
+  if (!rsdp && ebda)
     rsdp = find_anchor((UINTN)ebda << 4, ((UINTN)ebda << 4) + 1024, "RSD PTR ",
                        8, 16);
   if (!rsdp)
@@ -295,8 +318,10 @@ static void discover_config_tables(void) {
     }
     config_tables[n++].VendorTable = normalized_rsdp;
   }
-  VOID *sm3 = find_anchor(0xf0000, 0x100000, "_SM3_", 5, 16);
-  VOID *sm = find_anchor(0xf0000, 0x100000, "_SM_", 4, 16);
+  if (!sm3)
+    sm3 = find_anchor(0xf0000, 0x100000, "_SM3_", 5, 16);
+  if (!sm)
+    sm = find_anchor(0xf0000, 0x100000, "_SM_", 4, 16);
   if (sm3) {
     UINT8 len = *((UINT8 *)sm3 + 6);
     if (checksum_ok(sm3, len)) {
@@ -464,8 +489,10 @@ static EFI_STATUS EFIAPI bs_handle_protocol(EFI_HANDLE handle, EFI_GUID *guid,
     *out = &loaded_image;
     return EFI_SUCCESS;
   }
-  if (handle == legacy_storage_handle())
-    return legacy_storage_protocol(guid, out);
+  if (handle == efiemu_modfs_handle())
+    return efiemu_modfs_protocol(guid, out);
+  if (handle == efiemu_disk_handle())
+    return efiemu_disk_protocol(guid, out);
   return EFI_NOT_FOUND;
 }
 
@@ -512,15 +539,25 @@ static EFI_STATUS EFIAPI bs_locate_handles(EFI_LOCATE_SEARCH_TYPE type,
                                            UINTN *count, EFI_HANDLE **handles) {
   (void)type;
   (void)key;
+  if (!count || !handles)
+    return EFI_INVALID_PARAMETER;
+  EFI_HANDLE found[2];
+  UINTN n = 0;
   VOID *protocol = NULL;
-  if (EFI_ERROR(legacy_storage_protocol(guid, &protocol)))
+  /* The module volume is listed first so modules win over the disk. */
+  if (!EFI_ERROR(efiemu_modfs_protocol(guid, &protocol)))
+    found[n++] = efiemu_modfs_handle();
+  if (!EFI_ERROR(efiemu_disk_protocol(guid, &protocol)))
+    found[n++] = efiemu_disk_handle();
+  if (n == 0)
     return EFI_NOT_FOUND;
-  EFI_STATUS s = bs_allocate_pool(EfiBootServicesData, sizeof(EFI_HANDLE),
+  EFI_STATUS s = bs_allocate_pool(EfiBootServicesData, n * sizeof(EFI_HANDLE),
                                   (VOID **)handles);
   if (EFI_ERROR(s))
     return s;
-  (*handles)[0] = legacy_storage_handle();
-  *count = 1;
+  for (UINTN i = 0; i < n; ++i)
+    (*handles)[i] = found[i];
+  *count = n;
   return EFI_SUCCESS;
 }
 
@@ -610,7 +647,7 @@ static EFI_STATUS EFIAPI rt_set_virtual(UINTN map_size, UINTN desc_size,
                                         EFI_MEMORY_DESCRIPTOR *map) {
   (void)version;
 
-  UINT64 runtime_base = (UINT64)(UINTN)&legacy_entry;
+  UINT64 runtime_base = (UINT64)(UINTN)&__kernel_start;
   for (UINTN offset = 0; offset + desc_size <= map_size; offset += desc_size) {
     EFI_MEMORY_DESCRIPTOR *descriptor =
         (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)map + offset);
@@ -718,8 +755,8 @@ void legacy_runtime_fixup(EFI_RUNTIME_SERVICES *runtime_copy) {
   if (!runtime_copy || !runtime_virtual_delta)
     return;
 
-  UINT64 runtime_begin = (UINT64)(UINTN)&legacy_entry;
-  UINT64 runtime_end = (UINT64)(UINTN)&__bss_end;
+  UINT64 runtime_begin = (UINT64)(UINTN)&__kernel_start;
+  UINT64 runtime_end = (UINT64)(UINTN)&__kernel_end;
   UINT64 *function =
       (UINT64 *)((UINT8 *)runtime_copy + sizeof(EFI_TABLE_HEADER));
   UINTN function_count =
@@ -830,37 +867,131 @@ static EFI_STATUS EFIAPI con_clear(SIMPLE_TEXT_OUTPUT_INTERFACE *self) {
   return EFI_SUCCESS;
 }
 
-static void initialize_ranges(LegacyE820Entry *map, UINT32 count) {
+/* True when [base, end) already lies inside one range of this type. */
+static BOOLEAN range_has_type(UINT64 base, UINT64 end, EFI_MEMORY_TYPE type) {
+  for (UINTN i = 0; i < nranges; ++i) {
+    UINT64 rb = ranges[i].PhysicalStart;
+    UINT64 re = rb + ranges[i].NumberOfPages * PAGE_SIZE;
+    if (ranges[i].Type == type && base >= rb && end <= re)
+      return TRUE;
+  }
+  return FALSE;
+}
+
+static void reserve_bytes(UINT64 base, UINT64 size, EFI_MEMORY_TYPE type) {
+  if (!size)
+    return;
+  UINT64 b = base & ~(PAGE_SIZE - 1);
+  UINT64 e = (base + size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+  /* Files packed in one initrd share edge pages that are already reserved. */
+  if (e - b > PAGE_SIZE && range_has_type(b, b + PAGE_SIZE, type))
+    b += PAGE_SIZE;
+  if (e - b > PAGE_SIZE && range_has_type(e - PAGE_SIZE, e, type))
+    e -= PAGE_SIZE;
+  if (range_has_type(b, e, type))
+    return;
+  if (EFI_ERROR(reserve_range(b, (e - b) / PAGE_SIZE, type))) {
+    debug_string("efi-emulation: could not reserve ");
+    efiemu_debug_hex(b);
+    debug_string("\n");
+  }
+}
+
+/* x86 XNU is placed at fixed physical addresses from 1 MiB (kernel, then
+ * boot-args at 0x2800000); a UEFI bootloader may have put modules there. */
+#define XNU_WINDOW_BASE 0x100000ULL
+#define XNU_WINDOW_END 0x4000000ULL
+static CHAR8 module_names[EFIEMU_MAX_MODULES][128];
+
+static BOOLEAN in_xnu_window(UINT64 base, UINT64 size) {
+  return size && base < XNU_WINDOW_END && base + size > XNU_WINDOW_BASE;
+}
+
+static UINT64 allocate_above_window(UINT64 pages) {
+  for (UINTN i = 0; i < nranges; ++i) {
+    UINT64 rb = ranges[i].PhysicalStart;
+    UINT64 re = rb + ranges[i].NumberOfPages * PAGE_SIZE;
+    if (ranges[i].Type != EfiConventionalMemory || re > 0x100000000ULL)
+      continue;
+    if (rb < XNU_WINDOW_END)
+      rb = XNU_WINDOW_END;
+    if (rb + pages * PAGE_SIZE <= re &&
+        !EFI_ERROR(reserve_range(rb, pages, EfiLoaderData)))
+      return rb;
+  }
+  return 0;
+}
+
+static void relocate_module(EfiEmuModule *m) {
+  if (!in_xnu_window(m->start, m->size))
+    return;
+  UINT64 end = m->start + m->size;
+  /* The part above the window must not become the copy's destination. */
+  if (end > XNU_WINDOW_END)
+    reserve_bytes(XNU_WINDOW_END, end - XNU_WINDOW_END, EfiLoaderData);
+  UINT64 dst = allocate_above_window((m->size + PAGE_SIZE - 1) / PAGE_SIZE);
+  if (!dst) {
+    debug_string("efi-emulation: no memory to move a module out of XNU's window\n");
+    reserve_bytes(m->start, m->size, EfiLoaderData);
+    return;
+  }
+  CopyMem((VOID *)(UINTN)dst, (VOID *)(UINTN)m->start, m->size);
+  m->start = dst;
+}
+
+static void initialize_ranges(EfiEmuBootInfo *info) {
   nranges = 0;
-  for (UINT32 i = 0; i < count && nranges < MAX_RANGES; ++i) {
-    UINT64 b = (map[i].base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    UINT64 e = (map[i].base + map[i].length) & ~(PAGE_SIZE - 1);
+  for (UINT32 i = 0; i < info->memory_count && nranges < MAX_RANGES; ++i) {
+    EfiEmuMemoryRange *m = &info->memory[i];
+    UINT64 b = (m->base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    UINT64 e = (m->base + m->length) & ~(PAGE_SIZE - 1);
     if (e <= b)
       continue;
     EFI_MEMORY_DESCRIPTOR *d = &ranges[nranges++];
     SetMem(d, sizeof(*d), 0);
     d->PhysicalStart = b;
     d->NumberOfPages = (e - b) / PAGE_SIZE;
-    d->Type = map[i].type == 1 ? EfiConventionalMemory : EfiReservedMemoryType;
+    d->Type = m->type == EfiEmuMemoryUsable ? EfiConventionalMemory
+              : m->type == EfiEmuMemoryAcpiReclaim ? EfiACPIReclaimMemory
+              : m->type == EfiEmuMemoryAcpiNvs ? EfiACPIMemoryNVS
+                                                : EfiReservedMemoryType;
   }
   sort_ranges();
 
-  /* Keep the bootstrap page tables and BIOS stages out of the allocator. */
-  reserve_range(0x1000, (0x20000 - 0x1000) / PAGE_SIZE, EfiLoaderCode);
+  /* Page zero stays unallocatable so a null pointer never looks valid. */
+  reserve_range(0, 1, EfiReservedMemoryType);
 
   /* XNU maps this range at the virtual address supplied to SVAM. */
-  UINT64 runtime_begin = (UINT64)(UINTN)&legacy_entry;
+  UINT64 runtime_begin = (UINT64)(UINTN)&__kernel_start;
   UINT64 runtime_end =
-      ((UINT64)(UINTN)&__bss_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+      ((UINT64)(UINTN)&__kernel_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
   reserve_range(runtime_begin, (runtime_end - runtime_begin) / PAGE_SIZE,
                 EfiRuntimeServicesCode);
+
+  /* Protocol data inside XNU's window is consumed before the loader runs. */
+  if (!in_xnu_window(info->protocol_data_base, info->protocol_data_size))
+    reserve_bytes(info->protocol_data_base, info->protocol_data_size,
+                  EfiLoaderData);
+  for (UINT32 i = 0; i < info->module_count; ++i) {
+    EfiEmuModule *m = &info->modules[i];
+    UINTN n = 0;
+    while (m->name && m->name[n] && n < sizeof(module_names[0]) - 1) {
+      module_names[i][n] = m->name[n];
+      ++n;
+    }
+    module_names[i][n] = 0;
+    m->name = module_names[i];
+    if (!in_xnu_window(m->start, m->size))
+      reserve_bytes(m->start, m->size, EfiLoaderData);
+  }
+  for (UINT32 i = 0; i < info->module_count; ++i)
+    relocate_module(&info->modules[i]);
 }
 
-void legacy_firmware_main(LegacyE820Entry *map, UINT32 count,
-                          UINT32 boot_drive, LegacyFramebuffer *framebuffer) {
-  (void)boot_drive;
-  debug_string("legacy: installing EFI compatibility services\n");
-  initialize_ranges(map, count);
+void efiemu_main(EfiEmuBootInfo *info) {
+  EfiEmuFramebuffer *framebuffer = &info->framebuffer;
+  debug_string("efi-emulation: installing EFI compatibility services\n");
+  initialize_ranges(info);
   SetMem(&boot_services, sizeof(boot_services), 0);
   boot_services.Hdr.Signature = EFI_BOOT_SERVICES_SIGNATURE;
   boot_services.Hdr.Revision = EFI_BOOT_SERVICES_REVISION;
@@ -924,31 +1055,35 @@ void legacy_firmware_main(LegacyE820Entry *map, UINT32 count,
     graphics_output.SetMode = gop_set_mode;
     graphics_output.Blt = gop_blt;
     graphics_output.Mode = &graphics_mode;
-    debug_string("legacy: VBE framebuffer exposed as GOP\n");
+    debug_string("efi-emulation: framebuffer exposed as GOP\n");
   } else {
-    debug_string("legacy: no VBE framebuffer\n");
+    debug_string("efi-emulation: no framebuffer, serial console only\n");
   }
   SetMem(&loaded_image, sizeof(loaded_image), 0);
   loaded_image.Revision = EFI_LOADED_IMAGE_PROTOCOL_REVISION;
   loaded_image.DeviceHandle = LOADER_HANDLE;
-  loaded_image.ImageBase = (VOID *)0x20000;
+  loaded_image.ImageBase = (VOID *)&__kernel_start;
   SetMem(&system_table, sizeof(system_table), 0);
   system_table.Hdr.Signature = EFI_SYSTEM_TABLE_SIGNATURE;
   system_table.Hdr.Revision = EFI_SYSTEM_TABLE_REVISION;
   system_table.Hdr.HeaderSize = sizeof(system_table);
-  system_table.FirmwareVendor = L"xnu-loader BIOS shim";
+  system_table.FirmwareVendor = L"xnu-loader";
   system_table.ConOut = &console_out;
   system_table.StdErr = &console_out;
   system_table.RuntimeServices = &runtime_services;
   system_table.BootServices = &boot_services;
-  discover_config_tables();
-  debug_string("legacy: entering shared EFI loader\n");
-  EFI_STATUS storage_status = legacy_storage_init(boot_drive);
-  if (EFI_ERROR(storage_status))
-    debug_string("legacy: FAT32 volume unavailable\n");
-  loaded_image.DeviceHandle = legacy_storage_handle();
+  discover_config_tables(info);
+  /* Modules from the boot protocol first; the disk only as a fallback. */
+  BOOLEAN have_modules = !EFI_ERROR(efiemu_modfs_init(info));
+  if (!have_modules)
+    debug_string("efi-emulation: no modules, trying the disk\n");
+  if (EFI_ERROR(efiemu_disk_init()) && !have_modules)
+    debug_string("efi-emulation: no boot volume either\n");
+  loaded_image.DeviceHandle =
+      have_modules ? efiemu_modfs_handle() : efiemu_disk_handle();
+  debug_string("efi-emulation: entering shared EFI loader\n");
   EFI_STATUS status = efi_main(LOADER_HANDLE, &system_table);
-  debug_string("legacy: loader returned\n");
+  debug_string("efi-emulation: loader returned\n");
   (void)status;
   for (;;)
     __asm__ volatile("cli; hlt");

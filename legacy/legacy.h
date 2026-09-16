@@ -1,5 +1,5 @@
-#ifndef XNU_LEGACY_FIRMWARE_H
-#define XNU_LEGACY_FIRMWARE_H
+#ifndef XNU_LEGACY_H
+#define XNU_LEGACY_H
 
 #include <efi.h>
 
@@ -21,11 +21,8 @@ typedef struct __attribute__((packed)) {
   UINT8 valid;
 } LegacyFramebuffer;
 
+/* Called by stage2 in long mode; hands the BIOS data to efi-emulation. */
 void legacy_firmware_main(LegacyE820Entry *map, UINT32 count,
                           UINT32 boot_drive, LegacyFramebuffer *framebuffer);
-EFI_STATUS legacy_storage_init(UINT32 boot_drive);
-EFI_STATUS legacy_storage_protocol(EFI_GUID *guid, VOID **out);
-EFI_HANDLE legacy_storage_handle(void);
-void legacy_runtime_fixup(EFI_RUNTIME_SERVICES *runtime_copy);
 
 #endif

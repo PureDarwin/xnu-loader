@@ -25,12 +25,18 @@ stdenv.mkDerivation {
 
     $CC -c legacy/entry.S -o build/entry.o -m64 -ffreestanding -fno-stack-protector \
       -fno-pic -mno-red-zone
-    $CC -c legacy/firmware.c -o build/firmware.o -m64 -ffreestanding \
-      -fno-stack-protector -fno-pic -mno-red-zone -mgeneral-regs-only -fshort-wchar -DGNU_EFI_USE_MS_ABI \
-      -Ilegacy -Iinclude -I${gnu-efi}/include/efi -I${gnu-efi}/include/efi/x86_64
-    $CC -c legacy/storage.c -o build/storage.o -m64 -ffreestanding \
-      -fno-stack-protector -fno-pic -mno-red-zone -mgeneral-regs-only -fshort-wchar -DGNU_EFI_USE_MS_ABI \
-      -Ilegacy -Iinclude -I${gnu-efi}/include -I${gnu-efi}/include/efi -I${gnu-efi}/include/efi/x86_64
+    shim_objects=""
+    $CC -c efi-emulation/exceptions.S -o build/efiemu-exceptions.S.o -m64 -ffreestanding -fno-pic
+    shim_objects="build/efiemu-exceptions.S.o"
+    for source in legacy/main.c efi-emulation/exceptions.c efi-emulation/firmware.c \
+      efi-emulation/modfs.c efi-emulation/storage.c; do
+      object="build/$(basename "$(dirname "$source")")-$(basename "$source").o"
+      $CC -c "$source" -o "$object" -m64 -ffreestanding \
+        -fno-stack-protector -fno-pic -mno-red-zone -mgeneral-regs-only -fshort-wchar -DGNU_EFI_USE_MS_ABI \
+        -Ilegacy -Iefi-emulation -Iinclude -I${gnu-efi}/include -I${gnu-efi}/include/efi \
+        -I${gnu-efi}/include/efi/x86_64 -I${gnu-efi}/include/efi/protocol
+      shim_objects="$shim_objects $object"
+    done
     loader_objects=""
     for source in src/main.c src/app.c src/boot.c src/console.c src/devtree.c \
       src/fileio.c src/jump.S src/lowmem.c src/macho.c src/serial.c; do
@@ -38,14 +44,14 @@ stdenv.mkDerivation {
       $CC -c "$source" -o "$object" -m64 -ffreestanding -fno-stack-protector \
         -fno-pic -mno-red-zone -mgeneral-regs-only -maccumulate-outgoing-args -mno-avx \
         -fshort-wchar -funsigned-char -DGNU_EFI_USE_MS_ABI -DLEGACY_BIOS -DCONFIG_x86_64 \
-        -Iinclude -Ilegacy -I${gnu-efi}/include -I${gnu-efi}/include/efi -I${gnu-efi}/include/efi/x86_64 \
+        -Iinclude -Iefi-emulation -I${gnu-efi}/include -I${gnu-efi}/include/efi -I${gnu-efi}/include/efi/x86_64 \
         -I${gnu-efi}/include/efi/protocol
       loader_objects="$loader_objects $object"
     done
     libgcc="$($CC -m64 -print-libgcc-file-name)"
     $LD -nostdlib --allow-multiple-definition -T legacy/linker.ld \
       -o build/payload.elf \
-      build/entry.o build/firmware.o build/storage.o $loader_objects \
+      build/entry.o $shim_objects $loader_objects \
       -L${gnu-efi}/lib -lgnuefi -lefi "$libgcc"
     objcopy -O binary build/payload.elf build/payload.bin
     payload_sectors=$((($(stat -c %s build/payload.bin) + 511) / 512))

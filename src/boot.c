@@ -5,7 +5,7 @@
 #include "serial.h"
 #include <efiprot.h>
 #if defined(LEGACY_BIOS)
-#include "firmware.h"
+#include "efi_emulation.h"
 #endif
 
 /* IRQ mask/unmask, real on both architectures (not stubs) - x86's
@@ -251,6 +251,43 @@ EFI_STATUS boot_set_command_line(BootArgsState *state, boot_args *args, const CH
   args->CommandLine[len] = '\0';
 
   return EFI_SUCCESS;
+}
+
+/*
+ * csr-active-config=0x... in the command line is what csrutil would have put
+ * in NVRAM. x86 takes it through boot_args; arm64 reads /chosen/asmb lp-sip0
+ * from the device tree. Without it every SIP check is enforced (config 0).
+ */
+BOOLEAN boot_cmdline_csr_config(const CHAR8 *cmdline, UINT32 *out) {
+  static const CHAR8 key[] = "csr-active-config=";
+  if (!cmdline || !out)
+    return FALSE;
+  for (UINTN i = 0; cmdline[i]; i++) {
+    UINTN j = 0;
+    const CHAR8 *p;
+    UINT32 v = 0;
+    if (i != 0 && cmdline[i - 1] != ' ')
+      continue;
+    while (key[j] && cmdline[i + j] == key[j])
+      j++;
+    if (key[j])
+      continue;
+    p = cmdline + i + j;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+      p += 2;
+    for (; *p && *p != ' '; p++) {
+      CHAR8 c = *p;
+      UINT32 d = (c >= '0' && c <= '9') ? (UINT32)(c - '0') :
+                 (c >= 'a' && c <= 'f') ? (UINT32)(c - 'a' + 10) :
+                 (c >= 'A' && c <= 'F') ? (UINT32)(c - 'A' + 10) : 16;
+      if (d == 16)
+        break;
+      v = (v << 4) | d;
+    }
+    *out = v;
+    return TRUE;
+  }
+  return FALSE;
 }
 
 static BOOLEAN boot_cmdline_has_flag(const CHAR8 *cmdline, const CHAR8 *flag) {
@@ -517,6 +554,13 @@ EFI_STATUS boot_build_args(
   args->efiMode = kBootArgsEfiMode64;
   args->debugMode = 0;
   args->flags = kBootArgsFlagBlackBg | kBootArgsFlagLoginUI;
+  {
+    UINT32 csr;
+    if (boot_cmdline_csr_config(cmdline, &csr)) {
+      args->csrActiveConfig = csr;
+      args->flags |= kBootArgsFlagCSRActiveConfig;
+    }
+  }
 
   args->MemoryMap = (UINT32)(UINTN)state->memory_map;
   args->MemoryMapSize = (UINT32)state->memory_map_size;

@@ -1,4 +1,7 @@
-#include "firmware.h"
+/* FAT32 boot volume over legacy IDE (ATA PIO at 0x1f0): the fallback when
+ * the boot protocol supplied no modules. */
+#include "efi_emulation.h"
+#include "serial.h"
 #include <efilib.h>
 
 #define FAT_LBA 2048U
@@ -40,6 +43,10 @@ static EFI_HANDLE volume_handle = (EFI_HANDLE)(UINTN)0x46415432;
 static EFI_GUID fs_guid = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
 static EFI_GUID block_io_guid = EFI_BLOCK_IO_PROTOCOL_GUID;
 static EFI_GUID file_info_guid = EFI_FILE_INFO_ID;
+static BOOLEAN storage_ready;
+/* First sector of the FAT32 boot volume: GPT images use the conventional 2048,
+ * MBR images take it from the partition entry. */
+static UINT32 fat_lba = FAT_LBA;
 
 static BOOLEAN guid_equal_local(const EFI_GUID *a, const EFI_GUID *b) {
   const UINT64 *x = (const UINT64 *)a, *y = (const UINT64 *)b;
@@ -129,7 +136,7 @@ static EFI_STATUS EFIAPI block_flush(EFI_BLOCK_IO_PROTOCOL *self) {
 }
 
 static UINT32 first_data(void) {
-  return FAT_LBA + bpb.reserved + bpb.fats * bpb.fat32;
+  return fat_lba + bpb.reserved + bpb.fats * bpb.fat32;
 }
 
 static UINT32 cluster_lba(UINT32 c) {
@@ -139,7 +146,7 @@ static UINT32 cluster_lba(UINT32 c) {
 static UINT32 next_cluster(UINT32 c) {
   UINT8 sec[512];
   UINT32 off = c * 4;
-  if (EFI_ERROR(ata_read(FAT_LBA + bpb.reserved + off / 512, sec)))
+  if (EFI_ERROR(ata_read(fat_lba + bpb.reserved + off / 512, sec)))
     return 0x0fffffff;
   return (*(UINT32 *)(sec + off % 512)) & 0x0fffffff;
 }
@@ -319,18 +326,58 @@ static void init_proto(LegacyFile *f) {
   f->proto.GetInfo = file_get_info;
 }
 
-EFI_STATUS legacy_storage_init(UINT32 drive) {
-  (void)drive;
+EFI_STATUS efiemu_disk_init(void) {
   UINT8 sec[512];
-  EFI_STATUS s = ata_read(1, sec);
-  if (EFI_ERROR(s))
-    return s;
-  if (CompareMem(sec, "EFI PART", 8) != 0)
-    return EFI_UNSUPPORTED;
-
   UINT64 last_block = 0;
-  for (UINTN i = 0; i < 8; ++i)
-    last_block |= (UINT64)sec[32 + i] << (i * 8);
+  EFI_STATUS s = ata_read(1, sec);
+  if (EFI_ERROR(s)) {
+    serial_puts8((CONST CHAR8 *)"efi-emulation: disk: ATA read of LBA 1 failed; controller "
+                 "must be in legacy IDE mode at 0x1f0\r\n");
+    return s;
+  }
+  if (CompareMem(sec, "EFI PART", 8) == 0) {
+    for (UINTN i = 0; i < 8; ++i)
+      last_block |= (UINT64)sec[32 + i] << (i * 8);
+  } else {
+    /* No GPT: use the MBR partition table at LBA 0 and boot from the first
+     * FAT32 or EFI System entry it lists. */
+    s = ata_read(0, sec);
+    if (EFI_ERROR(s)) {
+      serial_puts8((CONST CHAR8 *)"efi-emulation: disk: ATA read of LBA 0 failed\r\n");
+      return s;
+    }
+    if (sec[510] != 0x55 || sec[511] != 0xaa) {
+      serial_puts8((CONST CHAR8 *)"efi-emulation: disk: no GPT header and no MBR "
+                   "signature\r\n");
+      return EFI_UNSUPPORTED;
+    }
+    UINT32 part_lba = 0;
+    for (UINTN i = 0; i < 4; ++i) {
+      CONST UINT8 *e = sec + 446 + i * 16;
+      UINT32 start = (UINT32)e[8] | ((UINT32)e[9] << 8) |
+                     ((UINT32)e[10] << 16) | ((UINT32)e[11] << 24);
+      UINT32 count = (UINT32)e[12] | ((UINT32)e[13] << 8) |
+                     ((UINT32)e[14] << 16) | ((UINT32)e[15] << 24);
+
+      if ((UINT64)start + count > last_block)
+        last_block = (UINT64)start + count;
+      if (part_lba == 0 && start != 0 &&
+          (e[4] == 0x0b || e[4] == 0x0c || e[4] == 0x0e || e[4] == 0xef))
+        part_lba = start;
+    }
+    /* No partition entry: a bare FAT32 at LBA 2048 (legacy-boot.img). */
+    if (part_lba == 0 && !EFI_ERROR(ata_read(2048, sec)) &&
+        CompareMem(sec + 82, "FAT32   ", 8) == 0)
+      part_lba = 2048;
+    if (part_lba == 0) {
+      serial_puts8((CONST CHAR8 *)"efi-emulation: disk: MBR has no FAT32 or EFI System "
+                   "partition\r\n");
+      return EFI_UNSUPPORTED;
+    }
+    fat_lba = part_lba;
+    if (last_block != 0)
+      last_block -= 1;
+  }
 
   SetMem(&block_media, sizeof(block_media), 0);
   block_media.MediaId = 1;
@@ -348,13 +395,18 @@ EFI_STATUS legacy_storage_init(UINT32 drive) {
   block_io.WriteBlocks = block_write;
   block_io.FlushBlocks = block_flush;
 
-  s = ata_read(FAT_LBA, sec);
-  if (EFI_ERROR(s))
+  s = ata_read(fat_lba, sec);
+  if (EFI_ERROR(s)) {
+    serial_puts8((CONST CHAR8 *)"efi-emulation: disk: ATA read of the ESP failed\r\n");
     return s;
+  }
   for (UINTN i = 0; i < sizeof(bpb); ++i)
     ((UINT8 *)&bpb)[i] = sec[i];
-  if (bpb.bytes_sector != 512 || bpb.fat32 == 0)
+  if (bpb.bytes_sector != 512 || bpb.fat32 == 0) {
+    serial_puts8((CONST CHAR8 *)"efi-emulation: disk: ESP is not FAT32 with 512-byte "
+                 "sectors\r\n");
     return EFI_UNSUPPORTED;
+  }
   fs.Revision = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_REVISION;
   fs.OpenVolume = open_volume;
   init_proto(&root);
@@ -363,16 +415,21 @@ EFI_STATUS legacy_storage_init(UINT32 drive) {
   root.allocated = TRUE;
   for (UINTN i = 0; i < 12; ++i)
     init_proto(&files[i]);
+  storage_ready = TRUE;
   return EFI_SUCCESS;
 }
 
-EFI_HANDLE legacy_storage_handle(void) {
+EFI_HANDLE efiemu_disk_handle(void) {
   return volume_handle;
 }
 
-EFI_STATUS legacy_storage_protocol(EFI_GUID *guid, VOID **out) {
+EFI_STATUS efiemu_disk_protocol(EFI_GUID *guid, VOID **out) {
   if (!guid || !out)
     return EFI_INVALID_PARAMETER;
+  /* Init returns early on unsupported media, leaving these tables zeroed; the
+   * loader would otherwise call straight through a null OpenVolume. */
+  if (!storage_ready)
+    return EFI_UNSUPPORTED;
   if (guid_equal_local(guid, &fs_guid)) {
     *out = &fs;
     return EFI_SUCCESS;

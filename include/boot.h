@@ -223,6 +223,8 @@ EFI_STATUS boot_refresh_memory_map(AppContext *ctx, BootArgsState *state);
 VOID boot_update_args_memory_map(AppContext *ctx, BootArgsState *state);
 
 EFI_STATUS boot_set_command_line(BootArgsState *state,  boot_args *args, const CHAR8 *cmdline);
+/* csr-active-config=0x... from the command line, if present. */
+BOOLEAN boot_cmdline_csr_config(const CHAR8 *cmdline, UINT32 *out);
 
 EFI_STATUS boot_build_args(AppContext *ctx, const CHAR8 *cmdline, MachoLoadResult *load_result, BootArgsState *state);
 

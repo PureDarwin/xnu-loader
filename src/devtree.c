@@ -1,6 +1,7 @@
 #include "devtree.h"
 #include "console.h"
 #include "app.h"
+#include "boot.h"
 #include <efiprot.h>
 
 /* One NVRAM bank. 0x2000 is the conventional CHRP size and leaves room for the
@@ -300,6 +301,76 @@ static BOOLEAN smbios_system_uuid(AppContext *ctx, UINT8 out[16]) {
 }
 
 /* Parse "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" into 16 raw bytes. */
+/*
+ * ACPI MADT ("APIC") lists one GICC entry per CPU (type 0x0B). Per the ACPI
+ * spec the flags are at offset 12 (bit 0 = enabled) and the MPIDR at offset 68;
+ * offsets 20 and 40 are the performance interrupt and the GICV base, which is
+ * why reading those yielded zero for every CPU. Returns how many were stored.
+ */
+static UINTN acpi_cpu_mpidrs(AppContext *ctx, UINT64 *out, UINTN max) {
+  static const EFI_GUID acpi20 = ACPI_20_TABLE_GUID;
+  static const EFI_GUID acpi10 = ACPI_TABLE_GUID;
+  UINT8 *rsdp = NULL;
+  UINTN found = 0;
+
+  for (UINTN i = 0; i < ctx->st->NumberOfTableEntries; i++) {
+    EFI_CONFIGURATION_TABLE *e = &ctx->st->ConfigurationTable[i];
+    if (!CompareMem(&e->VendorGuid, &acpi20, sizeof(EFI_GUID)) ||
+        (rsdp == NULL && !CompareMem(&e->VendorGuid, &acpi10, sizeof(EFI_GUID))))
+      rsdp = (UINT8 *)e->VendorTable;
+  }
+  if (!rsdp || CompareMem(rsdp, "RSD PTR ", 8))
+    return 0;
+
+  UINT8 *sdt = NULL;
+  UINTN entry_size = 0;
+  if (rsdp[15] >= 2) {                       /* revision 2+: XSDT, 8-byte entries */
+    UINT64 xsdt = 0;
+    CopyMem(&xsdt, rsdp + 24, sizeof(xsdt));
+    sdt = (UINT8 *)(UINTN)xsdt;
+    entry_size = 8;
+  } else {
+    UINT32 rsdt = 0;
+    CopyMem(&rsdt, rsdp + 16, sizeof(rsdt));
+    sdt = (UINT8 *)(UINTN)rsdt;
+    entry_size = 4;
+  }
+  if (!sdt)
+    return 0;
+
+  UINT32 sdt_len = 0;
+  CopyMem(&sdt_len, sdt + 4, sizeof(sdt_len));
+  if (sdt_len < 36)
+    return 0;
+
+  for (UINTN off = 36; off + entry_size <= sdt_len; off += entry_size) {
+    UINT64 addr = 0;
+    CopyMem(&addr, sdt + off, entry_size);
+    UINT8 *tbl = (UINT8 *)(UINTN)addr;
+    if (!tbl || CompareMem(tbl, "APIC", 4))
+      continue;
+
+    UINT32 madt_len = 0;
+    CopyMem(&madt_len, tbl + 4, sizeof(madt_len));
+    for (UINTN e = 44; e + 2 <= madt_len && found < max;) {
+      UINT8 type = tbl[e], len = tbl[e + 1];
+      if (len < 2)
+        break;
+      if (type == 0x0B && len >= 76) {
+        UINT32 flags = 0;
+        UINT64 mpidr = 0;
+        CopyMem(&flags, tbl + e + 12, sizeof(flags));
+        CopyMem(&mpidr, tbl + e + 68, sizeof(mpidr));
+        if (flags & 1)
+          out[found++] = mpidr;
+      }
+      e += len;
+    }
+    break;
+  }
+  return found;
+}
+
 static BOOLEAN uuid_str_to_bytes(const CHAR8 *str, UINT8 out[16]) {
   UINTN oi = 0;
   for (UINTN i = 0; str[i] && oi < 16; i++) {
@@ -995,6 +1066,38 @@ EFI_STATUS dt_build(
   dt_prop_str(ctx, chosen, "name", "chosen");
   dt_prop_str(ctx, chosen, "boot-args", boot_args);
 
+  /* kmutil panics "failed to get manifest properties" without /chosen/manifest-properties,
+   * then "non-sensical crypto hash method" without crypto-hash-method. */
+  {
+    DeviceTreeNode *manifest = dt_create_node(ctx);
+    dt_prop_str(ctx, manifest, "name", "manifest-properties");
+    dt_prop_str(ctx, manifest, "crypto-hash-method", "sha2-384");
+    dt_add_child(ctx, chosen, manifest);
+    dt_prop_str(ctx, chosen, "crypto-hash-method", "sha2-384");
+  }
+
+  /* arm64 IOPlatformExpertDevice::generatePlatformUUID hashes these two; without them
+   * IOPlatformUUID is never published and gethostuuid (opendirectoryd) blocks forever. */
+  {
+    static const UINT8 unique_chip_id[8] = { 0x50, 0x44, 0x56, 0x4d, 0x00, 0x00, 0x00, 0x01 };
+    dt_prop(ctx, chosen, "unique-chip-id", unique_chip_id, sizeof(unique_chip_id));
+    dt_prop_u32(ctx, chosen, "chip-id", 0xfe00);
+  }
+
+  /* arm64 xnu (CONFIG_CSR_FROM_DT) takes its SIP configuration from the local
+   * boot policy at /chosen/asmb: lp-sip0 is the csr_config word, lp-sip1 the
+   * "unauthenticated root allowed" bit (kern_csr.c csr_bootstrap). */
+  {
+    UINT32 csr;
+    if (boot_cmdline_csr_config(boot_args, &csr)) {
+      DeviceTreeNode *asmb = dt_create_node(ctx);
+      dt_prop_str(ctx, asmb, "name", "asmb");
+      dt_prop_u64(ctx, asmb, "lp-sip0", csr);
+      dt_prop_u32(ctx, asmb, "lp-sip1", (csr & (1u << 11)) ? 1 : 0);
+      dt_add_child(ctx, chosen, asmb);
+    }
+  }
+
   /* IODTNVRAM obtains its backing-store geometry from /chosen. xnu 12377 wants
    * the bank triple, not just the old nvram-total-size, and
    * IODTNVRAMFormatHandler::getNVRAMProperties fails the whole handler if any
@@ -1483,20 +1586,32 @@ EFI_STATUS dt_build(
   dt_prop_u32(ctx, cpus, "#address-cells", 2);
   dt_prop_u32(ctx, cpus, "#size-cells", 0);
 
-  DeviceTreeNode *cpu0 = dt_create_node(ctx);
-  dt_prop_str(ctx, cpu0, "name", "cpu@0");
-  dt_prop_str(ctx, cpu0, "device_type", "cpu");
-  dt_prop_str(ctx, cpu0, "state", "running");
+  /* One node per enabled processor; xnu's virt board config caps MAX_CPUS at 8.
+   * Only the boot CPU carries state "running" - that is how xnu picks it out. */
   {
-    UINT64 cpu_id = 0;
-    dt_prop_u64(ctx, cpu0, "reg", cpu_id);
-  }
-  {
+    UINT64 mpidr[8];
+    UINTN ncpu = acpi_cpu_mpidrs(ctx, mpidr, 8);
     UINT64 cntfrq;
+
     __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(cntfrq));
-    dt_prop_u32(ctx, cpu0, "timebase-frequency", (UINT32)cntfrq);
+    if (ncpu == 0) {
+      mpidr[0] = 0;
+      ncpu = 1;
+    }
+    for (UINTN ci = 0; ci < ncpu; ci++) {
+      CHAR8 name[8] = { 'c', 'p', 'u', '@', 0, 0, 0, 0 };
+      DeviceTreeNode *cpu = dt_create_node(ctx);
+
+      name[4] = (CHAR8)('0' + (ci % 10));
+      dt_prop_str(ctx, cpu, "name", name);
+      dt_prop_str(ctx, cpu, "device_type", "cpu");
+      dt_prop_str(ctx, cpu, "state", ci == 0 ? "running" : "waiting");
+      dt_prop_u64(ctx, cpu, "reg", mpidr[ci]);
+      dt_prop_u32(ctx, cpu, "timebase-frequency", (UINT32)cntfrq);
+      dt_add_child(ctx, cpus, cpu);
+    }
+    log_info(L"DT: published %lu cpu node(s)\r\n", (UINT64)ncpu);
   }
-  dt_add_child(ctx, cpus, cpu0);
 
   DeviceTreeNode *armio = dt_create_node(ctx);
   dt_prop_str(ctx, armio, "name", "arm-io");
@@ -1562,6 +1677,14 @@ EFI_STATUS dt_build(
     }
 
     dt_add_child(ctx, root, options);
+  }
+
+  /* macOS userland (kmutil) panics with "failed to get product node" without /product. */
+  {
+    DeviceTreeNode *product = dt_create_node(ctx);
+    dt_prop_str(ctx, product, "name", "product");
+    dt_prop_str(ctx, product, "product-name", "PureDarwin Virtual Machine");
+    dt_add_child(ctx, root, product);
   }
 #if defined(__aarch64__)
   dt_add_child(ctx, root, cpus);

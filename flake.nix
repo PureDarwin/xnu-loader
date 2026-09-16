@@ -31,6 +31,14 @@
       };
 
       legacy-boot = pkgs.callPackage ./legacy { };
+      # The loader as a Multiboot2 ELF kernel (GRUB etc.).
+      kernel-multiboot2 = pkgs.callPackage ./kernel { };
+      kernel-grub-bios = pkgs.callPackage ./kernel/grub-bios.nix {
+        loaderKernel = pkgs.callPackage ./kernel { };
+      };
+      kernel-grub-efi = pkgs.callPackage ./kernel/grub-efi.nix {
+        loaderKernel = pkgs.callPackage ./kernel { };
+      };
     });
   };
 }
