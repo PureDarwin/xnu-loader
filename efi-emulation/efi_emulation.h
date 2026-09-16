@@ -65,6 +65,12 @@ EFI_STATUS efiemu_modfs_init(EfiEmuBootInfo *info);
 EFI_STATUS efiemu_modfs_protocol(EFI_GUID *guid, VOID **out);
 EFI_HANDLE efiemu_modfs_handle(void);
 
+/* Reads count sectors (<= EFIEMU_BIOS_SECTORS) from the BIOS boot drive into
+ * EFIEMU_BIOS_BOUNCE; returns 0 or the INT 13h status. */
+#define EFIEMU_BIOS_BOUNCE 0x18000UL
+#define EFIEMU_BIOS_SECTORS 64U
+typedef UINT32 (__attribute__((sysv_abi)) *EfiEmuBiosRead)(UINT64 lba, UINT32 count);
+void efiemu_bios_disk_set(UINT32 drive, EfiEmuBiosRead read);
 EFI_STATUS efiemu_disk_init(void);
 EFI_STATUS efiemu_disk_protocol(EFI_GUID *guid, VOID **out);
 EFI_HANDLE efiemu_disk_handle(void);

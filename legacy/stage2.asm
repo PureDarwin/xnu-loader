@@ -21,6 +21,11 @@ ORG 0
 %define PDPT_PHYS          0x2000
 %define PD_PHYS            0x3000
 %define PD_COUNT           4
+; Bounce buffer for BIOS disk reads from long mode: inside the reserved low
+; area, 32KiB-aligned so a 64-sector read never crosses a 64KiB DMA boundary.
+%define BOUNCE_SEGMENT     0x1800
+%define BOUNCE_SECTORS     64
+%define L(x)               ((LOAD_SEGMENT << 4) + (x))
 
     jmp short entry
 header:
@@ -251,12 +256,21 @@ disk_error:
 align 8
 gdt:
     dq 0
-    dq 0x00af9a000000ffff          ; 64-bit code
-    dq 0x00cf92000000ffff          ; data
+    dq 0x00af9a000000ffff          ; 0x08 64-bit code
+    dq 0x00cf92000000ffff          ; 0x10 data
+    dq 0x00cf9a000000ffff          ; 0x18 32-bit code (BIOS thunk)
+    dq 0x00009a008000ffff          ; 0x20 16-bit code, base LOAD_SEGMENT
+    dq 0x000092008000ffff          ; 0x28 16-bit data, base LOAD_SEGMENT
 gdt_end:
 gdt_descriptor:
     dw gdt_end - gdt - 1
     dd (LOAD_SEGMENT << 4) + gdt
+gdt_descriptor64:
+    dw gdt_end - gdt - 1
+    dq (LOAD_SEGMENT << 4) + gdt
+real_idtr:
+    dw 0x3ff
+    dd 0
 
 BITS 64
 long_mode_entry:
@@ -272,6 +286,7 @@ long_mode_entry:
     movzx esi, word [(LOAD_SEGMENT << 4) + e820_count]
     movzx edx, byte [(LOAD_SEGMENT << 4) + boot_drive]
     mov rcx, (LOAD_SEGMENT << 4) + framebuffer
+    mov r8, (LOAD_SEGMENT << 4) + bios_disk_read
     mov rax, PAYLOAD_PHYS
     call rax
 .halt:
@@ -279,7 +294,146 @@ long_mode_entry:
     hlt
     jmp .halt
 
+; UINT32 bios_disk_read(UINT64 lba, UINT32 count), SysV ABI, called from long
+; mode: drops to real mode, reads count (<= BOUNCE_SECTORS) sectors from the
+; BIOS boot drive into the bounce buffer, returns 0 or the INT 13h status.
+bios_disk_read:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    pushfq
+    cli
+    mov rax, cr3
+    mov rdx, rax
+    shr rdx, 32
+    jnz .unreachable_cr3
+    mov [abs L(saved_cr3)], eax
+    mov [abs L(saved_rsp)], rsp
+    sidt [abs L(saved_idtr)]
+    sgdt [abs L(saved_gdtr)]
+    mov ax, cs
+    mov [abs L(saved_cs)], ax
+    mov ax, ss
+    mov [abs L(saved_ss)], ax
+    mov [abs L(dap.lba)], rdi
+    mov [abs L(dap.count)], si
+    mov word [abs L(dap.offset)], 0
+    mov word [abs L(dap.segment)], BOUNCE_SEGMENT
+    lgdt [abs L(gdt_descriptor64)]
+    push 0x18
+    mov eax, L(.compat32)
+    push rax
+    retfq
+.unreachable_cr3:
+    mov eax, 0x100
+    jmp .out
+
+BITS 32
+.compat32:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov eax, cr0
+    and eax, 0x7fffffff             ; paging off: long mode deactivates
+    mov cr0, eax
+    mov ecx, 0xc0000080
+    rdmsr
+    and eax, ~(1 << 8)
+    wrmsr
+    jmp 0x20:.prot16
+
 BITS 16
+.prot16:
+    mov ax, 0x28
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov eax, cr0
+    and al, 0xfe
+    mov cr0, eax
+    jmp LOAD_SEGMENT:.real16
+.real16:
+    mov ax, LOAD_SEGMENT
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0x7000
+    lidt [real_idtr]
+    sti
+    mov dl, [boot_drive]
+    mov si, dap
+    mov ah, 0x42
+    int 0x13
+    cli
+    mov byte [disk_status], 0
+    jnc .status_done
+    test ah, ah
+    jnz .status_ah
+    mov ah, 0xff
+.status_ah:
+    mov [disk_status], ah
+.status_done:
+    lgdt [gdt_descriptor]
+    mov eax, cr0
+    or al, 1
+    mov cr0, eax
+    jmp dword 0x18:L(.prot32)
+
+BITS 32
+.prot32:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov eax, [L(saved_cr3)]
+    mov cr3, eax
+    mov ecx, 0xc0000080
+    rdmsr
+    or eax, 1 << 8
+    wrmsr
+    mov eax, cr0
+    or eax, 0x80000000
+    mov cr0, eax
+    jmp 0x08:L(.long64)
+
+BITS 64
+.long64:
+    lgdt [abs L(saved_gdtr)]
+    lidt [abs L(saved_idtr)]
+    movzx eax, word [abs L(saved_ss)]
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov rsp, [abs L(saved_rsp)]
+    movzx eax, word [abs L(saved_cs)]
+    push rax
+    lea rax, [rel .cs_reloaded]
+    push rax
+    retfq
+.cs_reloaded:
+    movzx eax, byte [abs L(disk_status)]
+.out:
+    popfq
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+BITS 16
+saved_cr3 dd 0
+saved_rsp dq 0
+saved_idtr: times 10 db 0
+saved_gdtr: times 10 db 0
+saved_cs dw 0
+saved_ss dw 0
+disk_status db 0
 boot_drive db 0
 e820_count dw 0
 remaining dw 0
