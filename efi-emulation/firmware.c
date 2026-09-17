@@ -282,6 +282,95 @@ static void firmware_config_tables(EfiEmuBootInfo *info, VOID **rsdp,
     debug_string("efi-emulation: ACPI from the firmware system table\n");
 }
 
+static BOOLEAN in_xnu_window(UINT64 base, UINT64 size);
+static UINT64 allocate_above_window(UINT64 pages);
+
+static void acpi_fix_checksum(UINT8 *table, UINTN length, UINTN offset) {
+  UINT8 sum = 0;
+  table[offset] = 0;
+  for (UINTN i = 0; i < length; ++i)
+    sum += table[i];
+  table[offset] = (UINT8)(0 - sum);
+}
+
+/* Copy one ACPI table out of XNU's load window; returns its (new) address. */
+static UINT64 acpi_move_table(UINT64 addr, BOOLEAN has_header) {
+  if (addr == 0 || addr >= 0x100000000ULL)
+    return addr;
+  UINT32 length = *(UINT32 *)(UINTN)(addr + 4);
+  if (length < 8 || length > 0x1000000 || !in_xnu_window(addr, length))
+    return addr;
+  UINT64 dst = allocate_above_window((length + PAGE_SIZE - 1) / PAGE_SIZE);
+  if (!dst) {
+    debug_string("efi-emulation: no memory to move an ACPI table out of XNU's window\n");
+    return addr;
+  }
+  CopyMem((VOID *)(UINTN)dst, (VOID *)(UINTN)addr, length);
+  (void)has_header;
+  return dst;
+}
+
+/*
+ * Hyper-V (WSL2) places its ACPI tables at 1 MiB, exactly where x86 XNU is
+ * copied, so the kernel would overwrite them before reading the MADT. Move any
+ * table inside the window above it and repoint the RSDP, root table and FADT.
+ */
+static void relocate_acpi_tables(UINT8 *rsdp) {
+  UINT8 revision = rsdp[15];
+  BOOLEAN xsdt = revision >= 2 && *(UINT32 *)(rsdp + 20) >= 36 &&
+                 *(UINT64 *)(rsdp + 24) != 0;
+  UINT64 root = xsdt ? *(UINT64 *)(rsdp + 24) : *(UINT32 *)(rsdp + 16);
+  if (root == 0 || root >= 0x100000000ULL)
+    return;
+  UINTN entry = xsdt ? 8 : 4;
+  UINT64 new_root = acpi_move_table(root, TRUE);
+  UINT8 *r = (UINT8 *)(UINTN)new_root;
+  UINT32 rlen = *(UINT32 *)(r + 4);
+  BOOLEAN moved = new_root != root;
+
+  for (UINTN off = 36; off + entry <= rlen; off += entry) {
+    UINT64 child = xsdt ? *(UINT64 *)(r + off) : *(UINT32 *)(r + off);
+    UINT64 new_child = acpi_move_table(child, TRUE);
+    UINT8 *c = (UINT8 *)(UINTN)new_child;
+    if (new_child != child) {
+      moved = TRUE;
+      if (xsdt)
+        *(UINT64 *)(r + off) = new_child;
+      else
+        *(UINT32 *)(r + off) = (UINT32)new_child;
+    }
+    if (c && CompareMem(c, "FACP", 4) == 0) {
+      UINT32 flen = *(UINT32 *)(c + 4);
+      /* FIRMWARE_CTRL/DSDT at 36/40; X_FIRMWARE_CTRL/X_DSDT at 132/140. */
+      for (UINTN k = 0; k < 2; ++k) {
+        UINTN o32 = k ? 40 : 36, o64 = k ? 140 : 132;
+        UINT64 old = flen >= o64 + 8 && *(UINT64 *)(c + o64) ? *(UINT64 *)(c + o64)
+                                                             : *(UINT32 *)(c + o32);
+        UINT64 now = acpi_move_table(old, k == 1);
+        if (now == old)
+          continue;
+        moved = TRUE;
+        if (*(UINT32 *)(c + o32))
+          *(UINT32 *)(c + o32) = (UINT32)now;
+        if (flen >= o64 + 8 && *(UINT64 *)(c + o64))
+          *(UINT64 *)(c + o64) = now;
+      }
+      acpi_fix_checksum(c, flen, 9);
+    }
+  }
+  if (!moved)
+    return;
+  acpi_fix_checksum(r, rlen, 9);
+  if (xsdt)
+    *(UINT64 *)(rsdp + 24) = new_root;
+  else
+    *(UINT32 *)(rsdp + 16) = (UINT32)new_root;
+  acpi_fix_checksum(rsdp, 20, 8);
+  if (revision >= 2)
+    acpi_fix_checksum(rsdp, 36, 32);
+  debug_string("efi-emulation: moved ACPI tables out of XNU's load window\n");
+}
+
 static void discover_config_tables(EfiEmuBootInfo *info) {
   UINTN n = 0;
   VOID *rsdp = info->rsdp;
@@ -316,6 +405,7 @@ static void discover_config_tables(EfiEmuBootInfo *info) {
       static EFI_GUID acpi10 = ACPI_TABLE_GUID;
       config_tables[n].VendorGuid = acpi10;
     }
+    relocate_acpi_tables(normalized_rsdp);
     config_tables[n++].VendorTable = normalized_rsdp;
   }
   if (!sm3)

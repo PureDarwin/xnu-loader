@@ -46,7 +46,7 @@ initrd_addr_max dd 0x7fffffff
 kernel_alignment dd 0x1000
 relocatable_kernel db 1
 min_alignment   db 12
-xloadflags      dw 0
+xloadflags      dw 0x0001          ; XLF_KERNEL_64: long-mode entry at +0x200
 cmdline_size    dd 0x7ff
 hardware_subarch dd 0
 hardware_subarch_data dq 0

@@ -64,11 +64,6 @@ static EFI_STATUS load_ramdisk(AppContext *ctx) {
   }
 
   if (EFI_ERROR(status)) {
-    log_info(L"no local ramdisk.img (%r); trying TFTP\r\n", status);
-    status = file_read_all_via_tftp(ctx, (CONST CHAR8 *)"ramdisk.img", &image);
-  }
-
-  if (EFI_ERROR(status)) {
     log_info(L"no ramdisk.img found (%r); continuing without RAMDisk\r\n", status);
     return EFI_SUCCESS;
   }
@@ -439,9 +434,9 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
 
   log_info(L"entry vm=0x%lx -> host=0x%lx\r\n", entry_vmaddr, (UINT64)(UINTN)host_entry);
 
-  //status = load_ramdisk(&ctx);
-  //if (EFI_ERROR(status))
-  //  return status;
+  status = load_ramdisk(&ctx);
+  if (EFI_ERROR(status))
+    return status;
 
   BootArgsState boot_state = {0};
 
