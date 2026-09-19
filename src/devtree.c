@@ -1707,6 +1707,9 @@ EFI_STATUS dt_build(
   {
     DeviceTreeNode *defaults = dt_create_node(ctx);
     dt_prop_str(ctx, defaults, "name", "defaults");
+    /* kern.hv_vmm_present reads this; without it userland believes it is on
+     * bare metal and never takes its paravirtualised paths. */
+    dt_prop_u32(ctx, defaults, "vmm-present", 1);
 #if defined(XNU_LOADER_QEMU_VIRT)
     /* Without this serial_init() returns early and the kernel is silent. */
     dt_prop_u32(ctx, defaults, "serial-device", XNU_LOADER_UART0_PHANDLE);

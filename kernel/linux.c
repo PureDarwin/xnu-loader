@@ -98,6 +98,8 @@ static UINT32 hex8(CONST UINT8 *s) {
   return v;
 }
 
+extern CONST CHAR8 embedded_initrd_start[], embedded_initrd_end[];
+
 static void parse_cpio(UINT64 start, UINT64 size) {
   CONST UINT8 *base = (CONST UINT8 *)(UINTN)start;
   UINT64 off = 0;
@@ -162,6 +164,12 @@ void kernel_linux_main(UINT64 boot_params) {
 
   UINT64 initrd = rd32(bp, BP_RAMDISK_IMAGE) | (UINT64)rd32(bp, BP_EXT_RAMDISK_IMAGE) << 32;
   UINT64 initrd_size = rd32(bp, BP_RAMDISK_SIZE) | (UINT64)rd32(bp, BP_EXT_RAMDISK_SIZE) << 32;
+  /* A built-in payload wins: hosts like WSL always pass an initrd of their own. */
+  if (embedded_initrd_end != embedded_initrd_start) {
+    initrd = (UINT64)(UINTN)embedded_initrd_start;
+    initrd_size = (UINT64)(embedded_initrd_end - embedded_initrd_start);
+    efiemu_debug_string("xnu-loader kernel: using the built-in initrd\n");
+  }
   if (initrd && initrd_size)
     parse_cpio(initrd, initrd_size);
   else
