@@ -55,9 +55,21 @@ void *memset(void *d, int c, size_t n) {
     *p++ = (uint8_t)c;
   return d;
 }
+/* Copies run upwards (the ramdisk slides down over itself), a word at a time when both
+   sides allow it, and restart the RV1106 watchdog so large images finish in time */
 void *memcpy(void *d, const void *s, size_t n) {
   uint8_t *p = d;
   const uint8_t *q = s;
+  if ((((uintptr_t)p | (uintptr_t)q) & 3) == 0) {
+    while (n >= 4) {
+      *(uint32_t *)p = *(const uint32_t *)q;
+      p += 4;
+      q += 4;
+      n -= 4;
+      if (board_rv1106 && ((uintptr_t)p & 0xfffff) == 0)
+        ((volatile uint32_t *)0xff5a0000)[3] = 0x76;
+    }
+  }
   while (n--)
     *p++ = *q++;
   return d;
@@ -388,6 +400,29 @@ void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
   uint32_t phys_base = ALIGN(initrd_end, board_rv1106 ? 0x400000u : 0x2000000u);
   uint32_t ncmds = rd32(k + 16), entry = 0, top = 0;
   const uint8_t *lc = k + 28;
+
+  /* A 64 MB board cannot hold a ramdisk twice: when the payload was loaded high enough,
+     put the kernel below it and slide the ramdisk down (copies run upwards) */
+  uint32_t rsize = 0;
+  const uint8_t *rd = cpio_find("EFI/BOOT/ramdisk.img", &rsize);
+  if (board_rv1106 && rd) {
+    uint32_t span = 0;
+    for (uint32_t i = 0; i < ncmds; ++i, lc += rd32(lc + 4))
+      if (rd32(lc) == 1 && rd32(lc + 28) && rd32(lc + 24) >= VIRT_BASE &&
+          rd32(lc + 24) - VIRT_BASE + rd32(lc + 28) > span)
+        span = rd32(lc + 24) - VIRT_BASE + rd32(lc + 28);
+    lc = k + 28;
+    uint32_t low = ALIGN(ram_base, 0x400000u) + 0x400000u;
+    if (low + ALIGN(span, 0x1000) + 0x14000 <= initrd_start && (uint32_t)rd > (uint32_t)k)
+      phys_base = low;
+    puts("boot32: ramdisk in the cpio at ");
+    puthex((uint32_t)rd);
+    puts(", kernel span ");
+    puthex(span);
+    puts(", kernel at ");
+    puthex(phys_base);
+    puts("\n");
+  }
   for (uint32_t i = 0; i < ncmds; ++i) {
     uint32_t cmd = rd32(lc), size = rd32(lc + 4);
     if (cmd == 1) { /* LC_SEGMENT */
@@ -414,10 +449,14 @@ void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
 
   /* Optional root ramdisk: xnu takes /chosen/memory-map/RAMDisk as md0, and maps it
      with ml_static_ptovirt, so it has to sit below topOfKernelData */
-  uint32_t rsize = 0;
-  const uint8_t *rd = cpio_find("EFI/BOOT/ramdisk.img", &rsize);
   uint32_t rd_phys = ALIGN(dt_phys + 0x10000, 0x4000);
+  /* With the kernel below the payload, the ramdisk slides down only as far as the end of
+     this shim's 64 KB (code, data and stack) */
+  extern char _start[];
+  if (rd && phys_base < (uint32_t)_start && rd_phys < (uint32_t)_start + 0x10000)
+    rd_phys = ALIGN((uint32_t)_start + 0x10000, 0x4000);
   if (rd) {
+    puts("boot32: moving the ramdisk\n");
     memcpy((void *)rd_phys, rd, rsize);
     rsize = ALIGN(rsize, 0x1000);
   }
