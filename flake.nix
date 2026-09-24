@@ -16,10 +16,16 @@
       hello = pkgs.callPackage ./hello.nix {};
       arm64 = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./. {
         arch = "aarch64";
+        platform = "bcm2837";
       };
       arm64-virt = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./. {
         arch = "aarch64";
-        qemuVirt = true;
+        platform = "qemuvirt";
+      };
+      # Allwinner H616/H618 - Orange Pi Zero 3.
+      arm64-sun50i = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./. {
+        arch = "aarch64";
+        platform = "sun50i";
       };
       # 32-bit UEFI on a 64-bit CPU: the EFI binary must be IA32 while the
       # kernel it boots is x86_64. Built from the i686 package set so libgcc,
@@ -33,8 +39,18 @@
       legacy-boot = pkgs.callPackage ./legacy { };
       # The loader as an arm64 Linux Image (U-Boot booti, QEMU -kernel).
       kernel-arm64 = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./kernel/arm64.nix { };
+      kernel-arm64-sun50i = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./kernel/arm64.nix {
+        platform = "sun50i";
+      };
       # xnu arm32 boot shim as a Linux zImage (QEMU -kernel, U-Boot bootz)
       kernel-arm32 = pkgs.pkgsCross.armv7l-hf-multiplatform.callPackage ./arm32 { };
+      # Luckfox Pico (RV1103/RV1106) and QEMU's virt Cortex-A7, fixed at build time
+      arm32 = pkgs.pkgsCross.armv7l-hf-multiplatform.callPackage ./arm32 {
+        platform = "rv1106";
+      };
+      arm32-virt = pkgs.pkgsCross.armv7l-hf-multiplatform.callPackage ./arm32 {
+        platform = "qemuvirt";
+      };
       # The loader as a Multiboot2 ELF kernel (GRUB etc.).
       kernel-multiboot2 = pkgs.callPackage ./kernel { };
       kernel-grub-bios = pkgs.callPackage ./kernel/grub-bios.nix {

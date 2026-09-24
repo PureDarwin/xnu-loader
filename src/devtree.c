@@ -2,6 +2,7 @@
 #include "console.h"
 #include "app.h"
 #include "boot.h"
+#include "platform.h"
 #include <efiprot.h>
 
 /* One NVRAM bank. 0x2000 is the conventional CHRP size and leaves room for the
@@ -1366,13 +1367,8 @@ EFI_STATUS dt_build(
    * these unconditionally and panics if either is missing; gDramBase/
    * gDramSize feed real_avail_end/pmap accounting downstream.
    */
-#if defined(XNU_LOADER_QEMU_VIRT)
-  #define XNU_LOADER_DRAM_BASE 0x40000000ULL
-#else
-  #define XNU_LOADER_DRAM_BASE 0ULL
-#endif
   {
-    UINT64 dram_base = XNU_LOADER_DRAM_BASE;
+    UINT64 dram_base = XNU_LOADER_RAM_BASE;
     UINT64 dram_size = app_detect_physical_memory_size(ctx);
     dt_prop(ctx, chosen, "dram-base", &dram_base, sizeof(dram_base));
     dt_prop(ctx, chosen, "dram-size", &dram_size, sizeof(dram_size));
@@ -1592,8 +1588,8 @@ EFI_STATUS dt_build(
   /* One node per enabled processor; xnu's virt board config caps MAX_CPUS at 8.
    * Only the boot CPU carries state "running" - that is how xnu picks it out. */
   {
-    UINT64 mpidr[8];
-    UINTN ncpu = acpi_cpu_mpidrs(ctx, mpidr, 8);
+    UINT64 mpidr[32];
+    UINTN ncpu = acpi_cpu_mpidrs(ctx, mpidr, 32);
     UINT64 cntfrq;
 
     __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(cntfrq));
@@ -1605,7 +1601,12 @@ EFI_STATUS dt_build(
       CHAR8 name[8] = { 'c', 'p', 'u', '@', 0, 0, 0, 0 };
       DeviceTreeNode *cpu = dt_create_node(ctx);
 
-      name[4] = (CHAR8)('0' + (ci % 10));
+      if (ci >= 10) {
+        name[4] = (CHAR8)('0' + (ci / 10));
+        name[5] = (CHAR8)('0' + (ci % 10));
+      } else {
+        name[4] = (CHAR8)('0' + ci);
+      }
       dt_prop_str(ctx, cpu, "name", name);
       dt_prop_str(ctx, cpu, "device_type", "cpu");
       dt_prop_str(ctx, cpu, "state", ci == 0 ? "running" : "waiting");
@@ -1618,7 +1619,7 @@ EFI_STATUS dt_build(
 
   DeviceTreeNode *armio = dt_create_node(ctx);
   dt_prop_str(ctx, armio, "name", "arm-io");
-#if defined(XNU_LOADER_QEMU_VIRT)
+#if defined(XNU_LOADER_PLATFORM_QEMUVIRT)
   dt_prop_str(ctx, armio, "device_type", "qemuvirt-io");
   {
     UINT64 ranges[3] = { 0, 0x08000000ULL, 0x08000000ULL };
@@ -1636,6 +1637,29 @@ EFI_STATUS dt_build(
     dt_prop(ctx, uart0, "reg", uart_reg, sizeof(uart_reg));
     dt_add_child(ctx, armio, uart0);
   }
+#elif defined(XNU_LOADER_PLATFORM_SUN50I)
+  dt_prop_str(ctx, armio, "device_type", "sun50i-io");
+  {
+    /* Peripheral window. XNU's pe_arm_get_soc_base_phys() returns the second
+     * cell, and uart0's reg offset below is relative to it. */
+    UINT64 ranges[3] = { 0, SUN50I_SOC_BASE, SUN50I_SOC_SIZE };
+    dt_prop(ctx, armio, "ranges", ranges, sizeof(ranges));
+  }
+  {
+    /* Matched by pe_serial.c's DesignWare APB UART driver. reg-shift,
+     * clock-frequency and current-speed are stated explicitly rather than
+     * relying on that driver's defaults. */
+    DeviceTreeNode *uart0 = dt_create_node(ctx);
+    dt_prop_str(ctx, uart0, "name", "uart0");
+    dt_prop_str(ctx, uart0, "compatible", "snps,dw-apb-uart");
+    dt_prop_u32(ctx, uart0, "AAPL,phandle", XNU_LOADER_UART0_PHANDLE);
+    UINT64 uart_reg[2] = { SUN50I_UART0_OFFSET, SUN50I_UART0_SIZE };
+    dt_prop(ctx, uart0, "reg", uart_reg, sizeof(uart_reg));
+    dt_prop_u32(ctx, uart0, "reg-shift", SUN50I_UART0_SHIFT);
+    dt_prop_u32(ctx, uart0, "clock-frequency", SUN50I_UART0_CLOCK_HZ);
+    dt_prop_u32(ctx, uart0, "current-speed", SUN50I_UART0_BAUD);
+    dt_add_child(ctx, armio, uart0);
+  }
 #else
   dt_prop_str(ctx, armio, "device_type", "bcm2837-io");
   {
@@ -1644,7 +1668,7 @@ EFI_STATUS dt_build(
   }
 #endif
 
-#if defined(XNU_LOADER_QEMU_VIRT)
+#if defined(XNU_LOADER_PLATFORM_QEMUVIRT)
   DeviceTreeNode *pci = dt_create_node(ctx);
   dt_prop_str(ctx, pci, "name", "pci");
   dt_prop_str(ctx, pci, "device_type", "pci");
@@ -1691,10 +1715,8 @@ EFI_STATUS dt_build(
   }
 #if defined(__aarch64__)
   dt_add_child(ctx, root, cpus);
-#if !defined(XNU_LOADER_QEMU_VIRT)
   dt_add_child(ctx, root, armio);
-#else
-  dt_add_child(ctx, root, armio);
+#if defined(XNU_LOADER_PLATFORM_QEMUVIRT)
   dt_add_child(ctx, root, pci);
 #endif
 
@@ -1713,7 +1735,7 @@ EFI_STATUS dt_build(
     /* kern.hv_vmm_present reads this; without it userland believes it is on
      * bare metal and never takes its paravirtualised paths. */
     dt_prop_u32(ctx, defaults, "vmm-present", 1);
-#if defined(XNU_LOADER_QEMU_VIRT)
+#if defined(XNU_LOADER_HAVE_DT_UART)
     /* Without this serial_init() returns early and the kernel is silent. */
     dt_prop_u32(ctx, defaults, "serial-device", XNU_LOADER_UART0_PHANDLE);
 #endif

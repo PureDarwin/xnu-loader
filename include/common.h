@@ -35,15 +35,13 @@ extern EFI_PHYSICAL_ADDRESS g_xnu_bootinfo_base;
 #else
 #define XNU_BOOTINFO_BASE       0x2800000ULL   /* 2MB-aligned, above KC image  */
 #endif
-/* XNU maps [physBase, topOfKernelData) as a unit and its arm64 pmap uses a
- * 16KB granule, so both boundaries must be 16KB-aligned.  physBase already is;
- * this keeps the boot-info block (and therefore topOfKernelData) aligned too. */
+#if defined(XNU_LOADER_PLATFORM_SUN50I)
+#define XNU_BOOTINFO_ALIGN      0x1000ULL
+#define XNU_L2_BLOCK_SIZE       0x200000ULL
+#else
 #define XNU_BOOTINFO_ALIGN      0x4000ULL
-
-/* Size of one L2 block entry in the kernel's bootstrap page tables, which is
- * determined by the page granule XNU was built for: 32MB with 16KB pages,
- * 2MB with 4KB pages. */
 #define XNU_L2_BLOCK_SIZE       0x2000000ULL
+#endif
 
 #define XNU_BOOTARGS_PHYS       (XNU_BOOTINFO_BASE + 0x00000) /* 1 page       */
 #define XNU_EFITABLES_PHYS      (XNU_BOOTINFO_BASE + 0x01000) /* 1 page       */

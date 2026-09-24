@@ -6,7 +6,16 @@ void boot32_jump(uint32_t entry, uint32_t boot_args) __attribute__((noreturn));
 /* Console: QEMU virt's PL011 unless the FDT names a Rockchip RV1103/RV1106, whose UART2
  * is a DesignWare 8250 with 4-byte registers (THR +0x00, LSR +0x14) */
 static volatile uint32_t *uart = (volatile uint32_t *)0x09000000;
+/* XNU_LOADER_PLATFORM_RV1106 / _QEMUVIRT fix the board at build time; without either the
+ * FDT's root compatible decides */
+#if defined(XNU_LOADER_PLATFORM_RV1106) && defined(XNU_LOADER_PLATFORM_QEMUVIRT)
+#error "at most one XNU_LOADER_PLATFORM_* for arm32"
+#endif
+#if defined(XNU_LOADER_PLATFORM_RV1106)
+static int uart_8250, board_rv1106 = 1;
+#else
 static int uart_8250, board_rv1106;
+#endif
 
 static void putc(char c) {
   if (!uart)
@@ -128,8 +137,11 @@ static void parse_fdt(const uint8_t *h) {
       st += 8 + ((len + 3) & ~3u);
       if (depth == 1 && streq(pn, "compatible")) {
         for (uint32_t i = 0; i < len; i += strlen((const char *)v + i) + 1)
-          if (strhas((const char *)v + i, "rockchip,rv110"))
+          if (strhas((const char *)v + i, "rockchip,rv110")) {
+#if !defined(XNU_LOADER_PLATFORM_QEMUVIRT)
             board_rv1106 = 1;
+#endif
+          }
       } else if (depth == 1 && streq(pn, "#address-cells"))
         ac = be32(v);
       else if (depth == 1 && streq(pn, "#size-cells"))

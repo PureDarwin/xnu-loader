@@ -124,13 +124,35 @@ if(LOADER_ARCH STREQUAL "x86_64")
   target_compile_options(loader_objs PRIVATE -mno-red-zone)
 endif()
 
-option(XNU_LOADER_QEMU_VIRT "Target QEMU's generic virt machine (PL011 UART) instead of BCM2837" OFF)
+# Which aarch64 machine to target. The platforms differ in DRAM base, UART
+# hardware and which devicetree nodes XNU expects, so exactly one is selected
+# at build time and surfaced to the sources as XNU_LOADER_PLATFORM_<NAME>.
+# Ignored for x86_64, which has no equivalent variation.
+set(XNU_LOADER_PLATFORM "bcm2837" CACHE STRING
+    "aarch64 target platform: bcm2837, qemuvirt or sun50i")
+set_property(CACHE XNU_LOADER_PLATFORM PROPERTY STRINGS bcm2837 qemuvirt sun50i)
+
+set(XNU_LOADER_PLATFORM_DEFINES "")
+if(ARCH STREQUAL "aarch64")
+  if(XNU_LOADER_PLATFORM STREQUAL "bcm2837")
+    set(XNU_LOADER_PLATFORM_DEFINES XNU_LOADER_PLATFORM_BCM2837)
+  elseif(XNU_LOADER_PLATFORM STREQUAL "qemuvirt")
+    set(XNU_LOADER_PLATFORM_DEFINES XNU_LOADER_PLATFORM_QEMUVIRT)
+  elseif(XNU_LOADER_PLATFORM STREQUAL "sun50i")
+    set(XNU_LOADER_PLATFORM_DEFINES XNU_LOADER_PLATFORM_SUN50I)
+  else()
+    message(FATAL_ERROR
+      "XNU_LOADER_PLATFORM must be bcm2837, qemuvirt or sun50i, "
+      "got '${XNU_LOADER_PLATFORM}'")
+  endif()
+  message(STATUS "aarch64 platform: ${XNU_LOADER_PLATFORM}")
+endif()
 
 target_compile_definitions(loader_objs PRIVATE
   EFI_FUNCTION_WRAPPER
   CONFIG_${ARCH}
   CONFIG_LOADER_${LOADER_ARCH}
-  $<$<BOOL:${XNU_LOADER_QEMU_VIRT}>:XNU_LOADER_QEMU_VIRT>
+  ${XNU_LOADER_PLATFORM_DEFINES}
 )
 
 add_custom_command(

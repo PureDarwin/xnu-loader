@@ -1,61 +1,43 @@
 #if defined(__aarch64__)
 
-/*
- * AArch64 kernel handoff, derived directly from XNU's own
- * entry convention in osfmk/arm64/start.s:
- *   EXT(_start): b start_first_cpu
- *   start_first_cpu:
- *       mov x20, x0                     // boot_args ptr, everything else
- *       ldr x22, [x20, BA_VIRT_BASE]    // (virt/phys base, mem size, boot
- *       ldr x23, [x20, BA_PHYS_BASE]    // flags, page tables) is derived
- *       ...                             // FROM the boot_args struct and
- *                                       // symbols baked into the kernel
- *                                       // image itself.
- *
- * So the handoff contract is: x0 = physical address of boot_args, branch
- * to the kernel's _start, AT EL1. That last part turned out to matter in
- * practice: under QEMU's raspi3b + u-boot, the firmware runs at EL2 (not
- * EL1) the whole time - confirmed by hitting ESR_EL2 == a translation
- * fault (data abort) immediately after jumping to the kernel entry with
- * only SCTLR_EL1 touched, landing back in u-boot's own EL2 exception
- * vectors. Real Apple Silicon iBoot always drops to EL1 before jumping to
- * XNU (start_first_cpu's own register/MMU setup is written assuming EL1),
- * so an earlier version of this code that only cleared SCTLR_EL1.M/C/I
- * did nothing useful when actually running at EL2: EL2's own MMU
- * (SCTLR_EL2.M) was still on and still faulting.
- */
 .text
 .globl jump_to_xnu
 .type jump_to_xnu, @function
 
 jump_to_xnu:
-    /* AAPCS64: x0=entry, x1=boot_args_phys, x2=stack_top. */
-    mov x9, x0      /* stash entry (branch target) - x0 is about to become boot_args */
-    mov x10, x1     /* stash boot_args_phys the same way, ahead of clobbering x1 below */
-    mov x11, x2     /* stash stack_top */
+    /* AAPCS64: x0=entry, x1=boot_args_phys, x2=stack_top.
+     * Stashed in callee-saved registers because the cache flush below uses
+     * x0-x11/x16/x17 as scratch. Nothing needs preserving for the kernel
+     * except x0, which is set immediately before the branch. */
+    mov x19, x0     /* entry (branch target) */
+    mov x20, x1     /* boot_args_phys */
+    mov x21, x2     /* stack_top */
 
     msr daifset, #0xf
+
+    bl  dcache_clean_inval_all
+    ic  iallu
+    dsb nsh
+    isb
 
     mrs x0, CurrentEL
     lsr x0, x0, #2
     cmp x0, #2
     b.ne 1f
 
-    /*
-     * At EL2: configure HCR_EL2 for a plain 64-bit, non-virtualized EL1
-     * (RW=1 selects AArch64 EL1; everything else off - no VM, no traps),
-     * disable EL2's own MMU/caches (same reasoning as the EL1 case below:
-     * identity-mapped, so turning it off doesn't move our own PC), then
-     * ERET into EL1 at the kernel's entry point. ERET (unlike a plain
-     * branch) is what actually performs the exception-level change -
-     * SPSR_EL2/ELR_EL2 tell it "return to EL1h resuming at this address,
-     * with these interrupt masks."
-     */
     /* RW=1 only. API/APK (bits 41/40) stay clear so PAuth is disabled below
      * EL2 and the instructions reach sleh.c's emulation instead of running
      * natively against keys nothing else agrees on. */
     mov x0, #(1 << 31)
     msr hcr_el2, x0
+
+    /* CNTVOFF_EL2 is UNKNOWN out of reset and neither TF-A nor U-Boot clears
+     * it, so leave it alone and EL1's virtual counter reads pure garbage. */
+    msr cntvoff_el2, xzr
+    mrs x0, cnthctl_el2
+    orr x0, x0, #3         /* EL1PCTEN | EL1PCEN */
+    msr cnthctl_el2, x0
+    isb
 
     mrs x0, sctlr_el2
     bic x0, x0, #1         /* M  */
@@ -69,9 +51,9 @@ jump_to_xnu:
 
     mov x0, #0x3c5      /* SPSR: EL1h, all interrupts masked (DAIF=1111) */
     msr spsr_el2, x0
-    msr elr_el2, x9
-    mov sp, x11
-    mov x0, x10         /* boot_args_phys */
+    msr elr_el2, x19
+    mov sp, x21
+    mov x0, x20         /* boot_args_phys */
     eret
 
 1:
@@ -82,9 +64,57 @@ jump_to_xnu:
     msr sctlr_el1, x1
     isb
 
-    mov sp, x11
-    mov x0, x10     /* boot_args_phys */
-    br x9
+    mov sp, x21
+    mov x0, x20     /* boot_args_phys */
+    br x19
+
+.type dcache_clean_inval_all, @function
+dcache_clean_inval_all:
+    dsb     sy
+    mrs     x0, clidr_el1
+    and     w3, w0, #0x07000000     /* level of coherency, bits [26:24]   */
+    lsr     w3, w3, #23             /* ... as 2 * LoC                     */
+    cbz     w3, 5f                  /* nothing to do                      */
+    mov     w10, #0                 /* w10 = 2 * current level            */
+    mov     w8, #1
+1:
+    add     w2, w10, w10, lsr #1    /* w2 = 3 * level, CLIDR field offset */
+    lsr     w1, w0, w2
+    and     w1, w1, #7              /* cache type at this level           */
+    cmp     w1, #2
+    b.lt    4f                      /* no data or unified cache here      */
+    msr     csselr_el1, x10         /* select this level                  */
+    isb
+    mrs     x1, ccsidr_el1
+    and     w2, w1, #7              /* log2(line length) - 4              */
+    add     w2, w2, #4
+    ubfx    w4, w1, #3, #10         /* max way number                     */
+    clz     w5, w4                  /* bit position of the way field      */
+    lsl     w9, w4, w5
+    lsl     w16, w8, w5
+2:
+    ubfx    w7, w1, #13, #15        /* max set number                     */
+    lsl     w7, w7, w2
+    lsl     w17, w8, w2
+3:
+    orr     w11, w10, w9            /* level | way                        */
+    orr     w11, w11, w7            /* ... | set                          */
+    dc      cisw, x11               /* clean and invalidate by set/way    */
+    subs    w7, w7, w17
+    b.ge    3b
+    subs    x9, x9, x16
+    b.ge    2b
+4:
+    add     w10, w10, #2            /* next level                         */
+    cmp     w3, w10
+    dsb     sy
+    b.gt    1b
+5:
+    mov     w10, #0                 /* restore CSSELR_EL1                 */
+    msr     csselr_el1, x10
+    dsb     sy
+    isb
+    ret
 
 .section .note.GNU-stack,"",%progbits
 
@@ -92,17 +122,6 @@ jump_to_xnu:
 
 /*
  * IA32 firmware handoff.
- *
- * XNU's x86_64 entry point is entered in 32-bit protected mode with paging
- * off and boot_args in %eax - the kernel's own pstart does the switch to long
- * mode. The 64-bit loader therefore has to leave long mode before jumping
- * (see the .code64 version below, which clears EFER.LME and CR0.PG).
- *
- * A 32-bit UEFI implementation is already in that state, so there is no mode
- * transition to perform here: establish flat segments from our own GDT in
- * case the firmware left something exotic loaded, make sure paging is off,
- * and jump. This is the whole reason an ia32 loader is viable on a 64-bit
- * CPU without a long-mode trampoline.
  */
 .text
 .code32

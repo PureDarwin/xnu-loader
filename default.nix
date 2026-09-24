@@ -7,10 +7,12 @@
 , mtools
 , arch ? "x86_64"
 , loaderArch ? arch
-, qemuVirt ? false
+  # aarch64 target machine: bcm2837, qemuvirt or sun50i. Ignored for x86_64.
+, platform ? "bcm2837"
 }:
 
 assert arch == "x86_64" || arch == "aarch64";
+assert platform == "bcm2837" || platform == "qemuvirt" || platform == "sun50i";
 assert loaderArch == "x86_64" || loaderArch == "aarch64" || loaderArch == "ia32";
 # ia32 firmware is only ever paired with an x86_64 kernel.
 assert loaderArch != "ia32" || arch == "x86_64";
@@ -42,7 +44,7 @@ stdenv.mkDerivation rec {
     "-DGNU_EFI_DIR=${gnu-efi}"
     "-DARCH=${arch}"
     "-DLOADER_ARCH=${loaderArch}"
-  ] ++ lib.optional qemuVirt "-DXNU_LOADER_QEMU_VIRT=ON";
+  ] ++ lib.optional (arch == "aarch64") "-DXNU_LOADER_PLATFORM=${platform}";
 
   # Cross binutils installs only target-prefixed tools in bin/, so CMake's own
   # search settles on ${binutils}/bin/<tool>, which does not exist, and the

@@ -1,6 +1,10 @@
 { stdenv
 , lib
+  # auto (the FDT decides), qemuvirt (virt Cortex-A7) or rv1106 (Luckfox Pico)
+, platform ? "auto"
 }:
+
+assert platform == "auto" || platform == "qemuvirt" || platform == "rv1106";
 
 # xnu arm32 boot shim as a Linux zImage: QEMU -kernel, U-Boot bootz. The
 # kernel Mach-O and boot-args.txt come from a newc cpio initrd.
@@ -14,6 +18,7 @@ stdenv.mkDerivation {
     runHook preBuild
     flags="-march=armv7-a -marm -mfloat-abi=soft -ffreestanding -fno-builtin -fno-stack-protector"
     flags="$flags -nostdlib -fpie -O2 -Wall"
+    ${lib.optionalString (platform != "auto") "flags=\"$flags -DXNU_LOADER_PLATFORM_${lib.toUpper platform}\""}
     $CC $flags -c entry.S -o entry.o
     $CC $flags -c boot.c -o boot.o
     $LD -nostdlib -pie --no-dynamic-linker -z notext --no-warn-rwx-segments \

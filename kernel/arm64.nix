@@ -2,7 +2,11 @@
 , lib
 , gnu-efi
 , embeddedInitrd ? null
+  # aarch64 target machine, as in ../default.nix: bcm2837, qemuvirt or sun50i
+, platform ? "qemuvirt"
 }:
+
+assert platform == "bcm2837" || platform == "qemuvirt" || platform == "sun50i";
 
 # xnu-loader as an arm64 Linux Image: U-Boot `booti`, QEMU `-kernel`, or any
 # loader that speaks Documentation/arch/arm64/booting.rst. Modules (the kernel
@@ -20,7 +24,7 @@ stdenv.mkDerivation {
     common="$common -funsigned-char -O2 -ggdb -Wno-pointer-sign"
     includes="-Iefi-emulation -Iinclude -Isrc -I${gnu-efi}/include -I${gnu-efi}/include/efi -I${gnu-efi}/include/efi/aarch64"
     includes="$includes -I${gnu-efi}/include/efi/protocol"
-    defines="-DEFI_FUNCTION_WRAPPER -DCONFIG_aarch64 -DCONFIG_LOADER_aarch64 -DXNU_LOADER_QEMU_VIRT -DLEGACY_BIOS"
+    defines="-DEFI_FUNCTION_WRAPPER -DCONFIG_aarch64 -DCONFIG_LOADER_aarch64 -DXNU_LOADER_PLATFORM_${lib.toUpper platform} -DLEGACY_BIOS"
 
     objects=""
     for source in kernel/entry/linux-arm64.S efi-emulation/exceptions-arm64.S src/jump.S; do

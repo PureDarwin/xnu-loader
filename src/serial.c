@@ -1,4 +1,5 @@
 #include "serial.h"
+#include "platform.h"
 
 static BOOLEAN serial_ready = FALSE;
 
@@ -81,7 +82,7 @@ static VOID serial_putc(CHAR8 c) {
   uart_putc(SERIAL_BASE, c);
 }
 
-#elif defined(__aarch64__) && defined(XNU_LOADER_QEMU_VIRT)
+#elif defined(__aarch64__) && defined(XNU_LOADER_PLATFORM_QEMUVIRT)
 
 #define QEMUVIRT_UART_BASE 0x09000000ULL
 #define PL011_DR  (*(volatile UINT32 *)(QEMUVIRT_UART_BASE + 0x00))
@@ -111,7 +112,74 @@ static VOID serial_putc(CHAR8 c) {
   uart_putc(c);
 }
 
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) && defined(XNU_LOADER_PLATFORM_SUN50I)
+
+/* Allwinner H616/H618 UART0: a Synopsys DesignWare APB UART, 16550-compatible
+ * but with 32-bit registers on a 4-byte stride, so register index N lives at
+ * base + (N << 2). U-Boot leaves it running at 115200 8N1; serial_init()
+ * reprograms it anyway so the loader does not depend on that. */
+#define SUN50I_UART_REG(n) \
+  (*(volatile UINT32 *)(SUN50I_UART0_BASE + ((UINT64)(n) << SUN50I_UART0_SHIFT)))
+
+#define SUN50I_UART_THR SUN50I_UART_REG(0)  /* tx holding      (DLAB=0) */
+#define SUN50I_UART_DLL SUN50I_UART_REG(0)  /* divisor low     (DLAB=1) */
+#define SUN50I_UART_IER SUN50I_UART_REG(1)  /* irq enable      (DLAB=0) */
+#define SUN50I_UART_DLH SUN50I_UART_REG(1)  /* divisor high    (DLAB=1) */
+#define SUN50I_UART_FCR SUN50I_UART_REG(2)  /* FIFO control    (write)  */
+#define SUN50I_UART_LCR SUN50I_UART_REG(3)  /* line control             */
+#define SUN50I_UART_LSR SUN50I_UART_REG(5)  /* line status              */
+#define SUN50I_UART_USR SUN50I_UART_REG(31) /* DesignWare status (0x7c) */
+
+#define SUN50I_UART_LSR_THRE 0x20 /* transmit holding register empty */
+#define SUN50I_UART_LCR_8N1  0x03
+#define SUN50I_UART_LCR_DLAB 0x80
+#define SUN50I_UART_FCR_INIT 0x07 /* enable FIFOs, clear rx and tx    */
+
+static VOID uart_putc(CHAR8 c) {
+  UINT32 spins = 0;
+  while ((SUN50I_UART_LSR & SUN50I_UART_LSR_THRE) == 0) {
+    if (++spins >= 100000u)
+      return;  /* bounded: see the x86 uart_putc comment */
+  }
+  SUN50I_UART_THR = (UINT32)(UINT8)c;
+}
+
+VOID serial_init(VOID) {
+  /* Round to nearest: exact divisor is 13.02 at 24MHz/115200. */
+  CONST UINT32 divisor = (SUN50I_UART0_CLOCK_HZ + (8 * SUN50I_UART0_BAUD)) /
+                         (16 * SUN50I_UART0_BAUD);
+  UINT32 spins = 0;
+
+  SUN50I_UART_IER = 0;
+  SUN50I_UART_FCR = SUN50I_UART_FCR_INIT;
+
+  /* A DesignWare UART discards LCR writes while it is busy, which would drop
+   * the divisor below and silently leave the port at whatever rate firmware
+   * set. Drain the transmitter, then clear any latched busy-detect via USR. */
+  while ((SUN50I_UART_LSR & SUN50I_UART_LSR_THRE) == 0) {
+    if (++spins >= 100000u)
+      break;
+  }
+  (VOID)SUN50I_UART_USR;
+
+  SUN50I_UART_LCR = SUN50I_UART_LCR_DLAB;
+  SUN50I_UART_DLL = divisor & 0xFF;
+  SUN50I_UART_DLH = (divisor >> 8) & 0xFF;
+  SUN50I_UART_LCR = SUN50I_UART_LCR_8N1;
+  (VOID)SUN50I_UART_USR;
+
+  serial_ready = TRUE;
+}
+
+VOID serial_reinit(VOID) {
+  serial_init();
+}
+
+static VOID serial_putc(CHAR8 c) {
+  uart_putc(c);
+}
+
+#elif defined(__aarch64__) && defined(XNU_LOADER_PLATFORM_BCM2837)
 
 #define BCM2837_PERIPHERAL_BASE 0x3F000000ULL
 #define AUX_ENABLES     (*(volatile UINT32 *)(BCM2837_PERIPHERAL_BASE + 0x215004))

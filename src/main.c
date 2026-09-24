@@ -6,6 +6,7 @@
 #include "macho.h"
 #include "jump.h"
 #include "serial.h"
+#include "platform.h"
 
 static VOID   *g_jump_entry;
 static UINT64  g_jump_args;
@@ -190,11 +191,6 @@ EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes, UINT64 virt_
                                (XNU_BOOTINFO_END - XNU_BOOTINFO_BASE) +
                                2 * XNU_BOOTINFO_ALIGN +
                                EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT);
-#if defined(XNU_LOADER_QEMU_VIRT)
-  #define XNU_LOADER_RAM_BASE 0x40000000ULL
-#else
-  #define XNU_LOADER_RAM_BASE 0ULL
-#endif
   EFI_PHYSICAL_ADDRESS base = 0;
   EFI_STATUS status = EFI_NOT_FOUND;
   for (UINT64 try = XNU_LOADER_RAM_BASE + XNU_L2_BLOCK_SIZE + required_rem;
@@ -264,6 +260,34 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     return status;
 
   log_info(L"XNU EFI loader start\r\n");
+
+#if defined(__aarch64__)
+  /*
+   * CPU feature probe. The board's capabilities decide how the kernel must
+   * be built, and they are not documented anywhere we trust:
+   *
+   *   ID_AA64MMFR0_EL1.TGran16 [23:20] - 0 means no 16KB translation
+   *     granule, which is why this target needs a 4KB-page kernel.
+   *   ID_AA64ISAR0_EL1.SHA2 [15:12] - 0 means no SHA-256 crypto extension,
+   *     so XNU's accelerated corecrypto assembly cannot run here.
+   *   ID_AA64ISAR0_EL1.AES [7:4] and .SHA1 [11:8] likewise.
+   */
+  {
+    UINT64 mmfr0 = 0, isar0 = 0;
+    __asm__ volatile ("mrs %0, ID_AA64MMFR0_EL1" : "=r"(mmfr0));
+    __asm__ volatile ("mrs %0, ID_AA64ISAR0_EL1" : "=r"(isar0));
+    log_info(L"CPU ID_AA64MMFR0_EL1=0x%lx TGran4=%u TGran64=%u TGran16=%u\r\n",
+             mmfr0,
+             (UINT32)((mmfr0 >> 28) & 0xF),
+             (UINT32)((mmfr0 >> 24) & 0xF),
+             (UINT32)((mmfr0 >> 20) & 0xF));
+    log_info(L"CPU ID_AA64ISAR0_EL1=0x%lx AES=%u SHA1=%u SHA2=%u\r\n",
+             isar0,
+             (UINT32)((isar0 >> 4) & 0xF),
+             (UINT32)((isar0 >> 8) & 0xF),
+             (UINT32)((isar0 >> 12) & 0xF));
+  }
+#endif
 
   {
     EFI_LOADED_IMAGE *li = NULL;
