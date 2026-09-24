@@ -1147,8 +1147,11 @@ EFI_STATUS dt_build(
 
     /* Then an APFS container root (ApfsFileSystemDriver publishes
      * boot-uuid-media for it, matching nx_uuid from block zero). */
+    /* No firmware disk (the Linux-image entry): the container UUID can come
+     * from the boot-args and is then treated as if read from block zero */
     if (!got_uuid && !got_hfs_uuid && !got_ext4_uuid) {
-      got_apfs_uuid = find_apfs_boot_uuid(ctx, uuid_str);
+      got_apfs_uuid = boot_arg_get_uuid(boot_args, "apfs-container-uuid", uuid_str) ||
+                      find_apfs_boot_uuid(ctx, uuid_str);
     }
 
     if (!got_uuid && !got_hfs_uuid && !got_ext4_uuid && !got_apfs_uuid) {

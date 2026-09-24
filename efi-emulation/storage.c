@@ -4,6 +4,21 @@
 #include "serial.h"
 #include <efilib.h>
 
+#if defined(__aarch64__)
+/* No firmware disk on the arm Linux-image path: modules are the only volume */
+void efiemu_bios_disk_set(UINT32 drive, EfiEmuBiosRead read) {
+  (void)drive;
+  (void)read;
+}
+EFI_STATUS efiemu_disk_init(void) { return EFI_NOT_FOUND; }
+EFI_HANDLE efiemu_disk_handle(void) { return NULL; }
+EFI_STATUS efiemu_disk_protocol(EFI_GUID *guid, VOID **out) {
+  (void)guid;
+  (void)out;
+  return EFI_UNSUPPORTED;
+}
+#else
+
 #define FAT_LBA 2048U
 #define ATA_DATA ata_base
 #define ATA_STATUS (UINT16)(ata_base + 7)
@@ -556,3 +571,4 @@ EFI_STATUS efiemu_disk_protocol(EFI_GUID *guid, VOID **out) {
   }
   return EFI_UNSUPPORTED;
 }
+#endif

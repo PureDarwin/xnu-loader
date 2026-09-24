@@ -31,6 +31,10 @@
       };
 
       legacy-boot = pkgs.callPackage ./legacy { };
+      # The loader as an arm64 Linux Image (U-Boot booti, QEMU -kernel).
+      kernel-arm64 = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./kernel/arm64.nix { };
+      # xnu arm32 boot shim as a Linux zImage (QEMU -kernel, U-Boot bootz)
+      kernel-arm32 = pkgs.pkgsCross.armv7l-hf-multiplatform.callPackage ./arm32 { };
       # The loader as a Multiboot2 ELF kernel (GRUB etc.).
       kernel-multiboot2 = pkgs.callPackage ./kernel { };
       kernel-grub-bios = pkgs.callPackage ./kernel/grub-bios.nix {

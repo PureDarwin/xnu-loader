@@ -122,6 +122,21 @@ static VOID finish_boot_and_jump(VOID *unused) {
 
 #if defined(__aarch64__)
 EFI_PHYSICAL_ADDRESS g_xnu_bootinfo_base;
+
+/* The kernel starts with the MMU and caches off, so its reads bypass the D-cache.
+ * Anything written here that is still dirty in cache is invisible to it (under KVM
+ * that showed up as firmware page tables on the exception vector page) */
+static VOID arm64_clean_to_poc(UINT64 base, UINT64 size) {
+  UINT64 ctr, line;
+
+  if (size == 0)
+    return;
+  __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+  line = 4ULL << ((ctr >> 16) & 0xf);
+  for (UINT64 a = base & ~(line - 1); a < base + size; a += line)
+    __asm__ volatile("dc civac, %0" : : "r"(a) : "memory");
+  __asm__ volatile("dsb sy" : : : "memory");
+}
 #endif
 
 
@@ -796,6 +811,12 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   /* Do the copy from a stack we own, clear of the destination. */
   pd_call_on_stack(stack_top, finish_boot_and_jump, NULL);
 #else
+  /* Kernel image with its trust-cache page, boot-info block, and the ramdisk */
+  arm64_clean_to_poc(ctx.kernel_region_base - XNU_BOOTINFO_ALIGN,
+                     ctx.kernel_region_end - (ctx.kernel_region_base - XNU_BOOTINFO_ALIGN));
+  arm64_clean_to_poc(XNU_BOOTINFO_BASE, XNU_BOOTINFO_END - XNU_BOOTINFO_BASE);
+  arm64_clean_to_poc(ctx.ramdisk_phys, ctx.ramdisk_size);
+  __asm__ volatile("ic iallu; dsb ish; isb" : : : "memory");
   serial_mark((CONST CHAR8 *)"jumping to kernel");
   jump_to_xnu(g_jump_entry, g_jump_args, g_jump_stack);
 #endif

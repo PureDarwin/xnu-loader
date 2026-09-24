@@ -45,6 +45,7 @@ VOID InitializeLib(EFI_HANDLE image, EFI_SYSTEM_TABLE *table) {
   RT = table->RuntimeServices;
 }
 
+#if defined(__x86_64__)
 static UINT8 io_in8(UINT16 port) {
   UINT8 v;
   __asm__ volatile("inb %1,%0" : "=a"(v) : "Nd"(port));
@@ -53,6 +54,20 @@ static UINT8 io_in8(UINT16 port) {
 static void io_out8(UINT16 port, UINT8 v) {
   __asm__ volatile("outb %0,%1" : : "a"(v), "Nd"(port));
 }
+#define efiemu_halt() __asm__ volatile("cli; hlt")
+#elif defined(__aarch64__)
+UINT32 efiemu_psci_conduit;
+#define efiemu_halt() __asm__ volatile("msr daifset, #0xf; wfi")
+
+static UINT64 psci_call(UINT64 fn) {
+  register UINT64 x0 __asm__("x0") = fn;
+  if (efiemu_psci_conduit == 1)
+    __asm__ volatile("hvc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+  else if (efiemu_psci_conduit == 2)
+    __asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+  return x0;
+}
+#endif
 
 #define debug_string efiemu_debug_string
 
@@ -373,6 +388,17 @@ static void relocate_acpi_tables(UINT8 *rsdp) {
 
 static void discover_config_tables(EfiEmuBootInfo *info) {
   UINTN n = 0;
+#if defined(__aarch64__)
+  if (info->fdt) {
+    static EFI_GUID dtb = { 0xb1b621d5, 0xf19c, 0x41a5,
+                            { 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0 } };
+    config_tables[n].VendorGuid = dtb;
+    config_tables[n++].VendorTable = (VOID *)(UINTN)info->fdt;
+  }
+  system_table.NumberOfTableEntries = n;
+  system_table.ConfigurationTable = config_tables;
+  return;
+#endif
   VOID *rsdp = info->rsdp;
   VOID *sm3 = NULL;
   VOID *sm = NULL;
@@ -432,6 +458,8 @@ static void discover_config_tables(EfiEmuBootInfo *info) {
   system_table.ConfigurationTable = config_tables;
 }
 
+/* Sorted, with touching ranges of one type merged: every pool allocation is a
+ * page run, and the loader's device tree alone makes hundreds of them */
 static void sort_ranges(void) {
   for (UINTN i = 1; i < nranges; ++i) {
     EFI_MEMORY_DESCRIPTOR v = ranges[i];
@@ -442,6 +470,19 @@ static void sort_ranges(void) {
     }
     ranges[j] = v;
   }
+  UINTN out = 0;
+  for (UINTN i = 0; i < nranges; ++i) {
+    if (out) {
+      EFI_MEMORY_DESCRIPTOR *p = &ranges[out - 1];
+      if (p->Type == ranges[i].Type && p->Attribute == ranges[i].Attribute &&
+          p->PhysicalStart + p->NumberOfPages * PAGE_SIZE == ranges[i].PhysicalStart) {
+        p->NumberOfPages += ranges[i].NumberOfPages;
+        continue;
+      }
+    }
+    ranges[out++] = ranges[i];
+  }
+  nranges = out;
 }
 
 static EFI_STATUS reserve_range(EFI_PHYSICAL_ADDRESS base, UINTN pages,
@@ -509,14 +550,36 @@ static EFI_STATUS EFIAPI bs_allocate_pages(EFI_ALLOCATE_TYPE kind,
   return EFI_OUT_OF_RESOURCES;
 }
 
+/* Like UEFI, any page run inside one allocation can be freed, splitting it */
 static EFI_STATUS EFIAPI bs_free_pages(EFI_PHYSICAL_ADDRESS memory,
                                        UINTN pages) {
+  UINT64 end = memory + pages * PAGE_SIZE;
   for (UINTN i = 0; i < nranges; ++i) {
-    if (ranges[i].PhysicalStart == memory && ranges[i].NumberOfPages == pages) {
-      ranges[i].Type = EfiConventionalMemory;
-      ++map_key;
-      return EFI_SUCCESS;
+    UINT64 rb = ranges[i].PhysicalStart;
+    UINT64 re = rb + ranges[i].NumberOfPages * PAGE_SIZE;
+    if (ranges[i].Type == EfiConventionalMemory || memory < rb || end > re)
+      continue;
+    if (nranges + 2 >= MAX_RANGES)
+      return EFI_OUT_OF_RESOURCES;
+    EFI_MEMORY_DESCRIPTOR old = ranges[i];
+    ranges[i].PhysicalStart = memory;
+    ranges[i].NumberOfPages = pages;
+    ranges[i].Type = EfiConventionalMemory;
+    ranges[i].Attribute = 0;
+    if (memory > rb) {
+      ranges[nranges] = old;
+      ranges[nranges].NumberOfPages = (memory - rb) / PAGE_SIZE;
+      ++nranges;
     }
+    if (end < re) {
+      ranges[nranges] = old;
+      ranges[nranges].PhysicalStart = end;
+      ranges[nranges].NumberOfPages = (re - end) / PAGE_SIZE;
+      ++nranges;
+    }
+    sort_ranges();
+    ++map_key;
+    return EFI_SUCCESS;
   }
   return EFI_NOT_FOUND;
 }
@@ -675,6 +738,7 @@ static EFI_STATUS EFIAPI bs_exit(EFI_HANDLE image, UINTN key) {
    * as a double fault and resets the machine before the trap path can log it.
    * UEFI firmware normally quiesces these sources as part of ExitBootServices.
    */
+#if defined(__x86_64__)
   io_out8(0x21, 0xff);
   io_out8(0xa1, 0xff);
   io_out8(0xa0, 0x20);
@@ -685,10 +749,23 @@ static EFI_STATUS EFIAPI bs_exit(EFI_HANDLE image, UINTN key) {
   io_out8(0x71, (UINT8)(io_in8(0x71) & ~0x70));
   io_out8(0x70, 0x0c);
   (void)io_in8(0x71);
+#endif
 
   return EFI_SUCCESS;
 }
 
+#if defined(__aarch64__)
+static EFI_STATUS EFIAPI bs_stall(UINTN usec) {
+  UINT64 freq, start, now;
+  __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+  __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(start));
+  UINT64 ticks = freq / 1000000ULL * usec + (freq % 1000000ULL) * usec / 1000000ULL;
+  do {
+    __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(now));
+  } while (now - start < ticks);
+  return EFI_SUCCESS;
+}
+#else
 static EFI_STATUS EFIAPI bs_stall(UINTN usec) {
   /*
    * Channel 2 is not used for the scheduler tick and gives us an actual
@@ -718,6 +795,7 @@ static EFI_STATUS EFIAPI bs_stall(UINTN usec) {
   io_out8(0x61, speaker);
   return EFI_SUCCESS;
 }
+#endif
 
 static EFI_STATUS EFIAPI bs_crc32(VOID *data, UINTN size, UINT32 *out) {
   if (!data || !out)
@@ -766,6 +844,24 @@ static EFI_STATUS EFIAPI rt_convert_pointer(UINTN disposition,
   return EFI_SUCCESS;
 }
 
+#if defined(__aarch64__)
+static EFI_STATUS EFIAPI rt_get_time(EFI_TIME *time,
+                                      EFI_TIME_CAPABILITIES *capabilities) {
+  if (!time)
+    return EFI_INVALID_PARAMETER;
+  /* No RTC contract on this path: a fixed date keeps callers well-formed */
+  SetMem(time, sizeof(*time), 0);
+  time->Year = 2026;
+  time->Month = 1;
+  time->Day = 1;
+  time->TimeZone = EFI_UNSPECIFIED_TIMEZONE;
+  if (capabilities) {
+    SetMem(capabilities, sizeof(*capabilities), 0);
+    capabilities->Resolution = 1;
+  }
+  return EFI_SUCCESS;
+}
+#else
 static UINT8 cmos_read(UINT8 index) {
   io_out8(0x70, (UINT8)(index | 0x80));
   return io_in8(0x71);
@@ -818,6 +914,8 @@ static EFI_STATUS EFIAPI rt_get_time(EFI_TIME *time,
   }
   return EFI_SUCCESS;
 }
+
+#endif
 
 static EFI_STATUS EFIAPI rt_set_time(EFI_TIME *time) {
   (void)time;
@@ -934,22 +1032,43 @@ static EFI_STATUS EFIAPI rt_reset(EFI_RESET_TYPE type, EFI_STATUS status,
   (void)status;
   (void)data_size;
   (void)data;
+#if defined(__aarch64__)
+  psci_call(type == EfiResetShutdown ? 0x84000008ULL : 0x84000009ULL);
+#else
   io_out8(0xcf9, 0x06);
   while (io_in8(0x64) & 0x02) {
   }
   io_out8(0x64, 0xfe);
+#endif
   for (;;)
-    __asm__ volatile("cli; hlt");
+    efiemu_halt();
 }
 
 static EFI_STATUS EFIAPI con_output(SIMPLE_TEXT_OUTPUT_INTERFACE *self,
                                     CHAR16 *s) {
   (void)self;
+  CHAR8 line[128];
+  UINTN n = 0;
   while (*s) {
     UINT8 character = *s > 0x7f ? '?' : (UINT8)*s;
+#if defined(__x86_64__)
     __asm__ volatile("outb %0, $0xe9" : : "a"(character));
+#endif
+    line[n++] = (CHAR8)character;
+    if (n == sizeof(line) - 1) {
+      line[n] = 0;
+#if defined(__aarch64__)
+      serial_puts8(line);
+#endif
+      n = 0;
+    }
     ++s;
   }
+#if defined(__aarch64__)
+  line[n] = 0;
+  if (n)
+    serial_puts8(line);
+#endif
   return EFI_SUCCESS;
 }
 static EFI_STATUS EFIAPI con_clear(SIMPLE_TEXT_OUTPUT_INTERFACE *self) {
@@ -994,7 +1113,13 @@ static void reserve_bytes(UINT64 base, UINT64 size, EFI_MEMORY_TYPE type) {
 static CHAR8 module_names[EFIEMU_MAX_MODULES][128];
 
 static BOOLEAN in_xnu_window(UINT64 base, UINT64 size) {
+#if defined(__aarch64__)
+  (void)base;
+  (void)size;
+  return FALSE;
+#else
   return size && base < XNU_WINDOW_END && base + size > XNU_WINDOW_BASE;
+#endif
 }
 
 static UINT64 allocate_above_window(UINT64 pages) {
@@ -1076,6 +1201,8 @@ static void initialize_ranges(EfiEmuBootInfo *info) {
   }
   for (UINT32 i = 0; i < info->module_count; ++i)
     relocate_module(&info->modules[i]);
+  if (info->fdt)
+    reserve_bytes(info->fdt, info->fdt_size, EfiACPIReclaimMemory);
 }
 
 void efiemu_main(EfiEmuBootInfo *info) {
@@ -1176,5 +1303,5 @@ void efiemu_main(EfiEmuBootInfo *info) {
   debug_string("efi-emulation: loader returned\n");
   (void)status;
   for (;;)
-    __asm__ volatile("cli; hlt");
+    efiemu_halt();
 }

@@ -1,6 +1,7 @@
 #include "efi_emulation.h"
 #include "serial.h"
 
+#if defined(__x86_64__)
 /* Frame pushed by exception_common, lowest address first. */
 typedef struct {
   UINT64 r15, r14, r13, r12, r11, r10, r9, r8;
@@ -30,10 +31,13 @@ static IdtEntry idt[32];
 static void out_e9(char c) {
   __asm__ volatile("outb %0, $0xe9" : : "a"(c));
 }
+#endif
 
 void efiemu_debug_string(const char *s) {
+#if defined(__x86_64__)
   for (const char *p = s; *p; ++p)
     out_e9(*p);
+#endif
   serial_puts8((CONST CHAR8 *)s);
 }
 
@@ -47,6 +51,39 @@ void efiemu_debug_hex(UINT64 value) {
   efiemu_debug_string(text);
 }
 
+#if defined(__aarch64__)
+extern const UINT8 efiemu_arm64_vectors[];
+
+void efiemu_exceptions_install(void) {
+  __asm__ volatile("msr vbar_el1, %0; isb" : : "r"(efiemu_arm64_vectors));
+}
+
+static void report(const char *name, UINT64 value) {
+  efiemu_debug_string(name);
+  efiemu_debug_hex(value);
+  efiemu_debug_string("\n");
+}
+
+/* Called from the vector stub with x0 = vector slot, x1 = saved x0..x30 */
+void efiemu_arm64_exception(UINT64 slot, UINT64 *regs) {
+  UINT64 esr, elr, far, spsr;
+  __asm__ volatile("mrs %0, esr_el1" : "=r"(esr));
+  __asm__ volatile("mrs %0, elr_el1" : "=r"(elr));
+  __asm__ volatile("mrs %0, far_el1" : "=r"(far));
+  __asm__ volatile("mrs %0, spsr_el1" : "=r"(spsr));
+  efiemu_debug_string("\nefi-emulation: CPU exception\n");
+  report("  slot ", slot);
+  report("  esr  ", esr);
+  report("  elr  ", elr);
+  report("  far  ", far);
+  report("  spsr ", spsr);
+  report("  x0   ", regs[0]);
+  report("  x1   ", regs[1]);
+  report("  lr   ", regs[30]);
+  for (;;)
+    __asm__ volatile("msr daifset, #0xf; wfi");
+}
+#else
 void efiemu_exceptions_install(void) {
   for (UINTN i = 0; i < 32; ++i) {
     UINT64 handler = efiemu_exception_stubs[i];
@@ -83,3 +120,4 @@ void efiemu_exception_report(ExceptionFrame *frame) {
   report("  rdi    ", frame->rdi);
   report("  rsi    ", frame->rsi);
 }
+#endif

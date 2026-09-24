@@ -32,7 +32,7 @@ stdenv.mkDerivation {
     $CC -c kernel/entry/embedded.S -o build/entry-embedded.S.o -m64 -ffreestanding -fno-pic \
       ${lib.optionalString (embeddedInitrd != null) "'-DEMBED_CPIO=\"${embeddedInitrd}\"'"}
     objects="$objects build/entry-embedded.S.o"
-    for source in kernel/boot.c kernel/multiboot2.c kernel/linux.c efi-emulation/exceptions.c \
+    for source in kernel/boot.c kernel/multiboot2.c kernel/linux.c kernel/cpio.c efi-emulation/exceptions.c \
       efi-emulation/firmware.c efi-emulation/modfs.c efi-emulation/storage.c; do
       object="build/$(basename "$(dirname "$source")")-$(basename "$source").o"
       $CC -c "$source" -o "$object" $common $includes

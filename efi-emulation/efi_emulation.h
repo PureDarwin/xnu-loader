@@ -56,7 +56,15 @@ typedef struct {
   /* Boot-protocol data to keep out of the allocator (e.g. the MBI). */
   UINT64 protocol_data_base;
   UINT64 protocol_data_size;
+  /* Flattened device tree from an arm boot protocol: published as a config table */
+  UINT64 fdt;
+  UINT64 fdt_size;
 } EfiEmuBootInfo;
+
+#if defined(__aarch64__)
+/* Hooks the arm64 boot glue provides: PSCI conduit (0 none, 1 hvc, 2 smc) */
+extern UINT32 efiemu_psci_conduit;
+#endif
 
 void efiemu_main(EfiEmuBootInfo *info) __attribute__((noreturn));
 
@@ -69,13 +77,19 @@ EFI_HANDLE efiemu_modfs_handle(void);
  * EFIEMU_BIOS_BOUNCE; returns 0 or the INT 13h status. */
 #define EFIEMU_BIOS_BOUNCE 0x18000UL
 #define EFIEMU_BIOS_SECTORS 64U
+#if defined(__x86_64__)
 typedef UINT32 (__attribute__((sysv_abi)) *EfiEmuBiosRead)(UINT64 lba, UINT32 count);
+#else
+typedef UINT32 (*EfiEmuBiosRead)(UINT64 lba, UINT32 count);
+#endif
 void efiemu_bios_disk_set(UINT32 drive, EfiEmuBiosRead read);
 EFI_STATUS efiemu_disk_init(void);
 EFI_STATUS efiemu_disk_protocol(EFI_GUID *guid, VOID **out);
 EFI_HANDLE efiemu_disk_handle(void);
 
 void efiemu_exceptions_install(void);
+/* newc cpio: each regular file becomes a module the loader can open */
+void kernel_parse_cpio(EfiEmuBootInfo *info, UINT64 start, UINT64 size);
 void efiemu_debug_string(const char *s);
 void efiemu_debug_hex(UINT64 value);
 
