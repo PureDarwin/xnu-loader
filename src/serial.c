@@ -225,8 +225,12 @@ static VOID serial_putc(CHAR8 c) {
 VOID serial_puts8(CONST CHAR8 *s) {
   if (!serial_ready)
     return;
-  for (; *s; ++s)
+  /* Debug strings end lines with a bare \n: terminals need the \r too. */
+  for (; *s; ++s) {
+    if (*s == '\n')
+      serial_putc('\r');
     serial_putc(*s);
+  }
 }
 
 VOID serial_put16(CONST CHAR16 *s) {

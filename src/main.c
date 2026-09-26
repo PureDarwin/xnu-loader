@@ -182,9 +182,81 @@ static VOID ReleaseBootInfoGuard(AppContext *ctx,
   *guard_pages = 0;
 }
 
+#if defined(__aarch64__)
+/* XNU manages one contiguous range from physBase, so it gets the largest run
+ * of RAM without firmware holes, like sunxi's /memreserve/ secure monitor */
+static UINT64 g_xnu_window_lo, g_xnu_window_hi;
+
+/* The types app_detect_physical_memory_size counts as RAM */
+static BOOLEAN is_ram_type(UINT32 type) {
+  return type == EfiLoaderCode || type == EfiLoaderData ||
+         type == EfiBootServicesCode || type == EfiBootServicesData ||
+         type == EfiRuntimeServicesCode || type == EfiRuntimeServicesData ||
+         type == EfiConventionalMemory || type == EfiACPIReclaimMemory ||
+         type == EfiACPIMemoryNVS || type == EfiPalCode;
+}
+
+static VOID FindXnuWindow(AppContext *ctx) {
+  UINTN map_size = 0, key = 0, desc_size = 0;
+  UINT32 desc_ver = 0;
+  EFI_MEMORY_DESCRIPTOR *mm = NULL;
+
+  uefi_call_wrapper(ctx->bs->GetMemoryMap, 5, &map_size, mm, &key, &desc_size, &desc_ver);
+  map_size += desc_size * 4;
+
+  if (EFI_ERROR(uefi_call_wrapper(ctx->bs->AllocatePool, 3, EfiLoaderData, map_size, (VOID **)&mm)) || !mm)
+    return;
+
+  if (EFI_ERROR(uefi_call_wrapper(ctx->bs->GetMemoryMap, 5, &map_size, mm, &key, &desc_size, &desc_ver))) {
+    uefi_call_wrapper(ctx->bs->FreePool, 1, mm);
+    return;
+  }
+
+  UINTN n = map_size / desc_size;
+  for (UINTN i = 0; i < n; i++) {
+    EFI_MEMORY_DESCRIPTOR *d = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)mm + i * desc_size);
+    UINT64 lo = d->PhysicalStart, hi = lo + (d->NumberOfPages << EFI_PAGE_SHIFT);
+    BOOLEAN grew = TRUE;
+
+    if (!is_ram_type(d->Type))
+      continue;
+
+    /* The map need not be sorted: keep appending whichever RAM range starts at hi */
+    while (grew) {
+      grew = FALSE;
+      for (UINTN j = 0; j < n; j++) {
+        EFI_MEMORY_DESCRIPTOR *e = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)mm + j * desc_size);
+        if (is_ram_type(e->Type) && e->PhysicalStart == hi) {
+          hi += e->NumberOfPages << EFI_PAGE_SHIFT;
+          grew = TRUE;
+        }
+      }
+    }
+
+    if (hi - lo > g_xnu_window_hi - g_xnu_window_lo) {
+      g_xnu_window_lo = lo;
+      g_xnu_window_hi = hi;
+    }
+  }
+
+  uefi_call_wrapper(ctx->bs->FreePool, 1, mm);
+  log_info(L"xnu window: 0x%lx - 0x%lx\r\n", g_xnu_window_lo, g_xnu_window_hi);
+}
+#endif
+
 EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes, UINT64 virt_base) {
 #if defined(__aarch64__)
   UINT64 required_rem = virt_base & (XNU_L2_BLOCK_SIZE - 1);
+  UINT64 first = XNU_LOADER_RAM_BASE + XNU_L2_BLOCK_SIZE + required_rem;
+
+  FindXnuWindow(ctx);
+
+  /* Start inside the window, leaving room below for the trustcache page */
+  if (g_xnu_window_lo > XNU_LOADER_RAM_BASE) {
+    UINT64 w = (g_xnu_window_lo + XNU_BOOTINFO_ALIGN + XNU_L2_BLOCK_SIZE - 1) & ~(XNU_L2_BLOCK_SIZE - 1);
+    if (w + required_rem > first)
+      first = w + required_rem;
+  }
   /* Two XNU_BOOTINFO_ALIGN slacks: one below base for the trustcache page,
    * one above to keep the bootinfo block inside this allocation. */
   UINTN total_pages = (UINTN)((span_bytes +
@@ -193,10 +265,7 @@ EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes, UINT64 virt_
                                EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT);
   EFI_PHYSICAL_ADDRESS base = 0;
   EFI_STATUS status = EFI_NOT_FOUND;
-  for (UINT64 try = XNU_LOADER_RAM_BASE + XNU_L2_BLOCK_SIZE + required_rem;
-       try < XNU_LOADER_RAM_BASE + XNU_L2_BLOCK_SIZE + required_rem +
-             64ULL * XNU_L2_BLOCK_SIZE;
-       try += XNU_L2_BLOCK_SIZE) {
+  for (UINT64 try = first; try < first + 64ULL * XNU_L2_BLOCK_SIZE; try += XNU_L2_BLOCK_SIZE) {
     /* Claim the trustcache page below the image as part of this allocation;
      * grabbing it separately afterwards fails whenever UEFI already owns it. */
     base = try - XNU_BOOTINFO_ALIGN;
@@ -550,6 +619,10 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     UINT64 arm64_physical_mem_size =
         (XNU_LOADER_RAM_BASE + app_detect_physical_memory_size(&ctx))
         - arm64_phys_base;
+    /* Managed memory ends where the window does, before any firmware hole above it */
+    if (g_xnu_window_hi > arm64_phys_base &&
+        g_xnu_window_hi - arm64_phys_base < arm64_physical_mem_size)
+      arm64_physical_mem_size = g_xnu_window_hi - arm64_phys_base;
     status = arm64_boot_build_args(
         &ctx,
         cmdline,

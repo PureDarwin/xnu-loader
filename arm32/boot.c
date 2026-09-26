@@ -356,6 +356,8 @@ void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
     wdt[1] = 0xff;  /* TORR: TOP and TOP_INIT = 15 */
     wdt[3] = 0x76;  /* CRR: restart the count */
     wdt[0] = 0x1;   /* CR: enable, reset on expiry */
+    /* CRU_GLB_RST_CON: let the watchdog trigger the first global reset, leaving the PMU alone */
+    ((volatile uint32_t *)0xff3b0000)[0xc10 / 4] = (1u << 11) | (1u << 6) | (1u << 3);
     puts("boot32: watchdog armed\n");
   }
   if (go_initrd) {

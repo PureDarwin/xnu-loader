@@ -1,6 +1,18 @@
 /* arm64 Linux Image entry (Documentation/arch/arm64/booting.rst): x0 = FDT,
  * MMU off, at EL2 or EL1, anywhere 2 MiB-aligned. Drops to EL1, relocates the
  * position-independent image, then kernel_arm64_main builds an identity map. */
+#ifdef XNU_LOADER_PLATFORM_SUN50I
+/* Early progress on UART0 (DW 16550 at 0x05000000), already set up by the boot loader */
+.macro mark c
+  mov x9, #0x05000000
+  mov w10, #\c
+  str w10, [x9]
+.endm
+#else
+.macro mark c
+.endm
+#endif
+
 .section .text.linux_entry, "ax"
 .globl _start
 _start:
@@ -17,6 +29,7 @@ _start:
 
 primary_entry:
   mov x19, x0
+  mark 'P'
   msr daifset, #0xf
   mrs x0, CurrentEL
   cmp x0, #(2 << 2)
@@ -54,6 +67,7 @@ primary_entry:
   eret
 
 at_el1:
+  mark '1'
   mrs x0, sctlr_el1
   bic x0, x0, #1
   bic x0, x0, #(1 << 2)
@@ -93,6 +107,7 @@ at_el1:
   str x5, [x0, x3]
   b 4b
 5:
+  mark 'R'
   mov x0, x19
   bl kernel_arm64_main
 6:

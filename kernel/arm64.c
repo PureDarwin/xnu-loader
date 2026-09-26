@@ -15,9 +15,20 @@
 
 static EfiEmuBootInfo boot_info;
 static CHAR8 cmdline[2048];
-static struct { UINT64 base, size; } ram[16], reserved[MAX_RESERVED];
+struct range {
+  UINT64 base, size;
+};
+
+static struct range ram[16], reserved[MAX_RESERVED];
 static UINT32 nram, nreserved;
 static UINT64 fdt_initrd_start, fdt_initrd_end;
+
+/* Simple-framebuffer node from u-boot, committed at the node end */
+static struct {
+  BOOLEAN compat, disabled, argb;
+  UINT64 base;
+  UINT32 width, height, stride;
+} sfb;
 
 extern CONST CHAR8 embedded_initrd_start[], embedded_initrd_end[];
 extern UINT8 __kernel_start, __kernel_end;
@@ -50,10 +61,53 @@ static BOOLEAN node_is(CONST CHAR8 *name, CONST CHAR8 *want) {
   return !*want && (!*name || *name == '@');
 }
 
+/* True when the nul separated compatible list holds want */
+static BOOLEAN compat_has(CONST CHAR8 *v, UINT32 len, CONST CHAR8 *want) {
+  UINT32 o = 0;
+  while (o < len) {
+    if (str_eq(v + o, want))
+      return TRUE;
+    while (o < len && v[o])
+      ++o;
+    ++o;
+  }
+  return FALSE;
+}
+
+static void commit_simplefb(void) {
+  if (sfb.compat && !sfb.disabled && sfb.argb && sfb.base && sfb.width &&
+      sfb.height && sfb.stride >= sfb.width * 4) {
+    EfiEmuFramebuffer *fb = &boot_info.framebuffer;
+    fb->base = sfb.base;
+    fb->width = sfb.width;
+    fb->height = sfb.height;
+    fb->pixels_per_scanline = sfb.stride / 4;
+    fb->bits_per_pixel = 32;
+    fb->red_position = 16;
+    fb->blue_position = 0;
+    fb->valid = 1;
+  }
+  UINT8 *z = (UINT8 *)&sfb;
+  for (UINTN i = 0; i < sizeof(sfb); ++i)
+    z[i] = 0;
+}
+
 static void add_reserved(UINT64 base, UINT64 size) {
   if (size && nreserved < MAX_RESERVED) {
     reserved[nreserved].base = base;
     reserved[nreserved++].size = size;
+  }
+}
+
+static void log_ranges(CONST CHAR8 *what, CONST struct range *r, UINT32 n) {
+  for (UINT32 i = 0; i < n; ++i) {
+    efiemu_debug_string("xnu-loader kernel: ");
+    efiemu_debug_string(what);
+    efiemu_debug_string(" ");
+    efiemu_debug_hex(r[i].base);
+    efiemu_debug_string(" size ");
+    efiemu_debug_hex(r[i].size);
+    efiemu_debug_string("\n");
   }
 }
 
@@ -93,8 +147,10 @@ static void parse_fdt(UINT64 fdt) {
                : node_is(name, "reserved-memory") ? N_RESMEM
                                                  : N_OTHER;
     } else if (tok == FDT_END_NODE) {
-      if (depth == 2)
+      if (depth == 2) {
+        commit_simplefb();
         kind = N_OTHER;
+      }
       --depth;
     } else if (tok == FDT_PROP) {
       UINT32 len = be32(st);
@@ -123,6 +179,21 @@ static void parse_fdt(UINT64 fdt) {
         } else if (str_eq(pname, "linux,initrd-end")) {
           fdt_initrd_end = cells(v, len / 4);
         }
+      } else if (depth == 2 && kind == N_OTHER) {
+        if (str_eq(pname, "compatible"))
+          sfb.compat = compat_has((CONST CHAR8 *)v, len, "simple-framebuffer");
+        else if (str_eq(pname, "status"))
+          sfb.disabled = !str_eq((CONST CHAR8 *)v, "okay") && !str_eq((CONST CHAR8 *)v, "ok");
+        else if (str_eq(pname, "format"))
+          sfb.argb = str_eq((CONST CHAR8 *)v, "a8r8g8b8") || str_eq((CONST CHAR8 *)v, "x8r8g8b8");
+        else if (str_eq(pname, "reg") && len >= 4 * addr_cells)
+          sfb.base = cells(v, addr_cells);
+        else if (str_eq(pname, "width"))
+          sfb.width = be32(v);
+        else if (str_eq(pname, "height"))
+          sfb.height = be32(v);
+        else if (str_eq(pname, "stride"))
+          sfb.stride = be32(v);
       } else if (depth == 2 && kind == N_PSCI && str_eq(pname, "method")) {
         efiemu_psci_conduit = str_eq((CONST CHAR8 *)v, "hvc") ? 1
                               : str_eq((CONST CHAR8 *)v, "smc") ? 2 : 0;
@@ -257,6 +328,7 @@ static void arm64_enable_mmu(void) {
 }
 
 void kernel_arm64_main(UINT64 fdt) {
+  serial_puts8((CONST CHAR8 *)"\nxnu-loader kernel: C entry\n");
   efiemu_exceptions_install();
   if (be32((CONST UINT8 *)(UINTN)fdt) != FDT_MAGIC) {
     serial_puts8((CONST CHAR8 *)"xnu-loader kernel: no device tree in x0\n");
@@ -264,9 +336,12 @@ void kernel_arm64_main(UINT64 fdt) {
       __asm__ volatile("wfi");
   }
   parse_fdt(fdt);
+  serial_puts8((CONST CHAR8 *)"xnu-loader kernel: device tree parsed, enabling the MMU\n");
   arm64_enable_mmu();
   serial_reinit();
   efiemu_debug_string("xnu-loader kernel: arm64 Image entry\n");
+  log_ranges("ram", ram, nram);
+  log_ranges("reserved", reserved, nreserved);
 
   UINT64 initrd = fdt_initrd_start;
   UINT64 initrd_size = fdt_initrd_end > fdt_initrd_start ? fdt_initrd_end - fdt_initrd_start : 0;
