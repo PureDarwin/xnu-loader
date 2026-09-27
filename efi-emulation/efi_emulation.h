@@ -65,6 +65,11 @@ typedef struct {
 /* Hooks the arm64 boot glue provides: PSCI conduit (0 none, 1 hvc, 2 smc) */
 extern UINT32 efiemu_psci_conduit;
 #endif
+#if defined(__riscv)
+// from the risc-v image entry: the hart that booted and /cpus timebase-frequency
+extern UINT64 efiemu_riscv_hartid;
+extern UINT64 efiemu_riscv_timebase;
+#endif
 
 void efiemu_main(EfiEmuBootInfo *info) __attribute__((noreturn));
 

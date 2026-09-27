@@ -112,61 +112,61 @@ static VOID serial_putc(CHAR8 c) {
   uart_putc(c);
 }
 
-#elif defined(__aarch64__) && defined(XNU_LOADER_PLATFORM_SUN50I)
+#elif defined(__aarch64__) && defined(XNU_LOADER_A53_4K)
 
-/* Allwinner H616/H618 UART0: a Synopsys DesignWare APB UART, 16550-compatible
+/* H616/H618 and SG2002 UART0: a Synopsys DesignWare APB UART, 16550-compatible
  * but with 32-bit registers on a 4-byte stride, so register index N lives at
  * base + (N << 2). U-Boot leaves it running at 115200 8N1; serial_init()
  * reprograms it anyway so the loader does not depend on that. */
-#define SUN50I_UART_REG(n) \
-  (*(volatile UINT32 *)(SUN50I_UART0_BASE + ((UINT64)(n) << SUN50I_UART0_SHIFT)))
+#define A53_UART_REG(n) \
+  (*(volatile UINT32 *)(A53_UART0_BASE + ((UINT64)(n) << A53_UART0_SHIFT)))
 
-#define SUN50I_UART_THR SUN50I_UART_REG(0)  /* tx holding      (DLAB=0) */
-#define SUN50I_UART_DLL SUN50I_UART_REG(0)  /* divisor low     (DLAB=1) */
-#define SUN50I_UART_IER SUN50I_UART_REG(1)  /* irq enable      (DLAB=0) */
-#define SUN50I_UART_DLH SUN50I_UART_REG(1)  /* divisor high    (DLAB=1) */
-#define SUN50I_UART_FCR SUN50I_UART_REG(2)  /* FIFO control    (write)  */
-#define SUN50I_UART_LCR SUN50I_UART_REG(3)  /* line control             */
-#define SUN50I_UART_LSR SUN50I_UART_REG(5)  /* line status              */
-#define SUN50I_UART_USR SUN50I_UART_REG(31) /* DesignWare status (0x7c) */
+#define A53_UART_THR A53_UART_REG(0)  /* tx holding      (DLAB=0) */
+#define A53_UART_DLL A53_UART_REG(0)  /* divisor low     (DLAB=1) */
+#define A53_UART_IER A53_UART_REG(1)  /* irq enable      (DLAB=0) */
+#define A53_UART_DLH A53_UART_REG(1)  /* divisor high    (DLAB=1) */
+#define A53_UART_FCR A53_UART_REG(2)  /* FIFO control    (write)  */
+#define A53_UART_LCR A53_UART_REG(3)  /* line control             */
+#define A53_UART_LSR A53_UART_REG(5)  /* line status              */
+#define A53_UART_USR A53_UART_REG(31) /* DesignWare status (0x7c) */
 
-#define SUN50I_UART_LSR_THRE 0x20 /* transmit holding register empty */
-#define SUN50I_UART_LCR_8N1  0x03
-#define SUN50I_UART_LCR_DLAB 0x80
-#define SUN50I_UART_FCR_INIT 0x07 /* enable FIFOs, clear rx and tx    */
+#define A53_UART_LSR_THRE 0x20 /* transmit holding register empty */
+#define A53_UART_LCR_8N1  0x03
+#define A53_UART_LCR_DLAB 0x80
+#define A53_UART_FCR_INIT 0x07 /* enable FIFOs, clear rx and tx    */
 
 static VOID uart_putc(CHAR8 c) {
   UINT32 spins = 0;
-  while ((SUN50I_UART_LSR & SUN50I_UART_LSR_THRE) == 0) {
+  while ((A53_UART_LSR & A53_UART_LSR_THRE) == 0) {
     if (++spins >= 100000u)
       return;  /* bounded: see the x86 uart_putc comment */
   }
-  SUN50I_UART_THR = (UINT32)(UINT8)c;
+  A53_UART_THR = (UINT32)(UINT8)c;
 }
 
 VOID serial_init(VOID) {
-  /* Round to nearest: exact divisor is 13.02 at 24MHz/115200. */
-  CONST UINT32 divisor = (SUN50I_UART0_CLOCK_HZ + (8 * SUN50I_UART0_BAUD)) /
-                         (16 * SUN50I_UART0_BAUD);
+  /* Round to nearest: 13.02 at 24MHz, 13.56 at 25MHz, for 115200. */
+  CONST UINT32 divisor = (A53_UART0_CLOCK_HZ + (8 * A53_UART0_BAUD)) /
+                         (16 * A53_UART0_BAUD);
   UINT32 spins = 0;
 
-  SUN50I_UART_IER = 0;
-  SUN50I_UART_FCR = SUN50I_UART_FCR_INIT;
+  A53_UART_IER = 0;
+  A53_UART_FCR = A53_UART_FCR_INIT;
 
   /* A DesignWare UART discards LCR writes while it is busy, which would drop
    * the divisor below and silently leave the port at whatever rate firmware
    * set. Drain the transmitter, then clear any latched busy-detect via USR. */
-  while ((SUN50I_UART_LSR & SUN50I_UART_LSR_THRE) == 0) {
+  while ((A53_UART_LSR & A53_UART_LSR_THRE) == 0) {
     if (++spins >= 100000u)
       break;
   }
-  (VOID)SUN50I_UART_USR;
+  (VOID)A53_UART_USR;
 
-  SUN50I_UART_LCR = SUN50I_UART_LCR_DLAB;
-  SUN50I_UART_DLL = divisor & 0xFF;
-  SUN50I_UART_DLH = (divisor >> 8) & 0xFF;
-  SUN50I_UART_LCR = SUN50I_UART_LCR_8N1;
-  (VOID)SUN50I_UART_USR;
+  A53_UART_LCR = A53_UART_LCR_DLAB;
+  A53_UART_DLL = divisor & 0xFF;
+  A53_UART_DLH = (divisor >> 8) & 0xFF;
+  A53_UART_LCR = A53_UART_LCR_8N1;
+  (VOID)A53_UART_USR;
 
   serial_ready = TRUE;
 }
@@ -216,6 +216,44 @@ VOID serial_reinit(VOID) {
 
 static VOID serial_putc(CHAR8 c) {
   uart_putc(c);
+}
+
+#elif defined(__riscv)
+
+// the sbi console works on every board before any uart driver
+#define SBI_EXT_DBCN        0x4442434eL
+#define SBI_EXT_BASE        0x10L
+#define SBI_EXT_LEGACY_PUTC 0x01L
+
+static BOOLEAN sbi_has_dbcn;
+
+static long sbi_ecall(long ext, long fid, long arg0, long *value) {
+  register long a0 __asm__("a0") = arg0;
+  register long a1 __asm__("a1") = 0;
+  register long a6 __asm__("a6") = fid;
+  register long a7 __asm__("a7") = ext;
+  __asm__ volatile("ecall" : "+r"(a0), "+r"(a1) : "r"(a6), "r"(a7) : "memory");
+  if (value)
+    *value = a1;
+  return a0;
+}
+
+VOID serial_init(VOID) {
+  long present = 0;
+  // base extension probe_extension, dbcn write_byte when it is there
+  sbi_has_dbcn = sbi_ecall(SBI_EXT_BASE, 3, SBI_EXT_DBCN, &present) == 0 && present != 0;
+  serial_ready = TRUE;
+}
+
+VOID serial_reinit(VOID) {
+  serial_ready = TRUE;
+}
+
+static VOID serial_putc(CHAR8 c) {
+  if (sbi_has_dbcn)
+    sbi_ecall(SBI_EXT_DBCN, 2, (UINT8)c, NULL);
+  else
+    sbi_ecall(SBI_EXT_LEGACY_PUTC, 0, (UINT8)c, NULL);
 }
 
 #else

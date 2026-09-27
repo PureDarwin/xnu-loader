@@ -4,7 +4,7 @@
 #include "serial.h"
 #include <efilib.h>
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__riscv)
 /* No firmware disk on the arm Linux-image path: modules are the only volume */
 void efiemu_bios_disk_set(UINT32 drive, EfiEmuBiosRead read) {
   (void)drive;

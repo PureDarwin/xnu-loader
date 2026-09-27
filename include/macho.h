@@ -106,6 +106,15 @@ typedef struct arm_thread_state64 {
   UINT32 flags;
 } arm_thread_state64;
 
+// riscv64 as ld64 numbers it, 24 with the 64-bit abi bit, flavor 1 is x0..x31 then pc
+#define CPU_TYPE_RISCV64 (24 | 0x01000000)
+#define RISCV_THREAD_STATE64 1
+
+typedef struct riscv_thread_state64 {
+  UINT64 x[32];
+  UINT64 pc;
+} riscv_thread_state64;
+
 typedef struct macho_dysymtab_command {
   UINT32 cmd;
   UINT32 cmdsize;

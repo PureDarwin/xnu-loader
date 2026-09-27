@@ -3,6 +3,9 @@
 #include "efi_emulation.h"
 #include "serial.h"
 #include <efilib.h>
+#if defined(__riscv)
+#include "riscv_efi_boot.h"
+#endif
 
 #undef SetMem
 static void native_set_mem(void *ptr, UINTN size, UINT8 value) {
@@ -66,6 +69,29 @@ static UINT64 psci_call(UINT64 fn) {
   else if (efiemu_psci_conduit == 2)
     __asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
   return x0;
+}
+#elif defined(__riscv)
+#define efiemu_halt() __asm__ volatile("csrw sie, zero; wfi")
+
+static long sbi_call(long ext, long fid, long arg0, long arg1) {
+  register long a0 __asm__("a0") = arg0;
+  register long a1 __asm__("a1") = arg1;
+  register long a6 __asm__("a6") = fid;
+  register long a7 __asm__("a7") = ext;
+  __asm__ volatile("ecall" : "+r"(a0), "+r"(a1) : "r"(a6), "r"(a7) : "memory");
+  return a0;
+}
+
+// the boot hart reaches the shared loader the way real uefi firmware reports it
+static EFI_GUID riscv_boot_guid = RISCV_EFI_BOOT_PROTOCOL_GUID;
+static RISCV_EFI_BOOT_PROTOCOL riscv_boot;
+
+static EFI_STATUS EFIAPI riscv_get_boot_hart_id(RISCV_EFI_BOOT_PROTOCOL *self, UINTN *hartid) {
+  (void)self;
+  if (!hartid)
+    return EFI_INVALID_PARAMETER;
+  *hartid = efiemu_riscv_hartid;
+  return EFI_SUCCESS;
 }
 #endif
 
@@ -388,7 +414,7 @@ static void relocate_acpi_tables(UINT8 *rsdp) {
 
 static void discover_config_tables(EfiEmuBootInfo *info) {
   UINTN n = 0;
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__riscv)
   if (info->fdt) {
     static EFI_GUID dtb = { 0xb1b621d5, 0xf19c, 0x41a5,
                             { 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0 } };
@@ -723,6 +749,14 @@ static EFI_STATUS EFIAPI bs_locate_protocol(EFI_GUID *guid, VOID *registration,
     *out = &graphics_output;
     return EFI_SUCCESS;
   }
+#if defined(__riscv)
+  if (CompareMem(guid, &riscv_boot_guid, sizeof(*guid)) == 0) {
+    riscv_boot.Revision = RISCV_EFI_BOOT_PROTOCOL_REVISION;
+    riscv_boot.GetBootHartId = riscv_get_boot_hart_id;
+    *out = &riscv_boot;
+    return EFI_SUCCESS;
+  }
+#endif
   return EFI_NOT_FOUND;
 }
 
@@ -762,6 +796,18 @@ static EFI_STATUS EFIAPI bs_stall(UINTN usec) {
   UINT64 ticks = freq / 1000000ULL * usec + (freq % 1000000ULL) * usec / 1000000ULL;
   do {
     __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(now));
+  } while (now - start < ticks);
+  return EFI_SUCCESS;
+}
+#elif defined(__riscv)
+static EFI_STATUS EFIAPI bs_stall(UINTN usec) {
+  // qemu virt ticks at 10 MHz, used when the fdt has no timebase
+  UINT64 freq = efiemu_riscv_timebase ? efiemu_riscv_timebase : 10000000ULL;
+  UINT64 start, now;
+  __asm__ volatile("rdtime %0" : "=r"(start));
+  UINT64 ticks = freq / 1000000ULL * usec + (freq % 1000000ULL) * usec / 1000000ULL;
+  do {
+    __asm__ volatile("rdtime %0" : "=r"(now));
   } while (now - start < ticks);
   return EFI_SUCCESS;
 }
@@ -844,7 +890,7 @@ static EFI_STATUS EFIAPI rt_convert_pointer(UINTN disposition,
   return EFI_SUCCESS;
 }
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__riscv)
 static EFI_STATUS EFIAPI rt_get_time(EFI_TIME *time,
                                       EFI_TIME_CAPABILITIES *capabilities) {
   if (!time)
@@ -1034,6 +1080,9 @@ static EFI_STATUS EFIAPI rt_reset(EFI_RESET_TYPE type, EFI_STATUS status,
   (void)data;
 #if defined(__aarch64__)
   psci_call(type == EfiResetShutdown ? 0x84000008ULL : 0x84000009ULL);
+#elif defined(__riscv)
+  // sbi system reset, shutdown or cold reboot
+  sbi_call(0x53525354, 0, type == EfiResetShutdown ? 0 : 1, 0);
 #else
   io_out8(0xcf9, 0x06);
   while (io_in8(0x64) & 0x02) {
@@ -1057,14 +1106,14 @@ static EFI_STATUS EFIAPI con_output(SIMPLE_TEXT_OUTPUT_INTERFACE *self,
     line[n++] = (CHAR8)character;
     if (n == sizeof(line) - 1) {
       line[n] = 0;
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__riscv)
       serial_puts8(line);
 #endif
       n = 0;
     }
     ++s;
   }
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__riscv)
   line[n] = 0;
   if (n)
     serial_puts8(line);
@@ -1113,7 +1162,7 @@ static void reserve_bytes(UINT64 base, UINT64 size, EFI_MEMORY_TYPE type) {
 static CHAR8 module_names[EFIEMU_MAX_MODULES][128];
 
 static BOOLEAN in_xnu_window(UINT64 base, UINT64 size) {
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__riscv)
   (void)base;
   (void)size;
   return FALSE;

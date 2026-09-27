@@ -129,8 +129,8 @@ endif()
 # at build time and surfaced to the sources as XNU_LOADER_PLATFORM_<NAME>.
 # Ignored for x86_64, which has no equivalent variation.
 set(XNU_LOADER_PLATFORM "bcm2837" CACHE STRING
-    "aarch64 target platform: bcm2837, qemuvirt or sun50i")
-set_property(CACHE XNU_LOADER_PLATFORM PROPERTY STRINGS bcm2837 qemuvirt sun50i)
+    "aarch64 target platform: bcm2837, qemuvirt, sun50i or sg2002")
+set_property(CACHE XNU_LOADER_PLATFORM PROPERTY STRINGS bcm2837 qemuvirt sun50i sg2002)
 
 set(XNU_LOADER_PLATFORM_DEFINES "")
 if(ARCH STREQUAL "aarch64")
@@ -140,9 +140,11 @@ if(ARCH STREQUAL "aarch64")
     set(XNU_LOADER_PLATFORM_DEFINES XNU_LOADER_PLATFORM_QEMUVIRT)
   elseif(XNU_LOADER_PLATFORM STREQUAL "sun50i")
     set(XNU_LOADER_PLATFORM_DEFINES XNU_LOADER_PLATFORM_SUN50I)
+  elseif(XNU_LOADER_PLATFORM STREQUAL "sg2002")
+    set(XNU_LOADER_PLATFORM_DEFINES XNU_LOADER_PLATFORM_SG2002)
   else()
     message(FATAL_ERROR
-      "XNU_LOADER_PLATFORM must be bcm2837, qemuvirt or sun50i, "
+      "XNU_LOADER_PLATFORM must be bcm2837, qemuvirt, sun50i or sg2002, "
       "got '${XNU_LOADER_PLATFORM}'")
   endif()
   message(STATUS "aarch64 platform: ${XNU_LOADER_PLATFORM}")

@@ -521,6 +521,16 @@ EFI_STATUS macho_find_entry_vmaddr(
           return EFI_SUCCESS;
         }
 
+        // flavor 1 means something else on the other architectures
+        if (hdr->cputype == CPU_TYPE_RISCV64 && flavor == RISCV_THREAD_STATE64) {
+          if (state_size < sizeof(riscv_thread_state64))
+            return EFI_COMPROMISED_DATA;
+
+          riscv_thread_state64 *ts = (riscv_thread_state64 *)state;
+          *out_entry_vmaddr = ts->pc;
+          return EFI_SUCCESS;
+        }
+
         if (flavor == ARM_THREAD_STATE64) {
           if (state_size < sizeof(arm_thread_state64))
             return EFI_COMPROMISED_DATA;

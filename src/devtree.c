@@ -372,6 +372,89 @@ static UINTN acpi_cpu_mpidrs(AppContext *ctx, UINT64 *out, UINTN max) {
   return found;
 }
 
+// booti hands over an fdt and no acpi, so the cpu list comes from its /cpus node
+static UINT32 fdt_be32(const UINT8 *p) {
+  return (UINT32)p[0] << 24 | (UINT32)p[1] << 16 | (UINT32)p[2] << 8 | p[3];
+}
+
+static BOOLEAN fdt_str_eq(const CHAR8 *a, const CHAR8 *b) {
+  while (*a && *a == *b) {
+    ++a;
+    ++b;
+  }
+  return *a == *b;
+}
+
+static UINTN fdt_cpu_mpidrs(AppContext *ctx, UINT64 *out, UINTN max) {
+  static const EFI_GUID dtb_guid = { 0xb1b621d5, 0xf19c, 0x41a5,
+                                     { 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0 } };
+  const UINT8 *h = NULL;
+  UINTN found = 0;
+
+  for (UINTN i = 0; i < ctx->st->NumberOfTableEntries; i++) {
+    EFI_CONFIGURATION_TABLE *e = &ctx->st->ConfigurationTable[i];
+    if (!CompareMem(&e->VendorGuid, &dtb_guid, sizeof(EFI_GUID)))
+      h = (const UINT8 *)e->VendorTable;
+  }
+  if (!h || fdt_be32(h) != 0xd00dfeedU)
+    return 0;
+
+  const UINT8 *st = h + fdt_be32(h + 8);
+  const CHAR8 *strings = (const CHAR8 *)(h + fdt_be32(h + 12));
+  UINT32 depth = 0, cells = 1;
+  BOOLEAN in_cpus = FALSE, is_cpu = FALSE, disabled = FALSE, have_reg = FALSE;
+  UINT64 reg = 0;
+
+  for (;;) {
+    UINT32 tok = fdt_be32(st);
+    st += 4;
+    if (tok == 1) {                                    // begin node
+      const CHAR8 *name = (const CHAR8 *)st;
+      UINTN len = 0;
+      while (name[len])
+        ++len;
+      st += (len + 4) & ~3UL;
+      ++depth;
+      if (depth == 2)
+        in_cpus = fdt_str_eq(name, "cpus");
+      if (depth == 3 && in_cpus) {
+        is_cpu = disabled = have_reg = FALSE;
+        reg = 0;
+      }
+    } else if (tok == 2) {                             // end node
+      if (depth == 3 && in_cpus && is_cpu && have_reg && !disabled && found < max)
+        out[found++] = reg;
+      if (depth == 2)
+        in_cpus = FALSE;
+      --depth;
+    } else if (tok == 3) {                             // property
+      UINT32 len = fdt_be32(st);
+      const CHAR8 *pname = strings + fdt_be32(st + 4);
+      const UINT8 *v = st + 8;
+      st += 8 + ((len + 3) & ~3U);
+      if (depth == 2 && in_cpus && fdt_str_eq(pname, "#address-cells") && len >= 4) {
+        cells = fdt_be32(v);
+      } else if (depth == 3 && in_cpus) {
+        if (fdt_str_eq(pname, "device_type"))
+          is_cpu = fdt_str_eq((const CHAR8 *)v, "cpu");
+        else if (fdt_str_eq(pname, "status"))
+          disabled = !fdt_str_eq((const CHAR8 *)v, "okay") && !fdt_str_eq((const CHAR8 *)v, "ok");
+        else if (fdt_str_eq(pname, "reg") && len >= 4 * cells) {
+          reg = 0;
+          for (UINT32 c = 0; c < cells; c++)
+            reg = reg << 32 | fdt_be32(v + 4 * c);
+          have_reg = TRUE;
+        }
+      }
+    } else if (tok == 4) {                             // nop
+      continue;
+    } else {
+      break;
+    }
+  }
+  return found;
+}
+
 static BOOLEAN uuid_str_to_bytes(const CHAR8 *str, UINT8 out[16]) {
   UINTN oi = 0;
   for (UINTN i = 0; str[i] && oi < 16; i++) {
@@ -412,6 +495,13 @@ static UINT64 rdtsc64_raw(void) {
 static UINT64 rdtsc64_raw(void) {
   UINT64 v;
   __asm__ volatile ("mrs %0, cntvct_el0" : "=r"(v));
+  return v;
+}
+#elif defined(__riscv)
+// the time csr, ticking at /cpus timebase-frequency
+static UINT64 rdtsc64_raw(void) {
+  UINT64 v;
+  __asm__ volatile ("rdtime %0" : "=r"(v));
   return v;
 }
 #else
@@ -1410,6 +1500,25 @@ EFI_STATUS dt_build(
     }
   }
 #endif
+#if defined(__riscv)
+  // the kernel panics without dram-base and dram-size, the bank that holds the kernel
+  {
+    UINT64 dram_base = ctx->dram_base;
+    UINT64 dram_size = ctx->dram_size;
+    dt_prop(ctx, chosen, "dram-base", &dram_base, sizeof(dram_base));
+    dt_prop(ctx, chosen, "dram-size", &dram_size, sizeof(dram_size));
+  }
+  if (ctx->fdt_copy_size != 0) {
+    if (memory_map == NULL) {
+      memory_map = dt_create_node(ctx);
+      dt_prop_str(ctx, memory_map, "name", "memory-map");
+    }
+    MemoryMapFileInfo fdt_info;
+    fdt_info.paddr = (UINT64)ctx->fdt_copy_phys;
+    fdt_info.length = ctx->fdt_copy_size;
+    dt_prop(ctx, memory_map, "FDT", &fdt_info, sizeof(fdt_info));
+  }
+#endif
 
   if (ctx->ramdisk_size != 0) {
     if (memory_map == NULL) {
@@ -1544,6 +1653,8 @@ EFI_STATUS dt_build(
    * mailbox-queried memory layout, no ACPI at all). This just lets the
    * kcompat marker match the arch actually compiling. */
   dt_prop_u32(ctx, kcompat, "arm64", 1);
+#elif defined(__riscv)
+  dt_prop_u32(ctx, kcompat, "riscv64", 1);
 #else
 #error "devtree.c: unsupported architecture"
 #endif
@@ -1590,6 +1701,8 @@ EFI_STATUS dt_build(
   {
     UINT64 mpidr[32];
     UINTN ncpu = acpi_cpu_mpidrs(ctx, mpidr, 32);
+    if (ncpu == 0)
+      ncpu = fdt_cpu_mpidrs(ctx, mpidr, 32);
     UINT64 cntfrq;
 
     __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(cntfrq));
@@ -1637,12 +1750,12 @@ EFI_STATUS dt_build(
     dt_prop(ctx, uart0, "reg", uart_reg, sizeof(uart_reg));
     dt_add_child(ctx, armio, uart0);
   }
-#elif defined(XNU_LOADER_PLATFORM_SUN50I)
-  dt_prop_str(ctx, armio, "device_type", "sun50i-io");
+#elif defined(XNU_LOADER_A53_4K)
+  dt_prop_str(ctx, armio, "device_type", A53_SOC_IO_TYPE);
   {
     /* Peripheral window. XNU's pe_arm_get_soc_base_phys() returns the second
-     * cell, and uart0's reg offset below is relative to it. */
-    UINT64 ranges[3] = { 0, SUN50I_SOC_BASE, SUN50I_SOC_SIZE };
+     * cell, and the reg offsets below are relative to it. */
+    UINT64 ranges[3] = { 0, A53_SOC_BASE, A53_SOC_SIZE };
     dt_prop(ctx, armio, "ranges", ranges, sizeof(ranges));
   }
   {
@@ -1653,12 +1766,21 @@ EFI_STATUS dt_build(
     dt_prop_str(ctx, uart0, "name", "uart0");
     dt_prop_str(ctx, uart0, "compatible", "snps,dw-apb-uart");
     dt_prop_u32(ctx, uart0, "AAPL,phandle", XNU_LOADER_UART0_PHANDLE);
-    UINT64 uart_reg[2] = { SUN50I_UART0_OFFSET, SUN50I_UART0_SIZE };
+    UINT64 uart_reg[2] = { A53_UART0_OFFSET, A53_UART0_SIZE };
     dt_prop(ctx, uart0, "reg", uart_reg, sizeof(uart_reg));
-    dt_prop_u32(ctx, uart0, "reg-shift", SUN50I_UART0_SHIFT);
-    dt_prop_u32(ctx, uart0, "clock-frequency", SUN50I_UART0_CLOCK_HZ);
-    dt_prop_u32(ctx, uart0, "current-speed", SUN50I_UART0_BAUD);
+    dt_prop_u32(ctx, uart0, "reg-shift", A53_UART0_SHIFT);
+    dt_prop_u32(ctx, uart0, "clock-frequency", A53_UART0_CLOCK_HZ);
+    dt_prop_u32(ctx, uart0, "current-speed", A53_UART0_BAUD);
     dt_add_child(ctx, armio, uart0);
+  }
+  {
+    // the gic-400 the kernel drives itself, distributor then cpu interface
+    DeviceTreeNode *gic = dt_create_node(ctx);
+    dt_prop_str(ctx, gic, "name", "gic");
+    dt_prop_str(ctx, gic, "compatible", "arm,gic-400");
+    UINT64 gic_reg[4] = { A53_GICD_OFFSET, 0x1000ULL, A53_GICC_OFFSET, 0x2000ULL };
+    dt_prop(ctx, gic, "reg", gic_reg, sizeof(gic_reg));
+    dt_add_child(ctx, armio, gic);
   }
 #else
   dt_prop_str(ctx, armio, "device_type", "bcm2837-io");
@@ -1684,11 +1806,20 @@ EFI_STATUS dt_build(
 
   DeviceTreeNode *root = dt_create_node(ctx);
   dt_prop_str(ctx, root, "name", "device-tree");
+#if defined(__riscv)
+  // the board's own nodes, compatible and model come over from the fdt
+  status = dt_riscv_import_fdt(ctx, root, chosen);
+  if (EFI_ERROR(status)) {
+    uefi_call_wrapper(ctx->bs->FreePages, 2, dt_addr, XNU_DEVTREE_PAGES);
+    return status;
+  }
+#else
   /* IOKit matches the platform driver (AppleI386GenericPlatform) on these two
    * properties being present on the root node. Without them the entire IOKit
    * driver cascade fails to start and XNU hangs waiting for the root device. */
   dt_prop_str(ctx, root, "compatible", "ACPI");
   dt_prop_str(ctx, root, "model", "ACPI");
+#endif
   dt_add_child(ctx, root, chosen);
 
   /* XNU's IODTPlatformExpert requires the standard NVRAM options node. */
@@ -1742,9 +1873,27 @@ EFI_STATUS dt_build(
     dt_add_child(ctx, root, defaults);
   }
 #endif
+#if defined(__riscv)
+  {
+    // pmap and the platform expert look /defaults up whether or not it has anything
+    DeviceTreeNode *defaults = dt_create_node(ctx);
+    dt_prop_str(ctx, defaults, "name", "defaults");
+    if (dt_riscv_fdt_is_qemu(ctx))
+      dt_prop_u32(ctx, defaults, "vmm-present", 1);
+    dt_add_child(ctx, root, defaults);
+  }
+#endif
   dt_add_child(ctx, root, efi);
 
   log_info(L"DT: flattening into %lu-byte buffer\r\n", (UINT64)dt_size);
+#if defined(__riscv)
+  // measured first, a converted fdt can be larger than the arm64 trees
+  if (dt_riscv_flat_size(root) > dt_size) {
+    log_info(L"DT: tree needs %u bytes, more than %u\r\n", dt_riscv_flat_size(root), (UINT32)dt_size);
+    uefi_call_wrapper(ctx->bs->FreePages, 2, dt_addr, XNU_DEVTREE_PAGES);
+    return EFI_BUFFER_TOO_SMALL;
+  }
+#endif
   UINT32 used = dt_flatten_node(root, dt_base);
   if (used > dt_size) {
     log_info(L"DT: overflow %u > %u\n", used, (UINT32)dt_size);

@@ -2,11 +2,11 @@
 , lib
 , gnu-efi
 , embeddedInitrd ? null
-  # aarch64 target machine, as in ../default.nix: bcm2837, qemuvirt or sun50i
+  # aarch64 target machine, as in ../default.nix: bcm2837, qemuvirt, sun50i or sg2002
 , platform ? "qemuvirt"
 }:
 
-assert platform == "bcm2837" || platform == "qemuvirt" || platform == "sun50i";
+assert platform == "bcm2837" || platform == "qemuvirt" || platform == "sun50i" || platform == "sg2002";
 
 # xnu-loader as an arm64 Linux Image: U-Boot `booti`, QEMU `-kernel`, or any
 # loader that speaks Documentation/arch/arm64/booting.rst. Modules (the kernel

@@ -16,6 +16,9 @@
 #elif defined(__aarch64__)
 #define IRQ_DISABLE() __asm__ volatile ("msr daifset, #2")
 #define IRQ_ENABLE()  __asm__ volatile ("msr daifclr, #2")
+#elif defined(__riscv)
+#define IRQ_DISABLE() __asm__ volatile ("csrci sstatus, 2")
+#define IRQ_ENABLE()  __asm__ volatile ("csrsi sstatus, 2")
 #else
 #error "boot.c: unsupported architecture"
 #endif
@@ -773,7 +776,7 @@ EFI_STATUS boot_fill_video(
   return EFI_SUCCESS;
 }
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__riscv)
 /*
  * arm64's Boot_Video is 64-bit throughout and has no VideoV1 companion, so it
  * can carry a framebuffer anywhere in the address space without the 4GB
@@ -1067,7 +1070,7 @@ EFI_STATUS exit_boot_services_retry(
   return EFI_INVALID_PARAMETER;
 }
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__riscv)
 EFI_STATUS arm64_boot_build_args(
     AppContext *ctx,
     const CHAR8 *cmdline,

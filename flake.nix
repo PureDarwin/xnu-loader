@@ -42,6 +42,13 @@
       kernel-arm64-sun50i = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./kernel/arm64.nix {
         platform = "sun50i";
       };
+      kernel-arm64-sg2002 = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./kernel/arm64.nix {
+        platform = "sg2002";
+      };
+      # the loader as a riscv64 linux Image (opensbi, u-boot booti, qemu -kernel), clang and lld
+      kernel-riscv64 = pkgs.callPackage ./kernel/riscv64.nix {
+        compilerRt = pkgs.pkgsCross.riscv64.llvmPackages.compiler-rt;
+      };
       # xnu arm32 boot shim as a Linux zImage (QEMU -kernel, U-Boot bootz)
       kernel-arm32 = pkgs.pkgsCross.armv7l-hf-multiplatform.callPackage ./arm32 { };
       # Luckfox Pico (RV1103/RV1106) and QEMU's virt Cortex-A7, fixed at build time

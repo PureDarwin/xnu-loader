@@ -29,18 +29,24 @@
  *   [0x2800000, 0x2820000)   boot-info block (boot_args/tables/DT/memmap)
  *   [0x3200000, va_cursor)   runtime-services VA pack; physfree = round_up(va_cursor)
  */
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__riscv)
 extern EFI_PHYSICAL_ADDRESS g_xnu_bootinfo_base;
 #define XNU_BOOTINFO_BASE       g_xnu_bootinfo_base
 #else
 #define XNU_BOOTINFO_BASE       0x2800000ULL   /* 2MB-aligned, above KC image  */
 #endif
-#if defined(XNU_LOADER_PLATFORM_SUN50I)
+#if defined(__riscv)
+// riscv64 xnu runs on 4k pages
+#define XNU_BOOTINFO_ALIGN      0x1000ULL
+#define XNU_L2_BLOCK_SIZE       0x200000ULL
+#else
+#if defined(XNU_LOADER_PLATFORM_SUN50I) || defined(XNU_LOADER_PLATFORM_SG2002)
 #define XNU_BOOTINFO_ALIGN      0x1000ULL
 #define XNU_L2_BLOCK_SIZE       0x200000ULL
 #else
 #define XNU_BOOTINFO_ALIGN      0x4000ULL
 #define XNU_L2_BLOCK_SIZE       0x2000000ULL
+#endif
 #endif
 
 #define XNU_BOOTARGS_PHYS       (XNU_BOOTINFO_BASE + 0x00000) /* 1 page       */
@@ -50,8 +56,13 @@ extern EFI_PHYSICAL_ADDRESS g_xnu_bootinfo_base;
  * the trustcache page and the memory map rather than growing in place, so
  * XNU_ARM64_BOOTARGS_PHYS and XNU_TRUSTCACHE_PHYS keep their addresses. */
 #define XNU_DEVTREE_PHYS        (XNU_BOOTINFO_BASE + 0x06000) /* 8 pages      */
+#if defined(__riscv)
+// the whole fdt is carried over, so the tree runs up to the end of the block
+#define XNU_DEVTREE_PAGES       24
+#else
 #define XNU_DEVTREE_PAGES       8
-#if defined(__aarch64__)
+#endif
+#if defined(__aarch64__) || defined(__riscv)
 #define XNU_ARM64_BOOTARGS_PHYS (XNU_BOOTINFO_BASE + 0x04000) /* 1 page       */
 #endif
 #define XNU_TRUSTCACHE_PHYS     (XNU_BOOTINFO_BASE + 0x05000) /* 1 page       */
@@ -101,6 +112,15 @@ typedef struct AppContext {
 #if defined(__aarch64__)
   /* Release XNU expects the trust-cache EXTRADATA range below the KC. */
   EFI_PHYSICAL_ADDRESS trustcache_phys;
+#endif
+#if defined(__riscv)
+  // the ram bank holding the kernel, and the fdt copy placed next to the kernel
+  UINT64 dram_base;
+  UINT64 dram_size;
+  EFI_PHYSICAL_ADDRESS fdt_copy_phys;
+  UINT64 fdt_copy_size;
+  // from RISCV_EFI_BOOT_PROTOCOL, the kernel gets it in a1
+  UINT64 boot_hartid;
 #endif
 } AppContext;
 

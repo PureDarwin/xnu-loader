@@ -83,6 +83,38 @@ void efiemu_arm64_exception(UINT64 slot, UINT64 *regs) {
   for (;;)
     __asm__ volatile("msr daifset, #0xf; wfi");
 }
+#elif defined(__riscv)
+extern const UINT8 efiemu_riscv64_trap[];
+
+void efiemu_exceptions_install(void) {
+  __asm__ volatile("csrw stvec, %0" : : "r"(efiemu_riscv64_trap));
+}
+
+static void report(const char *name, UINT64 value) {
+  efiemu_debug_string(name);
+  efiemu_debug_hex(value);
+  efiemu_debug_string("\n");
+}
+
+// called from the trap stub with x0..x31 saved, regs[2] is the sp at the trap
+void efiemu_riscv64_exception(UINT64 *regs) {
+  UINT64 scause, sepc, stval, sstatus;
+  __asm__ volatile("csrr %0, scause" : "=r"(scause));
+  __asm__ volatile("csrr %0, sepc" : "=r"(sepc));
+  __asm__ volatile("csrr %0, stval" : "=r"(stval));
+  __asm__ volatile("csrr %0, sstatus" : "=r"(sstatus));
+  efiemu_debug_string("\nefi-emulation: CPU exception\n");
+  report("  scause  ", scause);
+  report("  sepc    ", sepc);
+  report("  stval   ", stval);
+  report("  sstatus ", sstatus);
+  report("  ra      ", regs[1]);
+  report("  sp      ", regs[2]);
+  report("  a0      ", regs[10]);
+  report("  a1      ", regs[11]);
+  for (;;)
+    __asm__ volatile("csrw sie, zero; wfi");
+}
 #else
 void efiemu_exceptions_install(void) {
   for (UINTN i = 0; i < 32; ++i) {

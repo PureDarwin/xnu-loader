@@ -1,10 +1,15 @@
 /* arm64 Linux Image entry (Documentation/arch/arm64/booting.rst): x0 = FDT,
  * MMU off, at EL2 or EL1, anywhere 2 MiB-aligned. Drops to EL1, relocates the
  * position-independent image, then kernel_arm64_main builds an identity map. */
+#if defined(XNU_LOADER_PLATFORM_SUN50I) || defined(XNU_LOADER_PLATFORM_SG2002)
+/* Early progress on UART0 (DW 16550), already set up by the boot loader */
 #ifdef XNU_LOADER_PLATFORM_SUN50I
-/* Early progress on UART0 (DW 16550 at 0x05000000), already set up by the boot loader */
+#define MARK_UART 0x05000000
+#else
+#define MARK_UART 0x04140000
+#endif
 .macro mark c
-  mov x9, #0x05000000
+  ldr x9, =MARK_UART
   mov w10, #\c
   str w10, [x9]
 .endm

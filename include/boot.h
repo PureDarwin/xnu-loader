@@ -149,7 +149,8 @@ typedef struct boot_args {
   uint32_t __reserved4[692];
 } boot_args;
 
-#if defined(__aarch64__)
+// riscv64 boot_args has this same layout (pexpert/pexpert/riscv/boot.h)
+#if defined(__aarch64__) || defined(__riscv)
 /* pexpert/arm64/boot.h's real Boot_Video: six plain unsigned longs, in
  * this exact order (baseAddr first) - NOT the same struct as the
  * extended x86 Boot_Video above (different field order, extra
@@ -241,7 +242,7 @@ typedef struct boot_video_info {
 } boot_video_info;
 
 EFI_STATUS boot_fill_video(AppContext *ctx, boot_args *args);
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__riscv)
 EFI_STATUS arm64_boot_fill_video(AppContext *ctx, arm64_boot_args *args);
 #endif
 
