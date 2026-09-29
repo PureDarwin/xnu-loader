@@ -5,12 +5,17 @@
 	.arm
 	.arch armv7-a
 	.arch_extension virt
-	/* On the 'go' path (r7 = argc 1..15), put one character on the RV1103 UART (0xff4c0000,
-	 * left set up by U-Boot) so a hang shows how far entry got. Clobbers r0, r1 */
+	/* On the 'go' path (r7 = argc 1..15), put one character on the board's UART (left set
+	 * up by U-Boot) so a hang shows how far entry got. Clobbers r0, r1 */
+#if defined(XNU_LOADER_PLATFORM_RK3506)
+#define GO_UART	0xff0a0000	// lyra uart0
+#else
+#define GO_UART	0xff4c0000	// pico uart2
+#endif
 	.macro	mark c
 	sub	r0, r7, #1
 	cmp	r0, #15
-	ldrlo	r0, =0xff4c0000
+	ldrlo	r0, =GO_UART
 	movlo	r1, #\c
 	strlo	r1, [r0]
 	.endm

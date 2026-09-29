@@ -75,7 +75,30 @@ static EFI_STATUS load_ramdisk(AppContext *ctx) {
     return EFI_SUCCESS;
   }
 
+#if defined(__aarch64__)
+  // arm64 xnu hands everything above topOfKernelData to the vm, so keep the ramdisk
+  // right after the boot-info block where topOfKernelData can cover it like iboot does
+  {
+    UINTN pages = (image.size + EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT;
+    for (EFI_PHYSICAL_ADDRESS at = XNU_BOOTINFO_END;
+         at < XNU_BOOTINFO_END + 64ULL * XNU_L2_BLOCK_SIZE;
+         at = (at + XNU_L2_BLOCK_SIZE) & ~(XNU_L2_BLOCK_SIZE - 1)) {
+      EFI_PHYSICAL_ADDRESS try_at = at;
+      if (!EFI_ERROR(uefi_call_wrapper(ctx->bs->AllocatePages, 4,
+              AllocateAddress, EfiLoaderData, pages, &try_at))) {
+        storage.ptr = (VOID *)(UINTN)try_at;
+        storage.phys = try_at;
+        storage.size = image.size;
+        storage.pages = pages;
+        break;
+      }
+    }
+  }
+  status = storage.ptr ? EFI_SUCCESS
+                       : lowmem_alloc_pages(ctx, image.size, EfiLoaderData, &storage);
+#else
   status = lowmem_alloc_pages(ctx, image.size, EfiLoaderData, &storage);
+#endif
   if (EFI_ERROR(status)) {
     file_free(ctx, &image);
     log_error(L"failed to allocate RAMDisk pages: %r\r\n", status);
@@ -654,6 +677,12 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
       arm64_args->memSize = arm64_physical_mem_size;
     }
     arm64_args->memSizeActual = arm64_physical_mem_size;
+    // a ramdisk above the boot-info block must stay out of the vm's free pages
+    if (ctx.ramdisk_size != 0 && ctx.ramdisk_phys >= XNU_BOOTINFO_END &&
+        ctx.ramdisk_phys + ctx.ramdisk_size <= arm64_phys_base + arm64_physical_mem_size) {
+      arm64_args->topOfKernelData =
+          (ctx.ramdisk_phys + ctx.ramdisk_size + XNU_BOOTINFO_ALIGN - 1) & ~(XNU_BOOTINFO_ALIGN - 1);
+    }
   }
 #endif
 

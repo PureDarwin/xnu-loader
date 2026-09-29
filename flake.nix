@@ -58,6 +58,10 @@
       arm32-virt = pkgs.pkgsCross.armv7l-hf-multiplatform.callPackage ./arm32 {
         platform = "qemuvirt";
       };
+      # luckfox lyra (rk3506)
+      arm32-rk3506 = pkgs.pkgsCross.armv7l-hf-multiplatform.callPackage ./arm32 {
+        platform = "rk3506";
+      };
       # The loader as a Multiboot2 ELF kernel (GRUB etc.).
       kernel-multiboot2 = pkgs.callPackage ./kernel { };
       kernel-grub-bios = pkgs.callPackage ./kernel/grub-bios.nix {

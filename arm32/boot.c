@@ -3,18 +3,75 @@
 
 void boot32_jump(uint32_t entry, uint32_t boot_args) __attribute__((noreturn));
 
-/* Console: QEMU virt's PL011 unless the FDT names a Rockchip RV1103/RV1106, whose UART2
+/* Console: QEMU virt's PL011 unless the FDT names a Rockchip board, whose console UART
  * is a DesignWare 8250 with 4-byte registers (THR +0x00, LSR +0x14) */
 static volatile uint32_t *uart = (volatile uint32_t *)0x09000000;
-/* XNU_LOADER_PLATFORM_RV1106 / _QEMUVIRT fix the board at build time; without either the
- * FDT's root compatible decides */
-#if defined(XNU_LOADER_PLATFORM_RV1106) && defined(XNU_LOADER_PLATFORM_QEMUVIRT)
+
+// rockchip boards: console, watchdog, ram when u-boot's fdt has no memory node, identity
+struct board {
+  const char *fdt_compat, *name, *dt_compat, *model;
+  uint32_t uart, wdt, cru_glb_rst, ram_size;
+  // the gic distributor, when the kernel may run smp from a secure boot
+  uint32_t gicd;
+  // cru gate and reset registers holding the watchdog's clocks, and its bits in both
+  uint32_t wdt_gate, wdt_srst, wdt_bits;
+};
+static const struct board board_rv1106_info = {
+  "rockchip,rv110", "Rockchip RV1106/RV1103", "puredarwin,rv1103", "Luckfox Pico (RV1103)",
+  0xff4c0000, 0xff5a0000, 0xff3b0000 + 0xc10, 0x4000000, 0, 0, 0, 0,
+};
+// wdt0, clocked and out of reset through CRU_GATE_CON06 and CRU_SOFTRST_CON06 bits 9 and 10
+static const struct board board_rk3506_info = {
+  "rockchip,rk3506", "Rockchip RK3506", "puredarwin,rk3506", "Luckfox Lyra (RK3506)",
+  0xff0a0000, 0xff260000, 0xff9a0000 + 0xc10, 0x8000000, 0xff581000,
+  0xff9a0818, 0xff9a0a18, (1u << 9) | (1u << 10),
+};
+
+// cntvoff is unknown out of reset and only monitor mode with scr.ns set can write it; the
+// kernel's cores all read the virtual counter, so zero it here and in the kernel's core pen
+static void zero_cntvoff(void) {
+  __asm__ volatile("cps #0x16\n\t"
+                   "mrc p15, 0, r1, c1, c1, 0\n\t"
+                   "orr r1, r1, #1\n\t"
+                   "mcr p15, 0, r1, c1, c1, 0\n\t"
+                   "isb\n\t"
+                   "mov r0, #0\n\t"
+                   "mov r2, #0\n\t"
+                   "mcrr p15, 4, r0, r2, c14\n\t"
+                   "bic r1, r1, #1\n\t"
+                   "mcr p15, 0, r1, c1, c1, 0\n\t"
+                   "isb\n\t"
+                   "cps #0x13"
+                   ::: "r0", "r1", "r2", "memory");
+}
+
+// a group register that takes a write means we run secure, as rockchip's usb boot leaves us
+static int gic_secure(uint32_t gicd) {
+  volatile uint32_t *igroupr0 = (volatile uint32_t *)(gicd + 0x80);
+  uint32_t was = *igroupr0;
+  int secure;
+
+  *igroupr0 = ~0u;
+  secure = *igroupr0 != 0;
+  *igroupr0 = was;
+  return secure;
+}
+
+// XNU_LOADER_PLATFORM_{RV1106,RK3506,QEMUVIRT} fix the board at build time
+// without one the fdt's root compatible decides
+#if (defined(XNU_LOADER_PLATFORM_RV1106) + defined(XNU_LOADER_PLATFORM_RK3506) + \
+     defined(XNU_LOADER_PLATFORM_QEMUVIRT)) > 1
 #error "at most one XNU_LOADER_PLATFORM_* for arm32"
 #endif
 #if defined(XNU_LOADER_PLATFORM_RV1106)
-static int uart_8250, board_rv1106 = 1;
+static int uart_8250;
+static const struct board *board = &board_rv1106_info;
+#elif defined(XNU_LOADER_PLATFORM_RK3506)
+static int uart_8250;
+static const struct board *board = &board_rk3506_info;
 #else
-static int uart_8250, board_rv1106;
+static int uart_8250;
+static const struct board *board;
 #endif
 
 static void putc(char c) {
@@ -56,7 +113,7 @@ void *memset(void *d, int c, size_t n) {
   return d;
 }
 /* Copies run upwards (the ramdisk slides down over itself), a word at a time when both
-   sides allow it, and restart the RV1106 watchdog so large images finish in time */
+   sides allow it, and restart the board's watchdog so large images finish in time */
 void *memcpy(void *d, const void *s, size_t n) {
   uint8_t *p = d;
   const uint8_t *q = s;
@@ -66,8 +123,8 @@ void *memcpy(void *d, const void *s, size_t n) {
       p += 4;
       q += 4;
       n -= 4;
-      if (board_rv1106 && ((uintptr_t)p & 0xfffff) == 0)
-        ((volatile uint32_t *)0xff5a0000)[3] = 0x76;
+      if (board && board->wdt && ((uintptr_t)p & 0xfffff) == 0)
+        ((volatile uint32_t *)board->wdt)[3] = 0x76;
     }
   }
   while (n--)
@@ -124,12 +181,16 @@ static uint32_t ram_base, ram_size, initrd_start, initrd_end;
 static char cmdline[256];
 static const uint8_t *fdt_seed;
 static uint32_t fdt_seed_len;
+// the fdt's cpu nodes, by their reg (mpidr affinity), for xnu's /cpus
+#define MAX_FDT_CPUS 4
+static uint32_t cpu_reg[MAX_FDT_CPUS], ncpus;
 
 static void parse_fdt(const uint8_t *h) {
   const uint8_t *st = h + be32(h + 8);
   const char *strings = (const char *)(h + be32(h + 12));
   uint32_t ac = 2, sc = 1, depth = 0;
-  enum { OTHER, MEMORY, CHOSEN } kind = OTHER;
+  enum { OTHER, MEMORY, CHOSEN, CPUS } kind = OTHER;
+  int in_cpu = 0;
 
   for (;;) {
     uint32_t tok = be32(st);
@@ -138,8 +199,13 @@ static void parse_fdt(const uint8_t *h) {
       const char *name = (const char *)st;
       st += (strlen(name) + 4) & ~3u;
       if (++depth == 2)
-        kind = nameis(name, "memory") ? MEMORY : nameis(name, "chosen") ? CHOSEN : OTHER;
+        kind = nameis(name, "memory") ? MEMORY : nameis(name, "chosen") ? CHOSEN :
+               nameis(name, "cpus") ? CPUS : OTHER;
+      else if (depth == 3 && kind == CPUS)
+        in_cpu = nameis(name, "cpu");
     } else if (tok == 2) {
+      if (depth == 3)
+        in_cpu = 0;
       if (depth-- == 2)
         kind = OTHER;
     } else if (tok == 3) {
@@ -148,12 +214,14 @@ static void parse_fdt(const uint8_t *h) {
       const uint8_t *v = st + 8;
       st += 8 + ((len + 3) & ~3u);
       if (depth == 1 && streq(pn, "compatible")) {
-        for (uint32_t i = 0; i < len; i += strlen((const char *)v + i) + 1)
-          if (strhas((const char *)v + i, "rockchip,rv110")) {
+        for (uint32_t i = 0; i < len; i += strlen((const char *)v + i) + 1) {
 #if !defined(XNU_LOADER_PLATFORM_QEMUVIRT)
-            board_rv1106 = 1;
+          if (!board && strhas((const char *)v + i, board_rv1106_info.fdt_compat))
+            board = &board_rv1106_info;
+          else if (!board && strhas((const char *)v + i, board_rk3506_info.fdt_compat))
+            board = &board_rk3506_info;
 #endif
-          }
+        }
       } else if (depth == 1 && streq(pn, "#address-cells"))
         ac = be32(v);
       else if (depth == 1 && streq(pn, "#size-cells"))
@@ -161,6 +229,8 @@ static void parse_fdt(const uint8_t *h) {
       else if (depth == 2 && kind == MEMORY && streq(pn, "reg") && !ram_size) {
         ram_base = (uint32_t)cells(v, ac);
         ram_size = (uint32_t)cells(v + 4 * ac, sc);
+      } else if (depth == 3 && in_cpu && streq(pn, "reg") && len >= 4 && ncpus < MAX_FDT_CPUS) {
+        cpu_reg[ncpus++] = be32(v + len - 4);
       } else if (depth == 2 && kind == CHOSEN && streq(pn, "bootargs")) {
         uint32_t n = len < sizeof(cmdline) ? len : sizeof(cmdline) - 1;
         memcpy(cmdline, v, n);
@@ -302,11 +372,15 @@ static uint32_t parse_hex(const char *s) {
 /* bootz: r2 = FDT. U-Boot 'go ADDR FDT [INITRD SIZE]': argc, argv, hex strings */
 void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
   uint32_t go_initrd = 0, go_initrd_size = 0;
-  if (argc >= 1 && argc < 16 && argv != 0 && (uint32_t)argv < 0x04000000) {
+  // only a rockchip u-boot enters through 'go', the pico's unless the build names one
+  const struct board *go_board = board ? board : &board_rv1106_info;
+  uint32_t go_ram_top = go_board->ram_size;
+  if (argc >= 1 && argc < 16 && argv != 0 && (uint32_t)argv < go_ram_top) {
     uint32_t i, nplain = 0;
 
-    /* Only this board's U-Boot enters through 'go': talk on its UART before parsing anything */
-    uart = (volatile uint32_t *)0xff4c0000;
+    // talk on its uart before parsing anything
+    board = go_board;
+    uart = (volatile uint32_t *)board->uart;
     uart_8250 = 1;
     puts("\nboot32: entered via go\n");
     fdt = 0;
@@ -314,7 +388,7 @@ void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
       uint32_t v = parse_hex(argv[i]);
 
       puts("boot32: argv["); puthex(i); puts("] = "); puts(argv[i]); puts("\n");
-      if (fdt == 0 && v != 0 && v < 0x04000000 && (v & 3) == 0 && be32((const uint8_t *)v) == 0xd00dfeed) {
+      if (fdt == 0 && v != 0 && v < go_ram_top && (v & 3) == 0 && be32((const uint8_t *)v) == 0xd00dfeed) {
         fdt = v;
       } else if (nplain == 0) {
         go_initrd = v;
@@ -326,7 +400,7 @@ void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
     }
     /* No FDT argument (an empty ${fdtcontroladdr}): U-Boot keeps its control FDT next to
      * its relocated self at the top of RAM, so take the first sane header up there */
-    for (i = 0x03000000; fdt == 0 && i < 0x04000000; i += 8) {
+    for (i = go_ram_top - 0x01000000; fdt == 0 && i < go_ram_top; i += 8) {
       const uint8_t *h = (const uint8_t *)i;
 
       if (be32(h) == 0xd00dfeed && be32(h + 4) >= 0x40 && be32(h + 4) < 0x100000 &&
@@ -342,23 +416,35 @@ void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
     halt("no device tree in r2");
   }
   parse_fdt((const uint8_t *)fdt);
-  if (board_rv1106) {
-    uart = (volatile uint32_t *)0xff4c0000; /* U-Boot left it configured at 115200 */
+  if (board) {
+    uart = (volatile uint32_t *)board->uart; // u-boot left it configured
     uart_8250 = 1;
   } else if (!uart_8250) {
     uart[12] |= 0x301; /* PL011 CR: UARTEN, TXE, RXE (U-Boot leaves it on; QEMU does not) */
   }
   puts("\nboot32: xnu arm32 shim\n");
-  if (board_rv1106)
-    puts("boot32: board Rockchip RV1106/RV1103\n");
-  if (board_rv1106 && !strhas(cmdline, "pdnowdt")) {
-    volatile uint32_t *wdt = (volatile uint32_t *)0xff5a0000;
+  if (board) {
+    puts("boot32: board ");
+    puts(board->name);
+    puts("\n");
+  }
+  if (board && board->wdt && !strhas(cmdline, "pdnowdt")) {
+    volatile uint32_t *wdt = (volatile uint32_t *)board->wdt;
+    if (board->wdt_gate) {
+      // rockchip hiword masks: clocks on, reset released
+      *(volatile uint32_t *)board->wdt_gate = board->wdt_bits << 16;
+      *(volatile uint32_t *)board->wdt_srst = board->wdt_bits << 16;
+    }
     wdt[1] = 0xff;  /* TORR: TOP and TOP_INIT = 15 */
     wdt[3] = 0x76;  /* CRR: restart the count */
     wdt[0] = 0x1;   /* CR: enable, reset on expiry */
     /* CRU_GLB_RST_CON: let the watchdog trigger the first global reset, leaving the PMU alone */
-    ((volatile uint32_t *)0xff3b0000)[0xc10 / 4] = (1u << 11) | (1u << 6) | (1u << 3);
+    *(volatile uint32_t *)board->cru_glb_rst = (1u << 11) | (1u << 6) | (1u << 3);
     puts("boot32: watchdog armed\n");
+  }
+  if (board && board->gicd && gic_secure(board->gicd)) {
+    zero_cntvoff();
+    puts("boot32: secure, cntvoff zeroed\n");
   }
   if (go_initrd) {
     initrd_start = go_initrd;
@@ -368,16 +454,18 @@ void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
   if (!initrd_start) {
     extern char _start[];
     const uint8_t *p = (const uint8_t *)_start + 0x10000;
-    uint32_t n = cpio_extent(p, 0x2000000);
+    // it may run up to the end of ram when the fdt gave its size
+    uint32_t lim = ram_size ? ram_base + ram_size - (uint32_t)p : 0x2000000;
+    uint32_t n = cpio_extent(p, lim);
     if (n) {
       initrd_start = (uint32_t)p;
       initrd_end = initrd_start + n;
       puts("boot32: cpio after the image\n");
     }
   }
-  if (!ram_size && board_rv1106) {
-    ram_base = 0; /* U-Boot's own FDT has no memory node: the SoC's 64 MB at 0 */
-    ram_size = 0x4000000;
+  if (!ram_size && board) {
+    ram_base = 0; // u-boot's own fdt has no memory node, use the board's ram at 0
+    ram_size = board->ram_size;
   }
   puts("boot32: RAM ");
   puthex(ram_base);
@@ -392,6 +480,14 @@ void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
   uint32_t ksize = 0, asize = 0;
   const uint8_t *k = cpio_find("EFI/BOOT/kernel", &ksize);
   const uint8_t *a = cpio_find("EFI/BOOT/boot-args.txt", &asize);
+  // keep the boot args before the ramdisk slides down over the cpio
+  static char args_copy[256];
+  if (a) {
+    if (asize > sizeof(args_copy))
+      asize = sizeof(args_copy);
+    memcpy(args_copy, a, asize);
+    a = (const uint8_t *)args_copy;
+  }
   if (!k)
     halt("EFI/BOOT/kernel not in the initrd");
   if (rd32(k) != 0xfeedface || rd32(k + 4) != 12)
@@ -399,7 +495,7 @@ void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
 
   /* The kernel owns [physBase, RAM end): keep it clear of the shim and initrd. Its page
      tables need a 4 MB (ARM_TT_L1_PT_SIZE) boundary; 64 MB boards cannot spare 32 */
-  uint32_t phys_base = ALIGN(initrd_end, board_rv1106 ? 0x400000u : 0x2000000u);
+  uint32_t phys_base = ALIGN(initrd_end, board ? 0x400000u : 0x2000000u);
   uint32_t ncmds = rd32(k + 16), entry = 0, top = 0;
   const uint8_t *lc = k + 28;
 
@@ -407,7 +503,7 @@ void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
      put the kernel below it and slide the ramdisk down (copies run upwards) */
   uint32_t rsize = 0;
   const uint8_t *rd = cpio_find("EFI/BOOT/ramdisk.img", &rsize);
-  if (board_rv1106 && rd) {
+  if (board && rd) {
     uint32_t span = 0;
     for (uint32_t i = 0; i < ncmds; ++i, lc += rd32(lc + 4))
       if (rd32(lc) == 1 && rd32(lc + 28) && rd32(lc + 24) >= VIRT_BASE &&
@@ -466,8 +562,8 @@ void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
   /* root: chosen (dram-base/size, memory-map), cpus (cpu0), defaults, options */
   dt_node(&b, 4, 4);
   dt_str(&b, "name", "device-tree");
-  dt_str(&b, "compatible", board_rv1106 ? "puredarwin,rv1103" : "puredarwin,virt-a7");
-  dt_str(&b, "model", board_rv1106 ? "Luckfox Pico (RV1103)" : "QEMU virt Cortex-A7");
+  dt_str(&b, "compatible", board ? board->dt_compat : "puredarwin,virt-a7");
+  dt_str(&b, "model", board ? board->model : "QEMU virt Cortex-A7");
   dt_u32(&b, "#address-cells", 1);
   dt_node(&b, 4, 1);
   dt_str(&b, "name", "chosen");
@@ -482,13 +578,20 @@ void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
     uint32_t rdp[2] = { rd_phys, rsize };
     dt_prop(&b, "RAMDisk", rdp, sizeof(rdp));
   }
-  dt_node(&b, 1, 1);
+  // one node per fdt cpu, the boot cpu first as cpu0 and its reg the mpidr affinity
+  if (ncpus == 0)
+    cpu_reg[ncpus++] = 0;
+  dt_node(&b, 1, ncpus);
   dt_str(&b, "name", "cpus");
-  dt_node(&b, 4, 0);
-  dt_str(&b, "name", "cpu0");
-  dt_str(&b, "device_type", "cpu");
-  dt_u32(&b, "reg", 0);
-  dt_str(&b, "state", "running");
+  for (uint32_t i = 0; i < ncpus; i++) {
+    char name[] = "cpu0";
+    name[3] = (char)('0' + i);
+    dt_node(&b, 4, 0);
+    dt_str(&b, "name", name);
+    dt_str(&b, "device_type", "cpu");
+    dt_u32(&b, "reg", cpu_reg[i]);
+    dt_str(&b, "state", i == 0 ? "running" : "waiting");
+  }
   dt_node(&b, 1, 0);
   dt_str(&b, "name", "defaults");
   dt_node(&b, 1, 0);

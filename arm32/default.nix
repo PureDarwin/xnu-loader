@@ -1,10 +1,10 @@
 { stdenv
 , lib
-  # auto (the FDT decides), qemuvirt (virt Cortex-A7) or rv1106 (Luckfox Pico)
+  # auto (the FDT decides), qemuvirt (virt Cortex-A7), rv1106 (Luckfox Pico) or rk3506 (Luckfox Lyra)
 , platform ? "auto"
 }:
 
-assert platform == "auto" || platform == "qemuvirt" || platform == "rv1106";
+assert platform == "auto" || platform == "qemuvirt" || platform == "rv1106" || platform == "rk3506";
 
 # xnu arm32 boot shim as a Linux zImage: QEMU -kernel, U-Boot bootz. The
 # kernel Mach-O and boot-args.txt come from a newc cpio initrd.
