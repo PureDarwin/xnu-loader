@@ -1,6 +1,7 @@
 #include "app.h"
 #include "console.h"
 #include "serial.h"
+#include "platform.h"
 
 EFI_STATUS app_init(AppContext *ctx, EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   if (!st)
@@ -16,7 +17,12 @@ EFI_STATUS app_init(AppContext *ctx, EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
 
   InitializeLib(image, st);
 
-  /* Bring up COM3 @ 115200 before any logging so serial captures the full
+#if defined(__aarch64__) && defined(XNU_LOADER_PLATFORM_GENERIC)
+  // the console and the rest of the board come from the firmware's device tree, else the build's defaults
+  fdt_board_parse(fdt_board_find(st));
+#endif
+
+  /* Bring up the serial console before any logging so serial captures the full
    * boot on real hardware (where there is no EFI console to read). */
   serial_init();
 

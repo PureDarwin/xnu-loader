@@ -3,6 +3,7 @@
  * is built with -mstrict-align (Device memory faults on unaligned access). */
 #include "efi_emulation.h"
 #include "serial.h"
+#include "platform.h"
 
 #define FDT_MAGIC 0xd00dfeedU
 #define FDT_BEGIN_NODE 1
@@ -328,6 +329,9 @@ static void arm64_enable_mmu(void) {
 }
 
 void kernel_arm64_main(UINT64 fdt) {
+  // the console comes from the tree, so read the board before the first message
+  fdt_board_parse((CONST VOID *)(UINTN)fdt);
+  serial_init();
   serial_puts8((CONST CHAR8 *)"\nxnu-loader kernel: C entry\n");
   efiemu_exceptions_install();
   if (be32((CONST UINT8 *)(UINTN)fdt) != FDT_MAGIC) {

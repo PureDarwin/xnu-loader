@@ -1732,56 +1732,62 @@ EFI_STATUS dt_build(
 
   DeviceTreeNode *armio = dt_create_node(ctx);
   dt_prop_str(ctx, armio, "name", "arm-io");
-#if defined(XNU_LOADER_PLATFORM_QEMUVIRT)
-  dt_prop_str(ctx, armio, "device_type", "qemuvirt-io");
+#if defined(XNU_LOADER_PLATFORM_GENERIC)
+  /* Board drivers in the platform expert still key on this tag, so the boards they
+   * know keep theirs; anything else read from its device tree is "fdt-io". */
   {
-    UINT64 ranges[3] = { 0, 0x08000000ULL, 0x08000000ULL };
-    dt_prop(ctx, armio, "ranges", ranges, sizeof(ranges));
+    CONST CHAR8 *io_type = "fdt-io";
+    if (g_board.is_qemu_virt)
+      io_type = "qemuvirt-io";
+#if defined(XNU_LOADER_PLATFORM_SUN50I)
+    io_type = "sun50i-io";
+#elif defined(XNU_LOADER_PLATFORM_SG2002)
+    io_type = "sg2002-io";
+#endif
+    dt_prop_str(ctx, armio, "device_type", io_type);
   }
-  {
-    /* xnu 12377's serial_init picks a driver by matching "compatible" on the
-     * node named by /defaults serial-device, so the node needs both that
-     * string and a phandle to be reachable at all. */
-    DeviceTreeNode *uart0 = dt_create_node(ctx);
-    dt_prop_str(ctx, uart0, "name", "uart0");
-    dt_prop_str(ctx, uart0, "compatible", "arm,pl011");
-    dt_prop_u32(ctx, uart0, "AAPL,phandle", XNU_LOADER_UART0_PHANDLE);
-    UINT64 uart_reg[2] = { 0x01000000ULL, 0x1000ULL };
-    dt_prop(ctx, uart0, "reg", uart_reg, sizeof(uart_reg));
-    dt_add_child(ctx, armio, uart0);
-  }
-#elif defined(XNU_LOADER_A53_4K)
-  dt_prop_str(ctx, armio, "device_type", A53_SOC_IO_TYPE);
   {
     /* Peripheral window. XNU's pe_arm_get_soc_base_phys() returns the second
      * cell, and the reg offsets below are relative to it. */
-    UINT64 ranges[3] = { 0, A53_SOC_BASE, A53_SOC_SIZE };
+    UINT64 ranges[3] = { 0, g_board.soc_base, g_board.soc_size };
     dt_prop(ctx, armio, "ranges", ranges, sizeof(ranges));
   }
-  {
-    /* Matched by pe_serial.c's DesignWare APB UART driver. reg-shift,
-     * clock-frequency and current-speed are stated explicitly rather than
-     * relying on that driver's defaults. */
+  if (g_board.uart_kind != FDT_UART_NONE) {
+    /* xnu 12377's serial_init picks a driver by matching "compatible" on the
+     * node named by /defaults serial-device, so the node needs both that
+     * string and a phandle to be reachable at all. Every 16550 goes to
+     * pe_serial.c's DesignWare driver, with its layout and clock spelled out. */
     DeviceTreeNode *uart0 = dt_create_node(ctx);
+    UINT64 uart_reg[2] = { g_board.uart_base - g_board.soc_base, g_board.uart_size };
     dt_prop_str(ctx, uart0, "name", "uart0");
-    dt_prop_str(ctx, uart0, "compatible", "snps,dw-apb-uart");
     dt_prop_u32(ctx, uart0, "AAPL,phandle", XNU_LOADER_UART0_PHANDLE);
-    UINT64 uart_reg[2] = { A53_UART0_OFFSET, A53_UART0_SIZE };
     dt_prop(ctx, uart0, "reg", uart_reg, sizeof(uart_reg));
-    dt_prop_u32(ctx, uart0, "reg-shift", A53_UART0_SHIFT);
-    dt_prop_u32(ctx, uart0, "clock-frequency", A53_UART0_CLOCK_HZ);
-    dt_prop_u32(ctx, uart0, "current-speed", A53_UART0_BAUD);
+    if (g_board.uart_kind == FDT_UART_PL011) {
+      dt_prop_str(ctx, uart0, "compatible", "arm,pl011");
+    } else {
+      dt_prop_str(ctx, uart0, "compatible", "snps,dw-apb-uart");
+      dt_prop_u32(ctx, uart0, "reg-shift", g_board.uart_shift);
+      dt_prop_u32(ctx, uart0, "reg-io-width", g_board.uart_width);
+      if (g_board.uart_clock)
+        dt_prop_u32(ctx, uart0, "clock-frequency", g_board.uart_clock);
+      dt_prop_u32(ctx, uart0, "current-speed", g_board.uart_baud);
+    }
     dt_add_child(ctx, armio, uart0);
   }
-  {
-    // the gic-400 the kernel drives itself, distributor then cpu interface
+  if (g_board.gic_version) {
+    /* gic-400: distributor then cpu interface. gic-v3: distributor then the
+     * redistributor region, walked per cpu by GICR_TYPER. */
     DeviceTreeNode *gic = dt_create_node(ctx);
+    UINT64 gic_reg[4] = { g_board.gicd_base - g_board.soc_base, g_board.gicd_size,
+                          g_board.gic2_base - g_board.soc_base, g_board.gic2_size };
     dt_prop_str(ctx, gic, "name", "gic");
-    dt_prop_str(ctx, gic, "compatible", "arm,gic-400");
-    UINT64 gic_reg[4] = { A53_GICD_OFFSET, 0x1000ULL, A53_GICC_OFFSET, 0x2000ULL };
+    dt_prop_str(ctx, gic, "compatible", g_board.gic_version == 3 ? "arm,gic-v3" : "arm,gic-400");
     dt_prop(ctx, gic, "reg", gic_reg, sizeof(gic_reg));
     dt_add_child(ctx, armio, gic);
   }
+  log_info(L"DT: board uart 0x%lx gic%u 0x%lx/0x%lx arm-io 0x%lx+0x%lx%s\r\n",
+           g_board.uart_base, g_board.gic_version, g_board.gicd_base, g_board.gic2_base,
+           g_board.soc_base, g_board.soc_size, g_board.from_fdt ? L" (from fdt)" : L"");
 #else
   dt_prop_str(ctx, armio, "device_type", "bcm2837-io");
   {
@@ -1790,15 +1796,16 @@ EFI_STATUS dt_build(
   }
 #endif
 
-#if defined(XNU_LOADER_PLATFORM_QEMUVIRT)
-  DeviceTreeNode *pci = dt_create_node(ctx);
-  dt_prop_str(ctx, pci, "name", "pci");
-  dt_prop_str(ctx, pci, "device_type", "pci");
-  dt_prop_str(ctx, pci, "compatible", "pci-host-ecam-generic");
-  dt_prop_u32(ctx, pci, "#address-cells", 3);
-  dt_prop_u32(ctx, pci, "#size-cells", 2);
-  {
+#if defined(XNU_LOADER_PLATFORM_GENERIC)
+  // only boards whose tree has a generic ecam host bridge, qemu virt's
+  DeviceTreeNode *pci = g_board.has_pci_ecam ? dt_create_node(ctx) : NULL;
+  if (pci) {
     UINT32 bus_range[2] = { 0, 255 };
+    dt_prop_str(ctx, pci, "name", "pci");
+    dt_prop_str(ctx, pci, "device_type", "pci");
+    dt_prop_str(ctx, pci, "compatible", "pci-host-ecam-generic");
+    dt_prop_u32(ctx, pci, "#address-cells", 3);
+    dt_prop_u32(ctx, pci, "#size-cells", 2);
     dt_prop(ctx, pci, "bus-range", bus_range, sizeof(bus_range));
   }
 #endif
@@ -1847,8 +1854,17 @@ EFI_STATUS dt_build(
 #if defined(__aarch64__)
   dt_add_child(ctx, root, cpus);
   dt_add_child(ctx, root, armio);
-#if defined(XNU_LOADER_PLATFORM_QEMUVIRT)
-  dt_add_child(ctx, root, pci);
+#if defined(XNU_LOADER_PLATFORM_GENERIC)
+  if (pci)
+    dt_add_child(ctx, root, pci);
+  if (g_board.psci_method) {
+    // how to reach psci firmware; an hvc with no el2 underneath is an undefined instruction
+    DeviceTreeNode *psci = dt_create_node(ctx);
+    dt_prop_str(ctx, psci, "name", "psci");
+    dt_prop_str(ctx, psci, "compatible", "arm,psci-1.0");
+    dt_prop_str(ctx, psci, "method", g_board.psci_method == 2 ? "smc" : "hvc");
+    dt_add_child(ctx, root, psci);
+  }
 #endif
 
   /*
@@ -1863,12 +1879,17 @@ EFI_STATUS dt_build(
   {
     DeviceTreeNode *defaults = dt_create_node(ctx);
     dt_prop_str(ctx, defaults, "name", "defaults");
+#if defined(XNU_LOADER_PLATFORM_GENERIC)
     /* kern.hv_vmm_present reads this; without it userland believes it is on
-     * bare metal and never takes its paravirtualised paths. */
-    dt_prop_u32(ctx, defaults, "vmm-present", 1);
-#if defined(XNU_LOADER_HAVE_DT_UART)
+     * bare metal and never takes its paravirtualised paths. A real board
+     * described by its own tree is bare metal. */
+    if (g_board.is_qemu_virt || !g_board.from_fdt)
+      dt_prop_u32(ctx, defaults, "vmm-present", 1);
     /* Without this serial_init() returns early and the kernel is silent. */
-    dt_prop_u32(ctx, defaults, "serial-device", XNU_LOADER_UART0_PHANDLE);
+    if (g_board.uart_kind != FDT_UART_NONE)
+      dt_prop_u32(ctx, defaults, "serial-device", XNU_LOADER_UART0_PHANDLE);
+#else
+    dt_prop_u32(ctx, defaults, "vmm-present", 1);
 #endif
     dt_add_child(ctx, root, defaults);
   }

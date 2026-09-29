@@ -82,101 +82,113 @@ static VOID serial_putc(CHAR8 c) {
   uart_putc(SERIAL_BASE, c);
 }
 
-#elif defined(__aarch64__) && defined(XNU_LOADER_PLATFORM_QEMUVIRT)
+#elif defined(__aarch64__) && defined(XNU_LOADER_PLATFORM_GENERIC)
 
-#define QEMUVIRT_UART_BASE 0x09000000ULL
-#define PL011_DR  (*(volatile UINT32 *)(QEMUVIRT_UART_BASE + 0x00))
-#define PL011_FR  (*(volatile UINT32 *)(QEMUVIRT_UART_BASE + 0x18))
+/* The console the device tree names (fdt_board.c): a PL011, or a 16550 in any
+ * of its register layouts - byte registers, or 32-bit ones on a 4-byte stride
+ * like the DesignWare APB UART on Allwinner and Sophgo parts. Firmware has it
+ * running already. A baud divisor it set is kept, since a vendor tree often
+ * gives no clock to compute a new one from. */
+/* pl011 has no reg-shift: its offsets are bytes */
+#define PL011_DR      0x00
+#define PL011_FR      0x18
 #define PL011_FR_TXFF (1U << 5)
 
-static VOID uart_putc(CHAR8 c) {
+#define UART_THR 0  /* tx holding      (DLAB=0) */
+#define UART_DLL 0  /* divisor low     (DLAB=1) */
+#define UART_IER 1  /* irq enable      (DLAB=0) */
+#define UART_DLH 1  /* divisor high    (DLAB=1) */
+#define UART_FCR 2  /* FIFO control    (write)  */
+#define UART_LCR 3  /* line control             */
+#define UART_LSR 5  /* line status              */
+#define UART_USR 31 /* DesignWare status (0x7c) */
+
+#define UART_LSR_THRE 0x20 /* transmit holding register empty */
+#define UART_LCR_8N1  0x03
+#define UART_LCR_DLAB 0x80
+#define UART_FCR_INIT 0x07 /* enable FIFOs, clear rx and tx    */
+
+static UINT32 uart_rd(UINT32 reg) {
+  UINT64 a = g_board.uart_base + ((UINT64)reg << g_board.uart_shift);
+  if (g_board.uart_width == 1)
+    return *(volatile UINT8 *)a;
+  return *(volatile UINT32 *)a;
+}
+
+static VOID uart_wr(UINT32 reg, UINT32 v) {
+  UINT64 a = g_board.uart_base + ((UINT64)reg << g_board.uart_shift);
+  if (g_board.uart_width == 1)
+    *(volatile UINT8 *)a = (UINT8)v;
+  else
+    *(volatile UINT32 *)a = v;
+}
+
+static BOOLEAN uart_is_dw(VOID) {
+  return g_board.uart_shift == 2 && g_board.uart_width == 4;
+}
+
+static VOID uart_drain(VOID) {
   UINT32 spins = 0;
-  while ((PL011_FR & PL011_FR_TXFF) != 0) {
-    if (++spins >= 100000u)
-      return;  /* bounded: see the x86 uart_putc comment */
-  }
-  PL011_DR = (UINT32)(UINT8)c;
-}
-
-VOID serial_init(VOID) {
-  /* QEMU's virt PL011 comes up already enabled by firmware/reset; just
-   * start using it directly. */
-  serial_ready = TRUE;
-}
-
-VOID serial_reinit(VOID) {
-  serial_ready = TRUE;
-}
-
-static VOID serial_putc(CHAR8 c) {
-  uart_putc(c);
-}
-
-#elif defined(__aarch64__) && defined(XNU_LOADER_A53_4K)
-
-/* H616/H618 and SG2002 UART0: a Synopsys DesignWare APB UART, 16550-compatible
- * but with 32-bit registers on a 4-byte stride, so register index N lives at
- * base + (N << 2). U-Boot leaves it running at 115200 8N1; serial_init()
- * reprograms it anyway so the loader does not depend on that. */
-#define A53_UART_REG(n) \
-  (*(volatile UINT32 *)(A53_UART0_BASE + ((UINT64)(n) << A53_UART0_SHIFT)))
-
-#define A53_UART_THR A53_UART_REG(0)  /* tx holding      (DLAB=0) */
-#define A53_UART_DLL A53_UART_REG(0)  /* divisor low     (DLAB=1) */
-#define A53_UART_IER A53_UART_REG(1)  /* irq enable      (DLAB=0) */
-#define A53_UART_DLH A53_UART_REG(1)  /* divisor high    (DLAB=1) */
-#define A53_UART_FCR A53_UART_REG(2)  /* FIFO control    (write)  */
-#define A53_UART_LCR A53_UART_REG(3)  /* line control             */
-#define A53_UART_LSR A53_UART_REG(5)  /* line status              */
-#define A53_UART_USR A53_UART_REG(31) /* DesignWare status (0x7c) */
-
-#define A53_UART_LSR_THRE 0x20 /* transmit holding register empty */
-#define A53_UART_LCR_8N1  0x03
-#define A53_UART_LCR_DLAB 0x80
-#define A53_UART_FCR_INIT 0x07 /* enable FIFOs, clear rx and tx    */
-
-static VOID uart_putc(CHAR8 c) {
-  UINT32 spins = 0;
-  while ((A53_UART_LSR & A53_UART_LSR_THRE) == 0) {
-    if (++spins >= 100000u)
-      return;  /* bounded: see the x86 uart_putc comment */
-  }
-  A53_UART_THR = (UINT32)(UINT8)c;
-}
-
-VOID serial_init(VOID) {
-  /* Round to nearest: 13.02 at 24MHz, 13.56 at 25MHz, for 115200. */
-  CONST UINT32 divisor = (A53_UART0_CLOCK_HZ + (8 * A53_UART0_BAUD)) /
-                         (16 * A53_UART0_BAUD);
-  UINT32 spins = 0;
-
-  A53_UART_IER = 0;
-  A53_UART_FCR = A53_UART_FCR_INIT;
-
-  /* A DesignWare UART discards LCR writes while it is busy, which would drop
-   * the divisor below and silently leave the port at whatever rate firmware
-   * set. Drain the transmitter, then clear any latched busy-detect via USR. */
-  while ((A53_UART_LSR & A53_UART_LSR_THRE) == 0) {
+  while ((uart_rd(UART_LSR) & UART_LSR_THRE) == 0) {
     if (++spins >= 100000u)
       break;
   }
-  (VOID)A53_UART_USR;
+  /* a DesignWare UART drops LCR writes while busy; reading USR clears a latched busy-detect */
+  if (uart_is_dw())
+    (VOID)uart_rd(UART_USR);
+}
 
-  A53_UART_LCR = A53_UART_LCR_DLAB;
-  A53_UART_DLL = divisor & 0xFF;
-  A53_UART_DLH = (divisor >> 8) & 0xFF;
-  A53_UART_LCR = A53_UART_LCR_8N1;
-  (VOID)A53_UART_USR;
+static VOID uart_16550_init(VOID) {
+  UINT32 lcr, divisor;
 
-  serial_ready = TRUE;
+  uart_wr(UART_IER, 0);
+  uart_wr(UART_FCR, UART_FCR_INIT);
+  uart_drain();
+
+  lcr = uart_rd(UART_LCR) & ~UART_LCR_DLAB;
+  uart_wr(UART_LCR, lcr | UART_LCR_DLAB);
+  divisor = (uart_rd(UART_DLL) & 0xFF) | (uart_rd(UART_DLH) & 0xFF) << 8;
+  if (divisor == 0 && g_board.uart_clock && g_board.uart_baud) {
+    /* round to nearest: 13.02 at 24MHz, 13.56 at 25MHz, for 115200 */
+    divisor = (g_board.uart_clock + 8 * g_board.uart_baud) / (16 * g_board.uart_baud);
+    uart_wr(UART_DLL, divisor & 0xFF);
+    uart_wr(UART_DLH, (divisor >> 8) & 0xFF);
+  }
+  uart_wr(UART_LCR, UART_LCR_8N1);
+  if (uart_is_dw())
+    (VOID)uart_rd(UART_USR);
+
+  /* no clock in the tree: report the one that gives firmware's divisor, so XNU's driver computes it again */
+  if (!g_board.uart_clock && divisor && g_board.uart_baud)
+    g_board.uart_clock = divisor * 16 * g_board.uart_baud;
+}
+
+VOID serial_init(VOID) {
+  if (g_board.uart_kind == FDT_UART_16550)
+    uart_16550_init();
+  serial_ready = g_board.uart_kind != FDT_UART_NONE;
 }
 
 VOID serial_reinit(VOID) {
-  serial_init();
+  serial_ready = g_board.uart_kind != FDT_UART_NONE;
 }
 
 static VOID serial_putc(CHAR8 c) {
-  uart_putc(c);
+  UINT32 spins = 0;
+
+  if (g_board.uart_kind == FDT_UART_PL011) {
+    while ((uart_rd(PL011_FR) & PL011_FR_TXFF) != 0) {
+      if (++spins >= 100000u)
+        return;  /* bounded: see the x86 uart_putc comment */
+    }
+    uart_wr(PL011_DR, (UINT32)(UINT8)c);
+    return;
+  }
+  while ((uart_rd(UART_LSR) & UART_LSR_THRE) == 0) {
+    if (++spins >= 100000u)
+      return;
+  }
+  uart_wr(UART_THR, (UINT32)(UINT8)c);
 }
 
 #elif defined(__aarch64__) && defined(XNU_LOADER_PLATFORM_BCM2837)

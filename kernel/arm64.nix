@@ -2,11 +2,14 @@
 , lib
 , gnu-efi
 , embeddedInitrd ? null
-  # aarch64 target machine, as in ../default.nix: bcm2837, qemuvirt, sun50i or sg2002
+  # aarch64 target machine, as in ../default.nix: bcm2837, generic, qemuvirt, sun50i or sg2002
 , platform ? "qemuvirt"
+  # generic boards: a 4k-page kernel, and a UART for the progress marks before the tree is read
+, kernel4k ? false
+, markUart ? null
 }:
 
-assert platform == "bcm2837" || platform == "qemuvirt" || platform == "sun50i" || platform == "sg2002";
+assert platform == "bcm2837" || platform == "generic" || platform == "qemuvirt" || platform == "sun50i" || platform == "sg2002";
 
 # xnu-loader as an arm64 Linux Image: U-Boot `booti`, QEMU `-kernel`, or any
 # loader that speaks Documentation/arch/arm64/booting.rst. Modules (the kernel
@@ -25,6 +28,7 @@ stdenv.mkDerivation {
     includes="-Iefi-emulation -Iinclude -Isrc -I${gnu-efi}/include -I${gnu-efi}/include/efi -I${gnu-efi}/include/efi/aarch64"
     includes="$includes -I${gnu-efi}/include/efi/protocol"
     defines="-DEFI_FUNCTION_WRAPPER -DCONFIG_aarch64 -DCONFIG_LOADER_aarch64 -DXNU_LOADER_PLATFORM_${lib.toUpper platform} -DLEGACY_BIOS"
+    defines="$defines ${lib.optionalString kernel4k "-DXNU_LOADER_KERNEL_4K"} ${lib.optionalString (markUart != null) "-DXNU_LOADER_MARK_UART=${markUart}"}"
 
     objects=""
     for source in kernel/entry/linux-arm64.S efi-emulation/exceptions-arm64.S src/jump.S; do
@@ -37,7 +41,8 @@ stdenv.mkDerivation {
     objects="$objects build/entry-embedded.S.o"
     # Runs with the MMU off, where unaligned accesses fault
     $CC -c kernel/arm64.c -o build/kernel-arm64.c.o $common -mstrict-align $defines $includes
-    objects="$objects build/kernel-arm64.c.o"
+    $CC -c src/fdt_board.c -o build/src-fdt_board.c.o $common -mstrict-align $defines $includes
+    objects="$objects build/kernel-arm64.c.o build/src-fdt_board.c.o"
     for source in kernel/cpio.c efi-emulation/exceptions.c efi-emulation/firmware.c \
       efi-emulation/modfs.c efi-emulation/storage.c \
       src/main.c src/app.c src/boot.c src/console.c src/devtree.c src/fileio.c \

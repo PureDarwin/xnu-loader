@@ -27,10 +27,6 @@
         arch = "aarch64";
         platform = "sun50i";
       };
-      # 32-bit UEFI on a 64-bit CPU: the EFI binary must be IA32 while the
-      # kernel it boots is x86_64. Built from the i686 package set so libgcc,
-      # gnu-efi and binutils are all 32-bit; a 64-bit toolchain has no 32-bit
-      # libgcc and its ld defaults to the wrong emulation.
       ia32 = pkgs.pkgsi686Linux.callPackage ./. {
         arch = "x86_64";
         loaderArch = "ia32";
@@ -44,6 +40,14 @@
       };
       kernel-arm64-sg2002 = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./kernel/arm64.nix {
         platform = "sg2002";
+      };
+      # any board whose device tree describes it, such as the orange pi zero 4 (a733) which marks on uart0
+      kernel-arm64-generic = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./kernel/arm64.nix {
+        platform = "generic";
+      };
+      kernel-arm64-a733 = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./kernel/arm64.nix {
+        platform = "generic";
+        markUart = "0x02500000";
       };
       # the loader as a riscv64 linux Image (opensbi, u-boot booti, qemu -kernel), clang and lld
       kernel-riscv64 = pkgs.callPackage ./kernel/riscv64.nix {

@@ -12,7 +12,7 @@
 }:
 
 assert arch == "x86_64" || arch == "aarch64";
-assert platform == "bcm2837" || platform == "qemuvirt" || platform == "sun50i" || platform == "sg2002";
+assert platform == "bcm2837" || platform == "generic" || platform == "qemuvirt" || platform == "sun50i" || platform == "sg2002";
 assert loaderArch == "x86_64" || loaderArch == "aarch64" || loaderArch == "ia32";
 # ia32 firmware is only ever paired with an x86_64 kernel.
 assert loaderArch != "ia32" || arch == "x86_64";

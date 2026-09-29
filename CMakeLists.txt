@@ -80,6 +80,7 @@ set(SOURCES
   src/boot.c
   src/console.c
   src/devtree.c
+  src/fdt_board.c
   src/fileio.c
   src/jump.S
   src/lowmem.c
@@ -129,13 +130,15 @@ endif()
 # at build time and surfaced to the sources as XNU_LOADER_PLATFORM_<NAME>.
 # Ignored for x86_64, which has no equivalent variation.
 set(XNU_LOADER_PLATFORM "bcm2837" CACHE STRING
-    "aarch64 target platform: bcm2837, qemuvirt, sun50i or sg2002")
-set_property(CACHE XNU_LOADER_PLATFORM PROPERTY STRINGS bcm2837 qemuvirt sun50i sg2002)
+    "aarch64 target platform: bcm2837, generic, qemuvirt, sun50i or sg2002")
+set_property(CACHE XNU_LOADER_PLATFORM PROPERTY STRINGS bcm2837 generic qemuvirt sun50i sg2002)
 
 set(XNU_LOADER_PLATFORM_DEFINES "")
 if(ARCH STREQUAL "aarch64")
   if(XNU_LOADER_PLATFORM STREQUAL "bcm2837")
     set(XNU_LOADER_PLATFORM_DEFINES XNU_LOADER_PLATFORM_BCM2837)
+  elseif(XNU_LOADER_PLATFORM STREQUAL "generic")
+    set(XNU_LOADER_PLATFORM_DEFINES XNU_LOADER_PLATFORM_GENERIC)
   elseif(XNU_LOADER_PLATFORM STREQUAL "qemuvirt")
     set(XNU_LOADER_PLATFORM_DEFINES XNU_LOADER_PLATFORM_QEMUVIRT)
   elseif(XNU_LOADER_PLATFORM STREQUAL "sun50i")
@@ -144,7 +147,7 @@ if(ARCH STREQUAL "aarch64")
     set(XNU_LOADER_PLATFORM_DEFINES XNU_LOADER_PLATFORM_SG2002)
   else()
     message(FATAL_ERROR
-      "XNU_LOADER_PLATFORM must be bcm2837, qemuvirt, sun50i or sg2002, "
+      "XNU_LOADER_PLATFORM must be bcm2837, generic, qemuvirt, sun50i or sg2002, "
       "got '${XNU_LOADER_PLATFORM}'")
   endif()
   message(STATUS "aarch64 platform: ${XNU_LOADER_PLATFORM}")

@@ -40,7 +40,8 @@ extern EFI_PHYSICAL_ADDRESS g_xnu_bootinfo_base;
 #define XNU_BOOTINFO_ALIGN      0x1000ULL
 #define XNU_L2_BLOCK_SIZE       0x200000ULL
 #else
-#if defined(XNU_LOADER_PLATFORM_SUN50I) || defined(XNU_LOADER_PLATFORM_SG2002)
+// 4k-page kernels: the cortex-a53 boards, or any generic board built with XNU_LOADER_KERNEL_4K
+#if defined(XNU_LOADER_KERNEL_4K) || defined(XNU_LOADER_PLATFORM_SUN50I) || defined(XNU_LOADER_PLATFORM_SG2002)
 #define XNU_BOOTINFO_ALIGN      0x1000ULL
 #define XNU_L2_BLOCK_SIZE       0x200000ULL
 #else
