@@ -37,11 +37,11 @@ EFI_STATUS dt_build(
     const CHAR8 *boot_args,
     UINT64 rt_table_phys);   /* physical addr of EFI_RUNTIME_SERVICES copy in conventional memory */
 
-#if defined(__riscv)
-// src/devtree-riscv64.c: the fdt's nodes in the kernel's format, cells as native words
-EFI_STATUS dt_riscv_import_fdt(AppContext *ctx, DeviceTreeNode *root, DeviceTreeNode *chosen);
+#if defined(__riscv) || defined(__aarch64__)
+// src/devtree-fdt.c: the fdt's nodes in the kernel's format, cells as native words
+EFI_STATUS dt_import_fdt(AppContext *ctx, DeviceTreeNode *root, DeviceTreeNode *chosen);
 BOOLEAN dt_riscv_fdt_is_qemu(AppContext *ctx);
-UINT32 dt_riscv_flat_size(DeviceTreeNode *node);
+UINT32 dt_flat_size(DeviceTreeNode *node);
 #endif
 
 #endif

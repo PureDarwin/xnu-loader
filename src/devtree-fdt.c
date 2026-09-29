@@ -1,7 +1,10 @@
-// the firmware fdt carried into the apple device tree the riscv64 kernel reads
-// every node and property comes over, cells become native words and a 2-cell value one u64
+// the firmware fdt carried into the apple device tree the kernel reads, cells become native
+// words and a 2-cell value one u64. riscv64 takes every node, arm64 the board's enabled devices
+// next to the nodes the loader builds itself
 #include "devtree.h"
 #include "console.h"
+
+#if defined(__riscv) || defined(__aarch64__)
 
 #define FDT_MAGIC 0xd00dfeedU
 #define FDT_BEGIN_NODE 1
@@ -24,6 +27,8 @@ typedef struct {
   BOOLEAN own_irq_parent, has_irq_ext, is_irq_controller, added_irq_parent;
   UINT32 irq_parent;
   BOOLEAN skip;
+  // status says the device is off, or the node is a pin controller whose children are pin groups
+  BOOLEAN disabled, is_pinctrl;
   // the first address in reg, a cpu node's hart id
   BOOLEAN have_reg;
   UINT64 reg;
@@ -251,6 +256,12 @@ static void scan_node(const UINT8 *st, const CHAR8 *strings, FdtLevel *lv, UINT3
       *phandle = be32(v);
     } else if (len == 4 && str_eq(pname, "#interrupt-cells")) {
       *icells = be32(v);
+    } else if (str_eq(pname, "status") && looks_like_strings(v, len)) {
+      lv->disabled = !str_eq((const CHAR8 *)v, "okay") && !str_eq((const CHAR8 *)v, "ok");
+    } else if (str_eq(pname, "compatible") && looks_like_strings(v, len)) {
+      for (UINT32 o = 0; o < len; o += (UINT32)str_len((const CHAR8 *)v + o) + 1)
+        if (str_suffix((const CHAR8 *)v + o, "-pinctrl") || str_suffix((const CHAR8 *)v + o, "-pio"))
+          lv->is_pinctrl = TRUE;
     }
     st += 12 + ((len + 3) & ~3U);
   }
@@ -332,7 +343,25 @@ static BOOLEAN node_is_cpu(DeviceTreeNode *node) {
   return FALSE;
 }
 
-EFI_STATUS dt_riscv_import_fdt(AppContext *ctx, DeviceTreeNode *root, DeviceTreeNode *chosen) {
+#if defined(__aarch64__)
+// nodes the arm64 loader builds itself or the kernel has no use for, and whatever is switched off.
+// a vendor tree is hundreds of kilobytes, most of it disabled devices and pin groups
+static BOOLEAN arm64_leave_out(UINT32 depth, const CHAR8 *name, FdtLevel *lv, FdtLevel *up) {
+  static const CHAR8 *const own[] = { "cpus", "psci", "memory", "reserved-memory", "aliases",
+                                      "__symbols__", "__fixups__", "__local_fixups__" };
+  if (lv->disabled || up->is_pinctrl)
+    return TRUE;
+  if (depth != 1)
+    return FALSE;
+  for (UINT32 i = 0; i < sizeof(own) / sizeof(own[0]); i++) {
+    if (str_eq(name, own[i]))
+      return TRUE;
+  }
+  return str_prefix(name, "memory@");
+}
+#endif
+
+EFI_STATUS dt_import_fdt(AppContext *ctx, DeviceTreeNode *root, DeviceTreeNode *chosen) {
   const UINT8 *h = find_fdt(ctx);
   if (!h) {
     log_error(L"DT: no flattened device tree from firmware\r\n");
@@ -375,6 +404,10 @@ EFI_STATUS dt_riscv_import_fdt(AppContext *ctx, DeviceTreeNode *root, DeviceTree
       } else if (up->skip || (depth == 1 && str_eq(name, "chosen"))) {
         // /chosen is the loader's own, only stdout-path comes over
         lv->skip = TRUE;
+#if defined(__aarch64__)
+      } else if (arm64_leave_out(depth, name, lv, up)) {
+        lv->skip = TRUE;
+#endif
       } else {
         lv->node = dt_create_node(ctx);
         if (!lv->node)
@@ -395,11 +428,13 @@ EFI_STATUS dt_riscv_import_fdt(AppContext *ctx, DeviceTreeNode *root, DeviceTree
       if (depth == 0)
         break;
       FdtLevel *lv = &levels[depth - 1];
+#if defined(__riscv)
       // the kernel takes the cpu marked running as the boot hart
       if (lv->node && lv->node != root && lv->have_reg && node_is_cpu(lv->node)) {
         add_str(ctx, lv->node, "state", lv->reg == ctx->boot_hartid ? "running" : "waiting");
         cpus++;
       }
+#endif
       depth--;
       if (depth == 0)
         break;
@@ -416,6 +451,11 @@ EFI_STATUS dt_riscv_import_fdt(AppContext *ctx, DeviceTreeNode *root, DeviceTree
           add_prop(ctx, chosen, "stdout-path", v, len);
         continue;
       }
+#if defined(__aarch64__)
+      // the root keeps the loader's compatible and model, the platform expert matches on them
+      if (depth == 1 && (str_eq(pname, "compatible") || str_eq(pname, "model")))
+        continue;
+#endif
       // a device's interrupts-extended outranks its interrupts and interrupt-parent
       BOOLEAN split = lv->has_irq_ext && !lv->is_irq_controller;
       if (split && str_eq(pname, "interrupts-extended") &&
@@ -437,8 +477,13 @@ EFI_STATUS dt_riscv_import_fdt(AppContext *ctx, DeviceTreeNode *root, DeviceTree
     }
   }
 
+#if defined(__riscv)
   log_info(L"DT: imported %u fdt nodes, %u cpus, boot hart %lu\r\n", nodes, cpus,
            ctx->boot_hartid);
+#else
+  (void)cpus;
+  log_info(L"DT: imported %u fdt nodes\r\n", nodes);
+#endif
   return EFI_SUCCESS;
 }
 
@@ -471,11 +516,13 @@ BOOLEAN dt_riscv_fdt_is_qemu(AppContext *ctx) {
   return FALSE;
 }
 
-UINT32 dt_riscv_flat_size(DeviceTreeNode *node) {
+UINT32 dt_flat_size(DeviceTreeNode *node) {
   UINT32 size = 8;
   for (UINT32 i = 0; i < node->nProperties; i++)
     size += DT_MAX_NAME + 4 + ((node->properties[i]->length + 3) & ~3U);
   for (UINT32 i = 0; i < node->nChildren; i++)
-    size += dt_riscv_flat_size(node->children[i]);
+    size += dt_flat_size(node->children[i]);
   return size;
 }
+
+#endif

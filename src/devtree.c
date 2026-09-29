@@ -1815,7 +1815,7 @@ EFI_STATUS dt_build(
   dt_prop_str(ctx, root, "name", "device-tree");
 #if defined(__riscv)
   // the board's own nodes, compatible and model come over from the fdt
-  status = dt_riscv_import_fdt(ctx, root, chosen);
+  status = dt_import_fdt(ctx, root, chosen);
   if (EFI_ERROR(status)) {
     uefi_call_wrapper(ctx->bs->FreePages, 2, dt_addr, XNU_DEVTREE_PAGES);
     return status;
@@ -1826,6 +1826,12 @@ EFI_STATUS dt_build(
    * driver cascade fails to start and XNU hangs waiting for the root device. */
   dt_prop_str(ctx, root, "compatible", "ACPI");
   dt_prop_str(ctx, root, "model", "ACPI");
+#if defined(__aarch64__) && defined(XNU_LOADER_PLATFORM_GENERIC)
+  /* A real board's enabled devices come over from its tree, so the platform
+   * expert can publish nubs for them. QEMU virt keeps the tree it always had. */
+  if (g_board.from_fdt && !g_board.is_qemu_virt)
+    dt_import_fdt(ctx, root, chosen);
+#endif
 #endif
   dt_add_child(ctx, root, chosen);
 
@@ -1907,10 +1913,10 @@ EFI_STATUS dt_build(
   dt_add_child(ctx, root, efi);
 
   log_info(L"DT: flattening into %lu-byte buffer\r\n", (UINT64)dt_size);
-#if defined(__riscv)
-  // measured first, a converted fdt can be larger than the arm64 trees
-  if (dt_riscv_flat_size(root) > dt_size) {
-    log_info(L"DT: tree needs %u bytes, more than %u\r\n", dt_riscv_flat_size(root), (UINT32)dt_size);
+#if defined(__riscv) || defined(__aarch64__)
+  // measured first, a converted fdt can be larger than the buffer
+  if (dt_flat_size(root) > dt_size) {
+    log_info(L"DT: tree needs %u bytes, more than %u\r\n", dt_flat_size(root), (UINT32)dt_size);
     uefi_call_wrapper(ctx->bs->FreePages, 2, dt_addr, XNU_DEVTREE_PAGES);
     return EFI_BUFFER_TOO_SMALL;
   }

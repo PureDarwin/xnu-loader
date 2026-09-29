@@ -81,6 +81,7 @@ set(SOURCES
   src/console.c
   src/devtree.c
   src/fdt_board.c
+  src/devtree-fdt.c
   src/fileio.c
   src/jump.S
   src/lowmem.c
