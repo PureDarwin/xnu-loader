@@ -52,6 +52,31 @@ static EFI_STATUS append_ramdisk_boot_arg(
   return EFI_SUCCESS;
 }
 
+#if defined(__aarch64__)
+// Apple's trust caches, merged and laid out as XNU reads them from /chosen/memory-map/TrustCache.
+// Without the file the loader keeps publishing an empty static module
+static VOID load_trustcache(AppContext *ctx) {
+  EFI_FILE_PROTOCOL *root = NULL;
+  FileBuffer file = {0};
+  EFI_STATUS status;
+
+  ctx->trustcache_slack = XNU_BOOTINFO_ALIGN;
+  status = app_open_self_volume(ctx, &root);
+  if (!EFI_ERROR(status)) {
+    status = file_read_all(ctx, root, L"\\trustcache.bin", &file);
+    uefi_call_wrapper(root->Close, 1, root);
+  }
+  if (EFI_ERROR(status) || file.size < 8) {
+    log_info(L"no trustcache.bin (%r); using an empty static trust cache\r\n", status);
+    return;
+  }
+  ctx->trustcache_data = file.data;
+  ctx->trustcache_size = file.size;
+  ctx->trustcache_slack = (file.size + XNU_BOOTINFO_ALIGN - 1) & ~(XNU_BOOTINFO_ALIGN - 1);
+  log_info(L"trustcache.bin: %lu bytes\r\n", (UINT64)file.size);
+}
+#endif
+
 static EFI_STATUS load_ramdisk(AppContext *ctx) {
   EFI_FILE_PROTOCOL *root = NULL;
   FileBuffer image = {0};
@@ -251,24 +276,25 @@ EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes, UINT64 virt_
 
   FindXnuWindow(ctx);
 
-  /* Start inside the window, leaving room below for the trustcache page */
+  /* Start inside the window, leaving room below for the trust caches */
+  UINT64 tc_slack = ctx->trustcache_slack ? ctx->trustcache_slack : XNU_BOOTINFO_ALIGN;
   if (g_xnu_window_lo > XNU_LOADER_RAM_BASE) {
-    UINT64 w = (g_xnu_window_lo + XNU_BOOTINFO_ALIGN + XNU_L2_BLOCK_SIZE - 1) & ~(XNU_L2_BLOCK_SIZE - 1);
+    UINT64 w = (g_xnu_window_lo + tc_slack + XNU_L2_BLOCK_SIZE - 1) & ~(XNU_L2_BLOCK_SIZE - 1);
     if (w + required_rem > first)
       first = w + required_rem;
   }
-  /* Two XNU_BOOTINFO_ALIGN slacks: one below base for the trustcache page,
+  /* Two slacks: one below base for the trust caches,
    * one above to keep the bootinfo block inside this allocation. */
   UINTN total_pages = (UINTN)((span_bytes +
                                (XNU_BOOTINFO_END - XNU_BOOTINFO_BASE) +
-                               2 * XNU_BOOTINFO_ALIGN +
+                               tc_slack + XNU_BOOTINFO_ALIGN +
                                EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT);
   EFI_PHYSICAL_ADDRESS base = 0;
   EFI_STATUS status = EFI_NOT_FOUND;
   for (UINT64 try = first; try < first + 64ULL * XNU_L2_BLOCK_SIZE; try += XNU_L2_BLOCK_SIZE) {
     /* Claim the trustcache page below the image as part of this allocation;
      * grabbing it separately afterwards fails whenever UEFI already owns it. */
-    base = try - XNU_BOOTINFO_ALIGN;
+    base = try - tc_slack;
     status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
       AllocateAddress, EfiLoaderData, total_pages, &base);
     if (!EFI_ERROR(status)) {
@@ -282,7 +308,7 @@ EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes, UINT64 virt_
     return status;
   }
 
-  SetMem((VOID *)(UINTN)(base - XNU_BOOTINFO_ALIGN),
+  SetMem((VOID *)(UINTN)(base - tc_slack),
          (UINTN)((UINT64)total_pages << EFI_PAGE_SHIFT), 0);
 
   ctx->kernel_region_base = base;
@@ -437,6 +463,10 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   }
 #endif
 
+#if defined(__aarch64__)
+  load_trustcache(&ctx);
+#endif
+
   /* Allocate a high staging buffer for the kernel image. */
   {
     UINT64 lo2 = 0, hi2 = 0;
@@ -452,13 +482,13 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   ctx.phys_base = ctx.kernel_region_base;
 
 #if defined(__aarch64__)
-  if (ctx.kernel_region_base < XNU_BOOTINFO_ALIGN) {
+  if (ctx.kernel_region_base < ctx.trustcache_slack) {
     log_error(L"trustcache: kernel staging address is too low\r\n");
     file_free(&ctx, &kernel);
     return EFI_OUT_OF_RESOURCES;
   }
   /* Already inside the staging allocation; see AllocKernelMemRegion. */
-  ctx.trustcache_phys = ctx.kernel_region_base - XNU_BOOTINFO_ALIGN;
+  ctx.trustcache_phys = ctx.kernel_region_base - ctx.trustcache_slack;
   log_info(L"arm64 trustcache page=0x%lx (below kernel)\r\n",
            (UINT64)ctx.trustcache_phys);
 
@@ -615,7 +645,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   LowMemBuffer arm64_args_buf = {0};
   arm64_boot_args *arm64_args = NULL;
   {
-    UINT64 arm64_phys_base = ctx.kernel_region_base - XNU_BOOTINFO_ALIGN;
+    UINT64 arm64_phys_base = ctx.kernel_region_base - ctx.trustcache_slack;
     UINT64 arm64_physical_mem_size =
         (XNU_LOADER_RAM_BASE + app_detect_physical_memory_size(&ctx))
         - arm64_phys_base;
@@ -626,7 +656,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     status = arm64_boot_build_args(
         &ctx,
         cmdline,
-        load_result.lowest_vmaddr - XNU_BOOTINFO_ALIGN,  /* virtBase */
+        load_result.lowest_vmaddr - ctx.trustcache_slack,  /* virtBase */
         arm64_phys_base,                         /* physBase - staging IS final for arm64 */
         arm64_physical_mem_size,
         XNU_BOOTINFO_END,                        /* topOfKernelData: covers boot-info block */

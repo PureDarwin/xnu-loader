@@ -49,6 +49,8 @@
       kernel-riscv64 = pkgs.callPackage ./kernel/riscv64.nix {
         compilerRt = pkgs.pkgsCross.riscv64.llvmPackages.compiler-rt;
       };
+      # xnu riscv32 boot shim as a riscv linux Image (qemu -kernel over opensbi)
+      riscv32 = pkgs.callPackage ./riscv32 { };
       # xnu arm32 boot shim as a Linux zImage (QEMU -kernel, U-Boot bootz)
       kernel-arm32 = pkgs.pkgsCross.armv7l-hf-multiplatform.callPackage ./arm32 { };
       # Luckfox Pico (RV1103/RV1106) and QEMU's virt Cortex-A7, fixed at build time

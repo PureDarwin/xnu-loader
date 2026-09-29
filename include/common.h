@@ -112,6 +112,10 @@ typedef struct AppContext {
 #if defined(__aarch64__)
   /* Release XNU expects the trust-cache EXTRADATA range below the KC. */
   EFI_PHYSICAL_ADDRESS trustcache_phys;
+  // \trustcache.bin from the ESP (offsets header + modules), and the slot reserved below the KC for it
+  VOID *trustcache_data;
+  UINT64 trustcache_size;
+  UINT64 trustcache_slack;
 #endif
 #if defined(__riscv)
   // the ram bank holding the kernel, and the fdt copy placed next to the kernel

@@ -1478,7 +1478,22 @@ EFI_STATUS dt_build(
       tc_status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
           AllocateAddress, EfiLoaderData, 1, &tc_phys);
     }
-    if (!EFI_ERROR(tc_status)) {
+    if (!EFI_ERROR(tc_status) && ctx->trustcache_data != NULL) {
+      // Apple's trust caches from \trustcache.bin, already in the offsets header + modules layout
+      CopyMem((VOID *)(UINTN)tc_phys, ctx->trustcache_data, ctx->trustcache_size);
+
+      if (memory_map == NULL) {
+        memory_map = dt_create_node(ctx);
+        dt_prop_str(ctx, memory_map, "name", "memory-map");
+      }
+
+      MemoryMapFileInfo tc_info;
+      tc_info.paddr = (UINT64)tc_phys;
+      tc_info.length = ctx->trustcache_size;
+      dt_prop(ctx, memory_map, "TrustCache", &tc_info, sizeof(tc_info));
+
+      log_info(L"DT: TrustCache at 0x%lx, %lu bytes\r\n", (UINT64)tc_phys, ctx->trustcache_size);
+    } else if (!EFI_ERROR(tc_status)) {
       TrustCacheModule1Empty *tc = (TrustCacheModule1Empty *)(UINTN)tc_phys;
       SetMem(tc, EFI_PAGE_SIZE, 0);
       tc->version = 1;

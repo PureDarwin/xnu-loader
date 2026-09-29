@@ -1,0 +1,83 @@
+/dts-v1/;
+
+// the esp32-p4 as the xnu shim hands it over: 32 MB of psram mapped 1:1 in the cached
+// window, two m and u mode harts, the clic, the clint timer, the interrupt matrix and uart0
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	compatible = "espressif,esp32p4";
+	model = "Espressif ESP32-P4";
+
+	chosen {
+		stdout-path = "/soc/serial@500ca000";
+	};
+
+	// what the product is called, hw.product and the cpu brand string read it
+	product {
+		product-name = "Espressif ESP32-P4";
+		product-soc-name = "ESP32-P4";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		timebase-frequency = <40000000>;
+
+		cpu@0 {
+			device_type = "cpu";
+			reg = <0>;
+			compatible = "espressif,esp32p4-hp", "riscv";
+			riscv,isa = "rv32imafc_zicsr_zifencei_zba_zbb_zbc_zbs_zcb_zcmp_zcmt";
+			mmu-type = "riscv,none";
+			clock-frequency = <360000000>;
+		};
+
+		cpu@1 {
+			device_type = "cpu";
+			reg = <1>;
+			compatible = "espressif,esp32p4-hp", "riscv";
+			riscv,isa = "rv32imafc_zicsr_zifencei_zba_zbb_zbc_zbs_zcb_zcmp_zcmt";
+			mmu-type = "riscv,none";
+			clock-frequency = <360000000>;
+		};
+	};
+
+	memory@48000000 {
+		device_type = "memory";
+		reg = <0x48000000 0x2000000>;
+	};
+
+	soc {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "simple-bus";
+		ranges;
+
+		clint: timer@20000000 {
+			compatible = "esp,esp32p4-clint";
+			reg = <0x20000000 0x10000>;
+		};
+
+		clic: interrupt-controller@20800000 {
+			compatible = "esp,esp32p4-clic";
+			reg = <0x20800000 0x10000>;
+			interrupt-controller;
+			#interrupt-cells = <1>;
+		};
+
+		intmatrix: interrupt-controller@500d6000 {
+			compatible = "esp,esp32p4-intmatrix";
+			reg = <0x500d6000 0x1000>;
+			interrupt-controller;
+			#interrupt-cells = <1>;
+		};
+
+		serial@500ca000 {
+			compatible = "esp,esp32p4-uart";
+			reg = <0x500ca000 0x1000>;
+			interrupt-parent = <&intmatrix>;
+			interrupts = <31>;
+		};
+	};
+};
