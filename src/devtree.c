@@ -9,8 +9,10 @@
  * 0x800 common partition plus headers. */
 #define XNU_NVRAM_BANK_SIZE 0x2000
 
-/* Arbitrary but stable: /defaults serial-device points at /arm-io/uart0. */
-#define XNU_LOADER_UART0_PHANDLE 1
+/* /defaults serial-device points at /arm-io/uart0. Kept far above the phandles
+ * dtc hands out from 1, since an imported board tree brings its own and the
+ * kernel takes the first node that matches. */
+#define XNU_LOADER_UART0_PHANDLE 0x7ff00001
 
 #ifndef EFI_RNG_PROTOCOL_GUID
 #define EFI_RNG_PROTOCOL_GUID \
