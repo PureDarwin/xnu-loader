@@ -137,6 +137,16 @@ VOID fdt_board_defaults(VOID) {
   g_board.gicd_size = 0x1000;
   g_board.gic2_base = 0x01F02000ULL;
   g_board.gic2_size = 0x2000;
+#elif defined(XNU_LOADER_PLATFORM_SC8280XP)
+  g_board.ram_base = 0x80000000ULL;
+  g_board.soc_base = 0x17000000ULL;
+  g_board.soc_size = 0x01000000ULL;
+  g_board.psci_method = 2;
+  g_board.gic_version = 3;
+  g_board.gicd_base = 0x17a00000ULL;
+  g_board.gicd_size = 0x10000;
+  g_board.gic2_base = 0x17a60000ULL;
+  g_board.gic2_size = 0x100000;
 #endif
 }
 

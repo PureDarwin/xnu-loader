@@ -13,7 +13,7 @@
  * those boards' arm-io window as it was.
  */
 #if defined(XNU_LOADER_PLATFORM_QEMUVIRT) || defined(XNU_LOADER_PLATFORM_SUN50I) || \
-    defined(XNU_LOADER_PLATFORM_SG2002)
+    defined(XNU_LOADER_PLATFORM_SG2002) || defined(XNU_LOADER_PLATFORM_SC8280XP)
 #undef XNU_LOADER_PLATFORM_GENERIC
 #define XNU_LOADER_PLATFORM_GENERIC 1
 #endif
