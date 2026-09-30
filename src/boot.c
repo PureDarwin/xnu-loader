@@ -967,6 +967,12 @@ EFI_STATUS exit_boot_services_retry(
     if (status == EFI_SUCCESS) {
       serial_reinit();
       serial_mark((CONST CHAR8 *)"ExitBootServices returned SUCCESS");
+      #if defined(XNU_LOADER_PLATFORM_SC8280XP)
+        /* arm64 XNU never calls EFI runtime services, so the packing and 
+        * SetVirtualAddressMap below serve nothing here. On the X13s the handoff
+        * stalled in them. Firmware keeps its physical mapping. */
+        return EFI_SUCCESS;
+      #endif
       EFI_RUNTIME_SERVICES *rt = ctx->st->RuntimeServices;
       UINT8 *rmap = (UINT8 *)state->memory_map_buf.ptr;
       UINTN rdesc_sz = state->descriptor_size;

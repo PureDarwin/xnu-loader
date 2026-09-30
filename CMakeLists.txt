@@ -146,9 +146,11 @@ if(ARCH STREQUAL "aarch64")
     set(XNU_LOADER_PLATFORM_DEFINES XNU_LOADER_PLATFORM_SUN50I)
   elseif(XNU_LOADER_PLATFORM STREQUAL "sg2002")
     set(XNU_LOADER_PLATFORM_DEFINES XNU_LOADER_PLATFORM_SG2002)
+  elseif(XNU_LOADER_PLATFORM STREQUAL "sc8280xp")
+    set(XNU_LOADER_PLATFORM_DEFINES XNU_LOADER_PLATFORM_SC8280XP)
   else()
     message(FATAL_ERROR
-      "XNU_LOADER_PLATFORM must be bcm2837, generic, qemuvirt, sun50i or sg2002, "
+      "XNU_LOADER_PLATFORM must be bcm2837, generic, qemuvirt, sun50i, sg2002 or sc8280xp, "
       "got '${XNU_LOADER_PLATFORM}'")
   endif()
   message(STATUS "aarch64 platform: ${XNU_LOADER_PLATFORM}")

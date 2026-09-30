@@ -27,6 +27,10 @@
         arch = "aarch64";
         platform = "sun50i";
       };
+      arm64-sc8280xp = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./. {
+        arch = "aarch64";
+        platform = "sc8280xp";
+      };
       ia32 = pkgs.pkgsi686Linux.callPackage ./. {
         arch = "x86_64";
         loaderArch = "ia32";

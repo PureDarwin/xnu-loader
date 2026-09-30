@@ -7,12 +7,12 @@
 , mtools
 , arch ? "x86_64"
 , loaderArch ? arch
-  # aarch64 target machine: bcm2837, qemuvirt, sun50i or sg2002. Ignored for x86_64.
+  # aarch64 target machine: bcm2837, qemuvirt, sun50i sg2002, or sc8280xp. Ignored for x86_64.
 , platform ? "bcm2837"
 }:
 
 assert arch == "x86_64" || arch == "aarch64";
-assert platform == "bcm2837" || platform == "generic" || platform == "qemuvirt" || platform == "sun50i" || platform == "sg2002";
+assert platform == "bcm2837" || platform == "generic" || platform == "qemuvirt" || platform == "sun50i" || platform == "sg2002" || platform == "sc8280xp";
 assert loaderArch == "x86_64" || loaderArch == "aarch64" || loaderArch == "ia32";
 # ia32 firmware is only ever paired with an x86_64 kernel.
 assert loaderArch != "ia32" || arch == "x86_64";
