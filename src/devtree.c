@@ -1122,6 +1122,49 @@ static BOOLEAN dp_get_partition_uuid(AppContext *ctx, CHAR8 uuid_str[37]) {
   return FALSE;
 }
 
+#if defined(XNU_LOADER_PLATFORM_SC8280XP)
+/* The X13s keyboard, TrackPoint and touchpad bus: GENI serial engine i2c@894000
+ * and its hid-over-i2c slaves. The platform expert publishes a nub for each child
+ * of a simple-bus. reg values are CPU physical addresses. Interrupts are left out:
+ * driver polls */
+static DeviceTreeNode *sc8280xp_soc(AppContext *ctx) {
+  static const struct {
+    const CHAR8 *name;
+    UINT32 addr, descr;
+  } slaves[] = {
+    { "keyboard@68", 0x68, 0x0001 },
+    { "touchpad@15", 0x15, 0x0001 },
+    { "touchpad@2c", 0x2c, 0x0020 }, // second source, not fitted on every unit
+  };
+
+  DeviceTreeNode *soc = dt_create_node(ctx);
+  DeviceTreeNode *i2c = dt_create_node(ctx);
+  UINT64 i2c_reg[2] = { 0x894000ULL, 0x4000ULL };
+
+  dt_prop_str(ctx, soc, "name", "soc");
+  dt_prop_str(ctx, soc, "compatible", "simple-bus");
+  dt_prop_u32(ctx, soc, "#address-cells", 2);
+  dt_prop_u32(ctx, soc, "#size-cells", 2);
+
+  dt_prop_str(ctx, i2c, "name", "i2c@894000");
+  dt_prop_str(ctx, i2c, "compatible", "qcom,geni-i2c");
+  dt_prop(ctx, i2c, "reg", i2c_reg, sizeof(i2c_reg));
+  dt_prop_u32(ctx, i2c, "clock-frequency", 400000);
+  dt_prop_u32(ctx, i2c, "#address-cells", 1);
+  dt_prop_u32(ctx, i2c, "#size-cells", 0);
+  for (UINTN i = 0; i < sizeof(slaves) / sizeof(slaves[0]); i++) {
+    DeviceTreeNode *hid = dt_create_node(ctx);
+    dt_prop_str(ctx, hid, "name", slaves[i].name);
+    dt_prop_str(ctx, hid, "compatible", "hid-over-i2c");
+    dt_prop_u32(ctx, hid, "reg", slaves[i].addr);
+    dt_prop_u32(ctx, hid, "hid-descr-addr", slaves[i].descr);
+    dt_add_child(ctx, i2c, hid);
+  }
+  dt_add_child(ctx, soc, i2c);
+  return soc;
+}
+#endif
+
 EFI_STATUS dt_build(
     AppContext *ctx,
     VOID **out_blob,
@@ -1865,6 +1908,9 @@ EFI_STATUS dt_build(
 #if defined(XNU_LOADER_PLATFORM_GENERIC)
   if (pci)
     dt_add_child(ctx, root, pci);
+#if defined(XNU_LOADER_PLATFORM_SC8280XP)
+  dt_add_child(ctx, root, sc8280xp_soc(ctx));
+#endif
   if (g_board.psci_method) {
     // how to reach psci firmware; an hvc with no el2 underneath is an undefined instruction
     DeviceTreeNode *psci = dt_create_node(ctx);
