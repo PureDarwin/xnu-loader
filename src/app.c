@@ -10,6 +10,10 @@ EFI_STATUS app_init(AppContext *ctx, EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   if (!ctx || st->Hdr.Signature != EFI_SYSTEM_TABLE_SIGNATURE)
     return EFI_ABORTED;
 
+  // ensure there's no leftover data. this caused a bug on some machines
+  // to falsely report having a RAMDisk when it did not.
+  SetMem(ctx, sizeof(*ctx), 0);
+
   ctx->image_handle = image;
   ctx->st = st;
   ctx->bs = st->BootServices;
