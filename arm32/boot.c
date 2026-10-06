@@ -7,24 +7,36 @@ void boot32_jump(uint32_t entry, uint32_t boot_args) __attribute__((noreturn));
  * is a DesignWare 8250 with 4-byte registers (THR +0x00, LSR +0x14) */
 static volatile uint32_t *uart = (volatile uint32_t *)0x09000000;
 
-// rockchip boards: console, watchdog, ram when u-boot's fdt has no memory node, identity
+// a board: console, watchdog, ram when u-boot's fdt has no memory node, identity
 struct board {
   const char *fdt_compat, *name, *dt_compat, *model;
   uint32_t uart, wdt, cru_glb_rst, ram_size;
+  // ram_base pairs with ram_size for that same fallback; sunxi puts dram at 0x40000000
+  uint32_t ram_base;
   // the gic distributor, when the kernel may run smp from a secure boot
   uint32_t gicd;
   // cru gate and reset registers holding the watchdog's clocks, and its bits in both
+  // (rockchip's designware watchdog; zero elsewhere, which also skips arming it)
   uint32_t wdt_gate, wdt_srst, wdt_bits;
 };
 static const struct board board_rv1106_info = {
   "rockchip,rv110", "Rockchip RV1106/RV1103", "puredarwin,rv1103", "Luckfox Pico (RV1103)",
-  0xff4c0000, 0xff5a0000, 0xff3b0000 + 0xc10, 0x4000000, 0, 0, 0, 0,
+  0xff4c0000, 0xff5a0000, 0xff3b0000 + 0xc10, 0x4000000, 0, 0, 0, 0, 0,
 };
 // wdt0, clocked and out of reset through CRU_GATE_CON06 and CRU_SOFTRST_CON06 bits 9 and 10
 static const struct board board_rk3506_info = {
   "rockchip,rk3506", "Rockchip RK3506", "puredarwin,rk3506", "Luckfox Lyra (RK3506)",
-  0xff0a0000, 0xff260000, 0xff9a0000 + 0xc10, 0x8000000, 0xff581000,
+  0xff0a0000, 0xff260000, 0xff9a0000 + 0xc10, 0x8000000, 0, 0xff581000,
   0xff9a0818, 0xff9a0a18, (1u << 9) | (1u << 10),
+};
+
+/* Allwinner A20 (sun7i): dual Cortex-A7, dram at 0x40000000, uart0 a dw-apb-uart with
+ * 32-bit registers like rockchip's, gic-400 distributor at 0x01c81000. Its watchdog is
+ * the sun4i one, not the designware block the fields above drive, so leave those zero. */
+static const struct board board_a20_info = {
+  "allwinner,sun7i-a20", "Allwinner A20 (sun7i)", "puredarwin,sun7i", "Allwinner A20",
+  0x01c28000, 0, 0, 0x40000000, 0x40000000, 0x01c81000,
+  0, 0, 0,
 };
 
 // cntvoff is unknown out of reset and only monitor mode with scr.ns set can write it; the
@@ -60,7 +72,7 @@ static int gic_secure(uint32_t gicd) {
 // XNU_LOADER_PLATFORM_{RV1106,RK3506,QEMUVIRT} fix the board at build time
 // without one the fdt's root compatible decides
 #if (defined(XNU_LOADER_PLATFORM_RV1106) + defined(XNU_LOADER_PLATFORM_RK3506) + \
-     defined(XNU_LOADER_PLATFORM_QEMUVIRT)) > 1
+     defined(XNU_LOADER_PLATFORM_A20) + defined(XNU_LOADER_PLATFORM_QEMUVIRT)) > 1
 #error "at most one XNU_LOADER_PLATFORM_* for arm32"
 #endif
 #if defined(XNU_LOADER_PLATFORM_RV1106)
@@ -69,6 +81,28 @@ static const struct board *board = &board_rv1106_info;
 #elif defined(XNU_LOADER_PLATFORM_RK3506)
 static int uart_8250;
 static const struct board *board = &board_rk3506_info;
+#elif defined(XNU_LOADER_PLATFORM_A20)
+static int uart_8250;
+static const struct board *board = &board_a20_info;
+// a fixed board talks on its own uart from the start, not virt's pl011 (unmapped there)
+#define EARLY_UART 0x01c28000
+// uart0 on pb22/pb23 at 115200 from the 24 MHz apb1, so output does not depend on u-boot
+static void early_uart_setup(void) {
+  volatile uint32_t *u = (volatile uint32_t *)EARLY_UART;
+  volatile uint32_t *apb1_gate = (volatile uint32_t *)0x01c2006c;
+  volatile uint32_t *pb_cfg2 = (volatile uint32_t *)0x01c2082c, *pb_pull1 = (volatile uint32_t *)0x01c20844;
+
+  *apb1_gate |= 1u << 16;
+  *pb_cfg2 = (*pb_cfg2 & ~(0x77u << 24)) | (0x22u << 24);
+  *pb_pull1 = (*pb_pull1 & ~(3u << 14)) | (1u << 14);
+  for (int i = 0; i < 100000 && !(u[5] & 0x40); i++)
+    ;
+  u[3] = 0x83;  /* LCR: 8n1, divisor latch */
+  u[0] = 13;    /* 24 MHz / 16 / 115200 */
+  u[1] = 0;
+  u[3] = 0x03;
+  u[2] = 0x07;  /* FCR: fifos on and cleared */
+}
 #else
 static int uart_8250;
 static const struct board *board;
@@ -163,6 +197,15 @@ static int nameis(const char *name, const char *want) {
   }
   return !*want && (!*name || *name == '@');
 }
+// framebuffer, framebuffer@addr, or u-boot's sunxi framebuffer-lcd0-hdmi and kin
+static int fbname(const char *name) {
+  const char *w = "framebuffer";
+  while (*w && *name == *w) {
+    ++name;
+    ++w;
+  }
+  return !*w && (!*name || *name == '@' || *name == '-');
+}
 static uint32_t be32(const uint8_t *p) {
   return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
 }
@@ -184,6 +227,8 @@ static uint32_t fdt_seed_len;
 // the fdt's cpu nodes, by their reg (mpidr affinity), for xnu's /cpus
 #define MAX_FDT_CPUS 4
 static uint32_t cpu_reg[MAX_FDT_CPUS], ncpus;
+// u-boot's live simple-framebuffer (sunxi fills one in /chosen with its hdmi mode)
+static uint32_t fb_base, fb_width, fb_height, fb_stride, fb_bpp;
 
 static void parse_fdt(const uint8_t *h) {
   const uint8_t *st = h + be32(h + 8);
@@ -191,6 +236,11 @@ static void parse_fdt(const uint8_t *h) {
   uint32_t ac = 2, sc = 1, depth = 0;
   enum { OTHER, MEMORY, CHOSEN, CPUS } kind = OTHER;
   int in_cpu = 0;
+  // a framebuffer node at any depth: gather its props, keep it once it ends okay
+  uint32_t fb_depth = 0, f_simple = 0, f_okay = 0, f_base = 0;
+  uint32_t f_w = 0, f_h = 0, f_stride = 0, f_bpp = 0;
+  // the #address-cells each node gives its children, which a framebuffer's reg is read with
+  uint32_t acs[8] = { 2 };
 
   for (;;) {
     uint32_t tok = be32(st);
@@ -198,12 +248,29 @@ static void parse_fdt(const uint8_t *h) {
     if (tok == 1) {
       const char *name = (const char *)st;
       st += (strlen(name) + 4) & ~3u;
-      if (++depth == 2)
+      if (++depth < 8)
+        acs[depth] = 2;
+      if (depth == 2)
         kind = nameis(name, "memory") ? MEMORY : nameis(name, "chosen") ? CHOSEN :
                nameis(name, "cpus") ? CPUS : OTHER;
       else if (depth == 3 && kind == CPUS)
         in_cpu = nameis(name, "cpu");
+      if (!fb_depth && fbname(name)) {
+        fb_depth = depth;
+        f_simple = f_base = f_w = f_h = f_stride = f_bpp = 0;
+        f_okay = 1;
+      }
     } else if (tok == 2) {
+      if (fb_depth && depth == fb_depth) {
+        fb_depth = 0;
+        if (!fb_base && f_simple && f_okay && f_base && f_w && f_h && f_stride && f_bpp) {
+          fb_base = f_base;
+          fb_width = f_w;
+          fb_height = f_h;
+          fb_stride = f_stride;
+          fb_bpp = f_bpp;
+        }
+      }
       if (depth == 3)
         in_cpu = 0;
       if (depth-- == 2)
@@ -213,20 +280,40 @@ static void parse_fdt(const uint8_t *h) {
       const char *pn = strings + be32(st + 4);
       const uint8_t *v = st + 8;
       st += 8 + ((len + 3) & ~3u);
-      if (depth == 1 && streq(pn, "compatible")) {
+      if (fb_depth && depth == fb_depth) {
+        if (streq(pn, "compatible"))
+          f_simple = strhas((const char *)v, "simple-framebuffer");
+        else if (streq(pn, "status"))
+          f_okay = streq((const char *)v, "okay") || streq((const char *)v, "ok");
+        else if (streq(pn, "reg") && fb_depth < 9 && len >= 4 * acs[fb_depth - 1])
+          f_base = (uint32_t)cells(v, acs[fb_depth - 1]);
+        else if (streq(pn, "width"))
+          f_w = be32(v);
+        else if (streq(pn, "height"))
+          f_h = be32(v);
+        else if (streq(pn, "stride"))
+          f_stride = be32(v);
+        else if (streq(pn, "format"))
+          // the kernel draws 32-bit xrgb only
+          f_bpp = streq((const char *)v, "x8r8g8b8") || streq((const char *)v, "a8r8g8b8") ? 32 : 0;
+      } else if (depth == 1 && streq(pn, "compatible")) {
         for (uint32_t i = 0; i < len; i += strlen((const char *)v + i) + 1) {
 #if !defined(XNU_LOADER_PLATFORM_QEMUVIRT)
           if (!board && strhas((const char *)v + i, board_rv1106_info.fdt_compat))
             board = &board_rv1106_info;
           else if (!board && strhas((const char *)v + i, board_rk3506_info.fdt_compat))
             board = &board_rk3506_info;
+          else if (!board && strhas((const char *)v + i, board_a20_info.fdt_compat))
+            board = &board_a20_info;
 #endif
         }
-      } else if (depth == 1 && streq(pn, "#address-cells"))
-        ac = be32(v);
-      else if (depth == 1 && streq(pn, "#size-cells"))
+      } else if (depth < 8 && streq(pn, "#address-cells")) {
+        acs[depth] = be32(v);
+        if (depth == 1)
+          ac = acs[1];
+      } else if (depth == 1 && streq(pn, "#size-cells")) {
         sc = be32(v);
-      else if (depth == 2 && kind == MEMORY && streq(pn, "reg") && !ram_size) {
+      } else if (depth == 2 && kind == MEMORY && streq(pn, "reg") && !ram_size) {
         ram_base = (uint32_t)cells(v, ac);
         ram_size = (uint32_t)cells(v + 4 * ac, sc);
       } else if (depth == 3 && in_cpu && streq(pn, "reg") && len >= 4 && ncpus < MAX_FDT_CPUS) {
@@ -340,6 +427,15 @@ static void make_seed(uint8_t *out) {
   }
 }
 
+// paint band n (32 rows) of the boot framebuffer: progress that needs no uart
+static void fb_band(uint32_t n, uint32_t xrgb) {
+  if (!fb_base || fb_bpp != 32 || fb_height < 32 * (n + 1))
+    return;
+  for (uint32_t y = 32 * n; y < 32 * (n + 1); y++)
+    for (uint32_t x = 0; x < fb_width; x++)
+      ((volatile uint32_t *)(fb_base + y * fb_stride))[x] = xrgb;
+}
+
 struct boot_args32 {
   uint16_t Revision, Version;
   uint32_t virtBase, physBase, memSize, topOfKernelData;
@@ -410,6 +506,14 @@ void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
       }
     }
   }
+#ifdef EARLY_UART
+  early_uart_setup();
+  uart = (volatile uint32_t *)EARLY_UART;
+  uart_8250 = 1;
+  puts("\nboot32: entry, fdt ");
+  puthex(fdt);
+  puts("\n");
+#endif
   if (be32((const uint8_t *)fdt) != 0xd00dfeed) {
     if (!uart_8250)
       uart[12] |= 0x301;
@@ -464,9 +568,22 @@ void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
     }
   }
   if (!ram_size && board) {
-    ram_base = 0; // u-boot's own fdt has no memory node, use the board's ram at 0
+    // u-boot's own fdt has no memory node, use the board's
+    ram_base = board->ram_base;
     ram_size = board->ram_size;
   }
+  // u-boot carves the framebuffer off the top of ram: end ram below it so the kernel leaves it be
+  if (fb_base > ram_base && fb_base < ram_base + ram_size) {
+    ram_size = (fb_base & ~0xfffu) - ram_base;
+    puts("boot32: framebuffer ");
+    puthex(fb_base);
+    puts(", ");
+    puthex(fb_width);
+    puts(" x ");
+    puthex(fb_height);
+    puts("\n");
+  }
+  fb_band(0, 0xff2060ff);
   puts("boot32: RAM ");
   puthex(ram_base);
   puts(" + ");
@@ -613,6 +730,15 @@ void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
   ba->memSizeActual = ram_size;
   ba->topOfKernelData = top_of_kernel;
   ba->machineType = 0;
+  if (fb_base) {
+    // bit 0 marks a physical address; text mode so the verbose console draws on it
+    ba->v_baseAddr = fb_base | 1;
+    ba->v_display = 0;
+    ba->v_rowBytes = fb_stride;
+    ba->v_width = fb_width;
+    ba->v_height = fb_height;
+    ba->v_depth = fb_bpp;
+  }
   ba->deviceTreeP = dt_phys - phys_base + VIRT_BASE;
   ba->deviceTreeLength = dt_len;
   if (a) {
@@ -641,5 +767,9 @@ void boot32_main(uint32_t fdt, uint32_t argc, char **argv) {
   puts(", top ");
   puthex(top_of_kernel);
   puts("\n");
+  fb_band(1, 0xff20c040);
+#if defined(XNU_LOADER_PLATFORM_A20)
+  *(volatile uint32_t *)0x01c2090c &= ~(1u << 24);  /* led off: at the kernel jump */
+#endif
   boot32_jump(entry - VIRT_BASE + phys_base, ba_phys);
 }

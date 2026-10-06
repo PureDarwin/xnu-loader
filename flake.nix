@@ -66,6 +66,10 @@
       arm32-rk3506 = pkgs.pkgsCross.armv7l-hf-multiplatform.callPackage ./arm32 {
         platform = "rk3506";
       };
+      # allwinner a20 (sun7i), e.g. Banana Pi
+      arm32-a20 = pkgs.pkgsCross.armv7l-hf-multiplatform.callPackage ./arm32 {
+        platform = "a20";
+      };
       # The loader as a Multiboot2 ELF kernel (GRUB etc.).
       kernel-multiboot2 = pkgs.callPackage ./kernel { };
       kernel-grub-bios = pkgs.callPackage ./kernel/grub-bios.nix {

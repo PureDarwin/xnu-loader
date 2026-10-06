@@ -6,18 +6,26 @@
 	.arch armv7-a
 	.arch_extension virt
 	/* On the 'go' path (r7 = argc 1..15), put one character on the board's UART (left set
-	 * up by U-Boot) so a hang shows how far entry got. Clobbers r0, r1 */
-#if defined(XNU_LOADER_PLATFORM_RK3506)
-#define GO_UART	0xff0a0000	// lyra uart0
+	 * up by U-Boot) so a hang shows how far entry got; on the a20 on every path. Clobbers r0, r1 */
+#if defined(XNU_LOADER_PLATFORM_A20)
+#define MARK_UART	0x01c28000	// sun7i uart0, which only bootz reaches
+#elif defined(XNU_LOADER_PLATFORM_RK3506)
+#define MARK_UART	0xff0a0000	// lyra uart0
 #else
-#define GO_UART	0xff4c0000	// pico uart2
+#define MARK_UART	0xff4c0000	// pico uart2
 #endif
 	.macro	mark c
+#if defined(XNU_LOADER_PLATFORM_A20)
+	ldr	r0, =MARK_UART
+	mov	r1, #\c
+	str	r1, [r0]
+#else
 	sub	r0, r7, #1
 	cmp	r0, #15
-	ldrlo	r0, =GO_UART
+	ldrlo	r0, =MARK_UART
 	movlo	r1, #\c
 	strlo	r1, [r0]
+#endif
 	.endm
 	.section .text.head, "ax"
 	.globl _start
@@ -40,6 +48,18 @@ _start:
 	mov	r9, r2
 	mov	r7, r0			/* U-Boot 'go' passes argc, argv instead of an FDT */
 	mov	r8, r1
+#if defined(XNU_LOADER_PLATFORM_A20)
+	/* banana pi green led (ph24) on: entered, with no uart needed; off again at the kernel jump */
+	ldr	r0, =0x01c20908		/* PH_CFG3 */
+	ldr	r1, [r0]
+	bic	r1, r1, #7
+	orr	r1, r1, #1		/* output */
+	str	r1, [r0]
+	ldr	r0, =0x01c2090c		/* PH_DAT */
+	ldr	r1, [r0]
+	orr	r1, r1, #(1 << 24)
+	str	r1, [r0]
+#endif
 	mark	'1'
 	mrs	r0, cpsr
 	and	r1, r0, #0x1f
