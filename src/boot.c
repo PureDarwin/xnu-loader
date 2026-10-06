@@ -996,16 +996,22 @@ EFI_STATUS exit_boot_services_retry(
       UINT64 va_base  = XNU_RT_VA_BASE;
 
       UINT64 va_cursor   = va_base;
-      UINT32 rmin_virt_pg = 0xFFFFFFFFU;
+      UINT64 rmin_virt_pg = ~0ULL;
       for (UINTN roff = 0; roff + rdesc_sz <= rmap_sz; roff += rdesc_sz) {
         EFI_MEMORY_DESCRIPTOR *d = (EFI_MEMORY_DESCRIPTOR *)(rmap + roff);
         if (!(d->Attribute & EFI_MEMORY_RUNTIME))
           continue;
         UINT64 sz = (UINT64)d->NumberOfPages << EFI_PAGE_SHIFT;
+#if defined(PD_ARCH_X86)
+        // the firmware's own pointers must be kernel addresses: efi_init maps the window
+        // there, and the low alias is user space whenever a task's pmap is loaded
+        d->VirtualStart = 0xFFFFFF8000000000ULL | va_cursor;
+#else
         d->VirtualStart = va_cursor;
+#endif
         va_cursor += sz;
 
-        UINT32 vpg = (UINT32)(d->VirtualStart >> EFI_PAGE_SHIFT);
+        UINT64 vpg = d->VirtualStart >> EFI_PAGE_SHIFT;
         if (vpg < rmin_virt_pg) rmin_virt_pg = vpg;
       }
 
@@ -1024,7 +1030,9 @@ EFI_STATUS exit_boot_services_retry(
       }
       serial_mark((CONST CHAR8 *)"calling SetVirtualAddressMap");
 
-      rt->SetVirtualAddressMap(rmap_sz, rdesc_sz,
+      // through the wrapper like every other firmware call: a direct call passes the sysv registers
+      // and the firmware rejects what it finds in the ms ones
+      EFI_STATUS svam = uefi_call_wrapper(rt->SetVirtualAddressMap, 4, rmap_sz, rdesc_sz,
                                state->descriptor_version,
                                (EFI_MEMORY_DESCRIPTOR *)rmap);
 
@@ -1033,17 +1041,22 @@ EFI_STATUS exit_boot_services_retry(
        * the virtual mapping selected for the shim's runtime image. */
       legacy_runtime_fixup(
           (EFI_RUNTIME_SERVICES *)(UINTN)state->rt_table_phys);
+#elif defined(PD_ARCH_X86)
+      // SVAM converted the firmware's own table (and its CRC): the pinned copy XNU calls
+      // through still holds the physical entry points
+      if (state->rt_table_phys)
+        XnuCopyMem((VOID *)(UINTN)state->rt_table_phys, rt, sizeof(EFI_RUNTIME_SERVICES));
 #endif
 
       serial_reinit();
-      serial_mark((CONST CHAR8 *)"SetVirtualAddressMap returned");
+      serial_trace((CONST CHAR8 *)"SetVirtualAddressMap returned ", (UINT64)svam);
 
       /* Update boot_args: virtual page start only.
        * efiSystemTable was already set to the conventional-memory copy
        * (tbl_phys) before EBS; that address is in XNU's physmap and
        * needs no adjustment after SVAM. */
       if (state->args) {
-        if (rmin_virt_pg != 0xFFFFFFFFU)
+        if (rmin_virt_pg != ~0ULL)
           state->args->efiRuntimeServicesVirtualPageStart = rmin_virt_pg;
       }
 
