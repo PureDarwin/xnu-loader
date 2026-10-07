@@ -1123,22 +1123,31 @@ static BOOLEAN dp_get_partition_uuid(AppContext *ctx, CHAR8 uuid_str[37]) {
 }
 
 #if defined(XNU_LOADER_PLATFORM_SC8280XP)
+/* Interrupt controllers the kernel finds by phandle: the GIC (/arm-io/gic, one cell, the
+ * INTID) and the TLMM (two cells, <pin flags>) */
+#define SC8280XP_GIC_PHANDLE    0x7ff00002
+#define SC8280XP_TLMM_PHANDLE   0x7ff00003
+#define DT_IRQ_LEVEL_LOW        8
+
 /* The X13s keyboard, TrackPoint and touchpad bus: GENI serial engine i2c@894000
- * and its hid-over-i2c slaves. The platform expert publishes a nub for each child
- * of a simple-bus. reg values are CPU physical addresses. Interrupts are left out:
- * driver polls */
+ * and its hid-over-i2c slaves, and the TLMM pins their interrupt lines are on. 
+ * The platform expert publishes a nub for each child of a simple-bus. reg values 
+ * are CPU physical addresses. */
 static DeviceTreeNode *sc8280xp_soc(AppContext *ctx) {
   static const struct {
     const CHAR8 *name;
-    UINT32 addr, descr;
+    UINT32 addr, descr, pin;
   } slaves[] = {
-    { "keyboard@68", 0x68, 0x0001 },
-    { "touchpad@15", 0x15, 0x0001 },
-    { "touchpad@2c", 0x2c, 0x0020 }, // second source, not fitted on every unit
+    { "keyboard@68", 0x68, 0x0001, 104 },
+    { "touchpad@15", 0x15, 0x0001, 182 },
+    { "touchpad@2c", 0x2c, 0x0020, 182 }, // second source, not fitted on every unit
   };
 
   DeviceTreeNode *soc = dt_create_node(ctx);
+  DeviceTreeNode *tlmm = dt_create_node(ctx);
   DeviceTreeNode *i2c = dt_create_node(ctx);
+  UINT64 tlmm_reg[2] = { 0xf100000ULL, 0x300000ULL };
+  UINT32 tlmm_reserved[10] = { 70, 2, 74, 6, 125, 2, 128, 2, 154, 4 };
   UINT64 i2c_reg[2] = { 0x894000ULL, 0x4000ULL };
 
   dt_prop_str(ctx, soc, "name", "soc");
@@ -1146,18 +1155,38 @@ static DeviceTreeNode *sc8280xp_soc(AppContext *ctx) {
   dt_prop_u32(ctx, soc, "#address-cells", 2);
   dt_prop_u32(ctx, soc, "#size-cells", 2);
 
+  /* summary interrupt: SPI 208, INTID 240 */
+  dt_prop_str(ctx, tlmm, "name", "pinctrl@f100000");
+  dt_prop_str(ctx, tlmm, "compatible", "qcom,sc8280xp-tlmm");
+  dt_prop(ctx, tlmm, "reg", tlmm_reg, sizeof(tlmm_reg));
+  dt_prop_u32(ctx, tlmm, "ngpios", 230);
+  dt_prop(ctx, tlmm, "gpio-reserved-ranges", tlmm_reserved, sizeof(tlmm_reserved));
+  dt_prop(ctx, tlmm, "interrupt-controller", NULL, 0);
+  dt_prop_u32(ctx, tlmm, "#interrupt-cells", 2);
+  dt_prop_u32(ctx, tlmm, "AAPL,phandle", SC8280XP_TLMM_PHANDLE);
+  dt_prop_u32(ctx, tlmm, "interrupt-parent", SC8280XP_GIC_PHANDLE);
+  dt_prop_u32(ctx, tlmm, "interrupts", 240);
+  dt_add_child(ctx, soc, tlmm);
+
   dt_prop_str(ctx, i2c, "name", "i2c@894000");
   dt_prop_str(ctx, i2c, "compatible", "qcom,geni-i2c");
   dt_prop(ctx, i2c, "reg", i2c_reg, sizeof(i2c_reg));
   dt_prop_u32(ctx, i2c, "clock-frequency", 400000);
   dt_prop_u32(ctx, i2c, "#address-cells", 1);
   dt_prop_u32(ctx, i2c, "#size-cells", 0);
+  dt_prop_u32(ctx, i2c, "interrupt-parent", SC8280XP_GIC_PHANDLE);
+  dt_prop_u32(ctx, i2c, "interrupts", 619);
   for (UINTN i = 0; i < sizeof(slaves) / sizeof(slaves[0]); i++) {
     DeviceTreeNode *hid = dt_create_node(ctx);
     dt_prop_str(ctx, hid, "name", slaves[i].name);
     dt_prop_str(ctx, hid, "compatible", "hid-over-i2c");
     dt_prop_u32(ctx, hid, "reg", slaves[i].addr);
     dt_prop_u32(ctx, hid, "hid-descr-addr", slaves[i].descr);
+    {
+      UINT32 irq[2] = { slaves[i].pin, DT_IRQ_LEVEL_LOW };
+      dt_prop_u32(ctx, hid, "interrupt-parent", SC8280XP_TLMM_PHANDLE);
+      dt_prop(ctx, hid, "interrupts", irq, sizeof(irq));
+    }
     dt_add_child(ctx, i2c, hid);
   }
   dt_add_child(ctx, soc, i2c);
@@ -1828,6 +1857,12 @@ EFI_STATUS dt_build(
     dt_prop_str(ctx, gic, "name", "gic");
     dt_prop_str(ctx, gic, "compatible", g_board.gic_version == 3 ? "arm,gic-v3" : "arm,gic-400");
     dt_prop(ctx, gic, "reg", gic_reg, sizeof(gic_reg));
+#if defined(XNU_LOADER_PLATFORM_SC8280XP)
+    /* the controller for device interrupts (PDArmGICSPI) */
+    dt_prop(ctx, gic, "interrupt-controller", NULL, 0);
+    dt_prop_u32(ctx, gic, "#interrupt-cells", 1);
+    dt_prop_u32(ctx, gic, "AAPL,phandle", SC8280XP_GIC_PHANDLE);
+#endif
     dt_add_child(ctx, armio, gic);
   }
   log_info(L"DT: board uart 0x%lx gic%u 0x%lx/0x%lx arm-io 0x%lx+0x%lx%s\r\n",
