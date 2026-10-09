@@ -293,7 +293,7 @@ BOOLEAN boot_cmdline_csr_config(const CHAR8 *cmdline, UINT32 *out) {
   return FALSE;
 }
 
-static BOOLEAN boot_cmdline_has_flag(const CHAR8 *cmdline, const CHAR8 *flag) {
+BOOLEAN boot_cmdline_has_flag(const CHAR8 *cmdline, const CHAR8 *flag) {
   if (!cmdline || !flag)
     return FALSE;
 
@@ -609,6 +609,8 @@ EFI_STATUS boot_build_args(
     lowmem_free(ctx, &args_buf);
     return status;
   }
+  // the logo goes up as soon as the mode is known, the loader keeps working behind it
+  boot_draw_logo(args);
 
   state->args = args;
   state->args_buf = args_buf;

@@ -20,8 +20,8 @@ struct range {
   UINT64 base, size;
 };
 
-static struct range ram[16], reserved[MAX_RESERVED];
-static UINT32 nram, nreserved;
+static struct range ram[16], reserved[MAX_RESERVED], released[4];
+static UINT32 nram, nreserved, nreleased;
 static UINT64 fdt_initrd_start, fdt_initrd_end;
 
 /* Simple-framebuffer node from u-boot, committed at the node end */
@@ -179,6 +179,13 @@ static void parse_fdt(UINT64 fdt) {
           fdt_initrd_start = cells(v, len / 4);
         } else if (str_eq(pname, "linux,initrd-end")) {
           fdt_initrd_end = cells(v, len / 4);
+        } else if (str_eq(pname, "pd,released-memory")) {
+          // ranges the boot script gave back, a firmware buffer it moved for one
+          UINT32 stride = 4 * (addr_cells + size_cells);
+          for (UINT32 o = 0; o + stride <= len && nreleased < 4; o += stride) {
+            released[nreleased].base = cells(v + o, addr_cells);
+            released[nreleased++].size = cells(v + o + 4 * addr_cells, size_cells);
+          }
         }
       } else if (depth == 2 && kind == N_OTHER) {
         if (str_eq(pname, "compatible"))
@@ -213,6 +220,17 @@ static void parse_fdt(UINT64 fdt) {
     } else {
       break;
     }
+  }
+
+  // a reservation the script released goes only on an exact match
+  for (UINT32 i = 0; i < nreserved;) {
+    BOOLEAN drop = FALSE;
+    for (UINT32 j = 0; j < nreleased; ++j)
+      drop |= reserved[i].base == released[j].base && reserved[i].size == released[j].size;
+    if (drop)
+      reserved[i] = reserved[--nreserved];
+    else
+      ++i;
   }
 }
 

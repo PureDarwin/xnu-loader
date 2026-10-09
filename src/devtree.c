@@ -387,7 +387,8 @@ static BOOLEAN fdt_str_eq(const CHAR8 *a, const CHAR8 *b) {
   return *a == *b;
 }
 
-static UINTN fdt_cpu_mpidrs(AppContext *ctx, UINT64 *out, UINTN max) {
+// each enabled cpu's MPIDR, and its capacity-dmips-mhz (0 when absent) for telling core types apart
+static UINTN fdt_cpu_mpidrs(AppContext *ctx, UINT64 *out, UINT32 *cap, UINTN max) {
   static const EFI_GUID dtb_guid = { 0xb1b621d5, 0xf19c, 0x41a5,
                                      { 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0 } };
   const UINT8 *h = NULL;
@@ -406,6 +407,7 @@ static UINTN fdt_cpu_mpidrs(AppContext *ctx, UINT64 *out, UINTN max) {
   UINT32 depth = 0, cells = 1;
   BOOLEAN in_cpus = FALSE, is_cpu = FALSE, disabled = FALSE, have_reg = FALSE;
   UINT64 reg = 0;
+  UINT32 capacity = 0;
 
   for (;;) {
     UINT32 tok = fdt_be32(st);
@@ -422,10 +424,13 @@ static UINTN fdt_cpu_mpidrs(AppContext *ctx, UINT64 *out, UINTN max) {
       if (depth == 3 && in_cpus) {
         is_cpu = disabled = have_reg = FALSE;
         reg = 0;
+        capacity = 0;
       }
     } else if (tok == 2) {                             // end node
-      if (depth == 3 && in_cpus && is_cpu && have_reg && !disabled && found < max)
+      if (depth == 3 && in_cpus && is_cpu && have_reg && !disabled && found < max) {
+        cap[found] = capacity;
         out[found++] = reg;
+      }
       if (depth == 2)
         in_cpus = FALSE;
       --depth;
@@ -446,6 +451,8 @@ static UINTN fdt_cpu_mpidrs(AppContext *ctx, UINT64 *out, UINTN max) {
           for (UINT32 c = 0; c < cells; c++)
             reg = reg << 32 | fdt_be32(v + 4 * c);
           have_reg = TRUE;
+        } else if (fdt_str_eq(pname, "capacity-dmips-mhz") && len >= 4) {
+          capacity = fdt_be32(v);
         }
       }
     } else if (tok == 4) {                             // nop
@@ -1306,8 +1313,11 @@ EFI_STATUS dt_build(
 
     /* No HFS volume found: try an ext4 root (Ext4FileSystemDriver publishes
      * boot-uuid-media for it, mirroring AppleFileSystemDriver for HFS). */
+    /* No firmware disk (the Linux-image entry): ext4-uuid names the filesystem, and an
+     * MBR partition has no GPT UUID for a strict root match to find */
     if (!got_uuid && !got_hfs_uuid) {
-      got_ext4_uuid = find_ext4_boot_uuid(ctx, uuid_str);
+      got_ext4_uuid = boot_arg_get_uuid(boot_args, "ext4-uuid", uuid_str) ||
+                      find_ext4_boot_uuid(ctx, uuid_str);
     }
 
     /* Then an APFS container root (ApfsFileSystemDriver publishes
@@ -1315,8 +1325,11 @@ EFI_STATUS dt_build(
     /* No firmware disk (the Linux-image entry): the container UUID can come
      * from the boot-args and is then treated as if read from block zero */
     if (!got_uuid && !got_hfs_uuid && !got_ext4_uuid) {
-      got_apfs_uuid = boot_arg_get_uuid(boot_args, "apfs-container-uuid", uuid_str) ||
-                      find_apfs_boot_uuid(ctx, uuid_str);
+      got_apfs_uuid = boot_arg_get_uuid(boot_args, "apfs-container-uuid", uuid_str);
+      // IOUUIDMatching compares exactly and APFS media publish their uuids in upper case
+      for (UINTN _c = 0; got_apfs_uuid && _c < 36; _c++)
+        if (uuid_str[_c] >= 'a' && uuid_str[_c] <= 'f') uuid_str[_c] -= 'a' - 'A';
+      got_apfs_uuid = got_apfs_uuid || find_apfs_boot_uuid(ctx, uuid_str);
     }
 
     if (!got_uuid && !got_hfs_uuid && !got_ext4_uuid && !got_apfs_uuid) {
@@ -1533,7 +1546,10 @@ EFI_STATUS dt_build(
    */
   {
     UINT64 dram_base = XNU_LOADER_RAM_BASE;
-    UINT64 dram_size = app_detect_physical_memory_size(ctx);
+    /* The DRAM address extent includes reserved gaps; a sum of usable
+     * bytes misclassifies upper RAM pages as device memory in XNU. */
+    UINT64 dram_size = app_detect_physical_memory_extent(ctx, dram_base);
+    log_info(L"DT: DRAM extent base=0x%lx size=0x%lx\r\n", dram_base, dram_size);
     dt_prop(ctx, chosen, "dram-base", &dram_base, sizeof(dram_base));
     dt_prop(ctx, chosen, "dram-size", &dram_size, sizeof(dram_size));
   }
@@ -1552,7 +1568,22 @@ EFI_STATUS dt_build(
       tc_status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
           AllocateAddress, EfiLoaderData, 1, &tc_phys);
     }
-    if (!EFI_ERROR(tc_status)) {
+    if (!EFI_ERROR(tc_status) && ctx->trustcache_data != NULL) {
+      // Apple's trust caches from \trustcache.bin, already in the offsets header + modules layout
+      CopyMem((VOID *)(UINTN)tc_phys, ctx->trustcache_data, ctx->trustcache_size);
+
+      if (memory_map == NULL) {
+        memory_map = dt_create_node(ctx);
+        dt_prop_str(ctx, memory_map, "name", "memory-map");
+      }
+
+      MemoryMapFileInfo tc_info;
+      tc_info.paddr = (UINT64)tc_phys;
+      tc_info.length = ctx->trustcache_size;
+      dt_prop(ctx, memory_map, "TrustCache", &tc_info, sizeof(tc_info));
+
+      log_info(L"DT: TrustCache at 0x%lx, %lu bytes\r\n", (UINT64)tc_phys, ctx->trustcache_size);
+    } else if (!EFI_ERROR(tc_status)) {
       TrustCacheModule1Empty *tc = (TrustCacheModule1Empty *)(UINTN)tc_phys;
       SetMem(tc, EFI_PAGE_SIZE, 0);
       tc->version = 1;
@@ -1774,9 +1805,16 @@ EFI_STATUS dt_build(
    * Only the boot CPU carries state "running" - that is how xnu picks it out. */
   {
     UINT64 mpidr[32];
+    UINT32 cap[32] = { 0 }, cap_min = 0, cap_max = 0;
     UINTN ncpu = acpi_cpu_mpidrs(ctx, mpidr, 32);
     if (ncpu == 0)
-      ncpu = fdt_cpu_mpidrs(ctx, mpidr, 32);
+      ncpu = fdt_cpu_mpidrs(ctx, mpidr, cap, 32);
+    for (UINTN ci = 0; ci < ncpu; ci++) {
+      if (cap[ci] != 0 && (cap_min == 0 || cap[ci] < cap_min))
+        cap_min = cap[ci];
+      if (cap[ci] > cap_max)
+        cap_max = cap[ci];
+    }
     UINT64 cntfrq;
 
     __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(cntfrq));
@@ -1799,6 +1837,10 @@ EFI_STATUS dt_build(
       dt_prop_str(ctx, cpu, "state", ci == 0 ? "running" : "waiting");
       dt_prop_u64(ctx, cpu, "reg", mpidr[ci]);
       dt_prop_u32(ctx, cpu, "timebase-frequency", (UINT32)cntfrq);
+      // mixed core types (capacity-dmips-mhz differs): "P" for the fastest, "E" for the rest, as Apple's
+      // device trees spell cluster-type. xnu then makes one cluster of each
+      if (cap_min != 0 && cap_min != cap_max && cap[ci] != 0)
+        dt_prop_str(ctx, cpu, "cluster-type", cap[ci] == cap_max ? "P" : "E");
       dt_add_child(ctx, cpus, cpu);
     }
     log_info(L"DT: published %lu cpu node(s)\r\n", (UINT64)ncpu);

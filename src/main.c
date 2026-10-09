@@ -25,6 +25,51 @@ static BOOLEAN boot_args_has_rd(const CHAR8 *args) {
   return FALSE;
 }
 
+// held at power-on like a Mac's command keys: V boots verbose with the text console kept live, S single-user
+// keys typed during the firmware are buffered, so a short poll catches them
+static VOID boot_keys_apply(AppContext *ctx, CONST CHAR8 **cmdline, BOOLEAN *owned) {
+  EFI_INPUT_KEY key;
+  BOOLEAN verbose = FALSE, single = FALSE;
+  CHAR8 *copy = NULL;
+  UINTN len = 0, i, extra;
+
+  if (ST == NULL || ST->ConIn == NULL)
+    return;
+  for (i = 0; i < 25; i++) {
+    while (!EFI_ERROR(uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key))) {
+      if (key.UnicodeChar == L'v' || key.UnicodeChar == L'V')
+        verbose = TRUE;
+      if (key.UnicodeChar == L's' || key.UnicodeChar == L'S')
+        single = TRUE;
+    }
+    uefi_call_wrapper(ctx->bs->Stall, 1, 20000);
+  }
+
+  verbose = verbose && !boot_cmdline_has_flag(*cmdline, (const CHAR8 *)"-v");
+  single = single && !boot_cmdline_has_flag(*cmdline, (const CHAR8 *)"-s");
+  if (!verbose && !single)
+    return;
+  while ((*cmdline)[len] != '\0')
+    len++;
+  extra = (verbose ? 16 : 0) + (single ? 3 : 0);
+  if (EFI_ERROR(uefi_call_wrapper(ctx->bs->AllocatePool, 3, EfiLoaderData, len + extra + 1, (VOID **)&copy)))
+    return;
+  CopyMem(copy, *cmdline, len);
+  if (verbose) {
+    CopyMem(copy + len, " -v gopconsole=1", 16);
+    len += 16;
+  }
+  if (single) {
+    CopyMem(copy + len, " -s", 3);
+    len += 3;
+  }
+  copy[len] = '\0';
+  if (*owned)
+    app_free_pool(ctx, (VOID *)(UINTN)*cmdline);
+  *cmdline = copy, *owned = TRUE;
+  log_info(L"boot keys: using \"%a\"\r\n", copy);
+}
+
 static EFI_STATUS append_ramdisk_boot_arg(
     AppContext *ctx, const CHAR8 **cmdline, BOOLEAN *owned) {
   const CHAR8 suffix[] = " ";
@@ -51,6 +96,31 @@ static EFI_STATUS append_ramdisk_boot_arg(
   *owned = TRUE;
   return EFI_SUCCESS;
 }
+
+#if defined(__aarch64__)
+// Apple's trust caches, merged and laid out as XNU reads them from /chosen/memory-map/TrustCache.
+// Without the file the loader keeps publishing an empty static module
+static VOID load_trustcache(AppContext *ctx) {
+  EFI_FILE_PROTOCOL *root = NULL;
+  FileBuffer file = {0};
+  EFI_STATUS status;
+
+  ctx->trustcache_slack = XNU_BOOTINFO_ALIGN;
+  status = app_open_self_volume(ctx, &root);
+  if (!EFI_ERROR(status)) {
+    status = file_read_all(ctx, root, L"\\trustcache.bin", &file);
+    uefi_call_wrapper(root->Close, 1, root);
+  }
+  if (EFI_ERROR(status) || file.size < 8) {
+    log_info(L"no trustcache.bin (%r); using an empty static trust cache\r\n", status);
+    return;
+  }
+  ctx->trustcache_data = file.data;
+  ctx->trustcache_size = file.size;
+  ctx->trustcache_slack = (file.size + XNU_BOOTINFO_ALIGN - 1) & ~(XNU_BOOTINFO_ALIGN - 1);
+  log_info(L"trustcache.bin: %lu bytes\r\n", (UINT64)file.size);
+}
+#endif
 
 static EFI_STATUS load_ramdisk(AppContext *ctx) {
   EFI_FILE_PROTOCOL *root = NULL;
@@ -274,24 +344,25 @@ EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes, UINT64 virt_
 
   FindXnuWindow(ctx);
 
-  /* Start inside the window, leaving room below for the trustcache page */
+  /* Start inside the window, leaving room below for the trust caches */
+  UINT64 tc_slack = ctx->trustcache_slack ? ctx->trustcache_slack : XNU_BOOTINFO_ALIGN;
   if (g_xnu_window_lo > XNU_LOADER_RAM_BASE) {
-    UINT64 w = (g_xnu_window_lo + XNU_BOOTINFO_ALIGN + XNU_L2_BLOCK_SIZE - 1) & ~(XNU_L2_BLOCK_SIZE - 1);
+    UINT64 w = (g_xnu_window_lo + tc_slack + XNU_L2_BLOCK_SIZE - 1) & ~(XNU_L2_BLOCK_SIZE - 1);
     if (w + required_rem > first)
       first = w + required_rem;
   }
-  /* Two XNU_BOOTINFO_ALIGN slacks: one below base for the trustcache page,
+  /* Two slacks: one below base for the trust caches,
    * one above to keep the bootinfo block inside this allocation. */
   UINTN total_pages = (UINTN)((span_bytes +
                                (XNU_BOOTINFO_END - XNU_BOOTINFO_BASE) +
-                               2 * XNU_BOOTINFO_ALIGN +
+                               tc_slack + XNU_BOOTINFO_ALIGN +
                                EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT);
   EFI_PHYSICAL_ADDRESS base = 0;
   EFI_STATUS status = EFI_NOT_FOUND;
   for (UINT64 try = first; try < first + 64ULL * XNU_L2_BLOCK_SIZE; try += XNU_L2_BLOCK_SIZE) {
     /* Claim the trustcache page below the image as part of this allocation;
      * grabbing it separately afterwards fails whenever UEFI already owns it. */
-    base = try - XNU_BOOTINFO_ALIGN;
+    base = try - tc_slack;
     status = uefi_call_wrapper(ctx->bs->AllocatePages, 4,
       AllocateAddress, EfiLoaderData, total_pages, &base);
     if (!EFI_ERROR(status)) {
@@ -305,7 +376,7 @@ EFI_STATUS AllocKernelMemRegion(AppContext *ctx, UINT64 span_bytes, UINT64 virt_
     return status;
   }
 
-  SetMem((VOID *)(UINTN)(base - XNU_BOOTINFO_ALIGN),
+  SetMem((VOID *)(UINTN)(base - tc_slack),
          (UINTN)((UINT64)total_pages << EFI_PAGE_SHIFT), 0);
 
   ctx->kernel_region_base = base;
@@ -350,6 +421,46 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   status = app_init(&ctx, image, st);
   if (EFI_ERROR(status))
     return status;
+
+  // boot args and boot keys come first, so a graphical boot is quiet before anything prints
+  CONST CHAR8 *cmdline = "-v debug=0x219 -nogzalloc_mode keepsyms=1 serial=3 gopconsole=1";
+  BOOLEAN cmdline_owned = FALSE;
+  FileBuffer boot_args_file = {0};
+  EFI_STATUS args_status = file_read_all_from_any_volume(
+      &ctx,
+      L"\\EFI\\BOOT\\boot-args.txt",
+      &boot_args_file,
+      NULL);
+
+  if (!EFI_ERROR(args_status) && boot_args_file.size > 0) {
+    UINTN len = boot_args_file.size;
+    CHAR8 *bytes = (CHAR8 *)boot_args_file.data;
+    /* Trim trailing CR/LF/whitespace a text editor may have left. */
+    while (len > 0 &&
+           (bytes[len - 1] == '\n' || bytes[len - 1] == '\r' ||
+            bytes[len - 1] == ' '  || bytes[len - 1] == '\t'))
+      len--;
+
+    if (len > 0) {
+      CHAR8 *copy = NULL;
+      status = uefi_call_wrapper(ctx.bs->AllocatePool, 3, EfiLoaderData, len + 1, (VOID **)&copy);
+      if (!EFI_ERROR(status)) {
+        CopyMem(copy, bytes, len);
+        copy[len] = '\0';
+        cmdline = copy;
+        cmdline_owned = TRUE;
+        log_info(L"boot-args.txt: using \"%a\"\r\n", cmdline);
+      } else {
+        log_error(L"boot-args.txt: AllocatePool failed (%r), using default\r\n", status);
+      }
+    }
+    file_free(&ctx, &boot_args_file);
+  } else {
+    log_info(L"no boot-args.txt found (%r); using default boot args\r\n", args_status);
+  }
+  boot_keys_apply(&ctx, &cmdline, &cmdline_owned);
+  if (!boot_cmdline_has_flag(cmdline, (const CHAR8 *)"-v"))
+    log_screen_quiet();
 
   log_info(L"XNU EFI loader start\r\n");
 
@@ -460,6 +571,10 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   }
 #endif
 
+#if defined(__aarch64__)
+  load_trustcache(&ctx);
+#endif
+
   /* Allocate a high staging buffer for the kernel image. */
   {
     UINT64 lo2 = 0, hi2 = 0;
@@ -475,13 +590,13 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   ctx.phys_base = ctx.kernel_region_base;
 
 #if defined(__aarch64__)
-  if (ctx.kernel_region_base < XNU_BOOTINFO_ALIGN) {
+  if (ctx.kernel_region_base < ctx.trustcache_slack) {
     log_error(L"trustcache: kernel staging address is too low\r\n");
     file_free(&ctx, &kernel);
     return EFI_OUT_OF_RESOURCES;
   }
   /* Already inside the staging allocation; see AllocKernelMemRegion. */
-  ctx.trustcache_phys = ctx.kernel_region_base - XNU_BOOTINFO_ALIGN;
+  ctx.trustcache_phys = ctx.kernel_region_base - ctx.trustcache_slack;
   log_info(L"arm64 trustcache page=0x%lx (below kernel)\r\n",
            (UINT64)ctx.trustcache_phys);
 
@@ -583,41 +698,6 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
     return status;
   }
 
-  CONST CHAR8 *cmdline = "-v debug=0x219 -nogzalloc_mode keepsyms=1 serial=3 gopconsole=1";
-  BOOLEAN cmdline_owned = FALSE;
-  FileBuffer boot_args_file = {0};
-  EFI_STATUS args_status = file_read_all_from_any_volume(
-      &ctx,
-      L"\\EFI\\BOOT\\boot-args.txt",
-      &boot_args_file,
-      NULL);
-
-  if (!EFI_ERROR(args_status) && boot_args_file.size > 0) {
-    UINTN len = boot_args_file.size;
-    CHAR8 *bytes = (CHAR8 *)boot_args_file.data;
-    /* Trim trailing CR/LF/whitespace a text editor may have left. */
-    while (len > 0 &&
-           (bytes[len - 1] == '\n' || bytes[len - 1] == '\r' ||
-            bytes[len - 1] == ' '  || bytes[len - 1] == '\t'))
-      len--;
-
-    if (len > 0) {
-      CHAR8 *copy = NULL;
-      status = uefi_call_wrapper(ctx.bs->AllocatePool, 3, EfiLoaderData, len + 1, (VOID **)&copy);
-      if (!EFI_ERROR(status)) {
-        CopyMem(copy, bytes, len);
-        copy[len] = '\0';
-        cmdline = copy;
-        cmdline_owned = TRUE;
-        log_info(L"boot-args.txt: using \"%a\"\r\n", cmdline);
-      } else {
-        log_error(L"boot-args.txt: AllocatePool failed (%r), using default\r\n", status);
-      }
-    }
-    file_free(&ctx, &boot_args_file);
-  } else {
-    log_info(L"no boot-args.txt found (%r); using default boot args\r\n", args_status);
-  }
 
   // disabled until things work right
   //if (ctx.ramdisk_size != 0) {
@@ -638,18 +718,18 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   LowMemBuffer arm64_args_buf = {0};
   arm64_boot_args *arm64_args = NULL;
   {
-    UINT64 arm64_phys_base = ctx.kernel_region_base - XNU_BOOTINFO_ALIGN;
+    UINT64 arm64_phys_base = ctx.kernel_region_base - ctx.trustcache_slack;
     UINT64 arm64_physical_mem_size =
         (XNU_LOADER_RAM_BASE + app_detect_physical_memory_size(&ctx))
         - arm64_phys_base;
-    /* Managed memory ends where the window does, before any firmware hole above it */
-    if (g_xnu_window_hi > arm64_phys_base &&
-        g_xnu_window_hi - arm64_phys_base < arm64_physical_mem_size)
+    /* Managed memory ends where the window does, before any firmware hole above it. The
+     * detected size sums RAM around the holes below, so base + size falls short of the end */
+    if (g_xnu_window_hi > arm64_phys_base)
       arm64_physical_mem_size = g_xnu_window_hi - arm64_phys_base;
     status = arm64_boot_build_args(
         &ctx,
         cmdline,
-        load_result.lowest_vmaddr - XNU_BOOTINFO_ALIGN,  /* virtBase */
+        load_result.lowest_vmaddr - ctx.trustcache_slack,  /* virtBase */
         arm64_phys_base,                         /* physBase - staging IS final for arm64 */
         arm64_physical_mem_size,
         XNU_BOOTINFO_END,                        /* topOfKernelData: covers boot-info block */
@@ -754,6 +834,11 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   log_info(L"stack_top = 0x%lx\r\n",      (UINT64)(UINTN)stack_top);
   log_info(L"entry     = 0x%lx\r\n",      (UINT64)(UINTN)host_entry);
 #endif // VERBOSE_BOOT
+
+#if !defined(__aarch64__) && !defined(__riscv)
+  // last thing before the handoff, so no later log line lands on the boot screen
+  boot_draw_logo(boot_state.args);
+#endif
 
   /* No logging after this point */
   status = exit_boot_services_retry(&ctx, image, &boot_state);

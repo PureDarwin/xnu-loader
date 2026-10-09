@@ -77,11 +77,11 @@ VOID app_free_pool(AppContext *ctx, VOID *ptr) {
     uefi_call_wrapper(ctx->bs->FreePool, 1, ptr);
 }
 
-UINT64 app_detect_physical_memory_size(AppContext *ctx) {
+static UINT64 app_detect_memory(AppContext *ctx, UINT64 base, BOOLEAN extent) {
   UINTN map_size = 0, key = 0, desc_size = 0;
   UINT32 desc_ver = 0;
   EFI_MEMORY_DESCRIPTOR *mm = NULL;
-  UINT64 total = 0;
+  UINT64 total = 0, end = base;
 
   uefi_call_wrapper(ctx->bs->GetMemoryMap, 5,
       &map_size, mm, &key, &desc_size, &desc_ver);
@@ -113,10 +113,22 @@ UINT64 app_detect_physical_memory_size(AppContext *ctx) {
         d->Type == EfiACPIReclaimMemory  ||
         d->Type == EfiACPIMemoryNVS      ||
         d->Type == EfiPalCode) {
-      total += d->NumberOfPages << EFI_PAGE_SHIFT;
+      UINT64 bytes = d->NumberOfPages << EFI_PAGE_SHIFT;
+      total += bytes;
+      if (d->PhysicalStart >= base && bytes <= ~0ULL - d->PhysicalStart &&
+          d->PhysicalStart + bytes > end)
+        end = d->PhysicalStart + bytes;
     }
   }
 
   uefi_call_wrapper(ctx->bs->FreePool, 1, mm);
-  return total;
+  return extent ? end - base : total;
+}
+
+UINT64 app_detect_physical_memory_size(AppContext *ctx) {
+  return app_detect_memory(ctx, 0, FALSE);
+}
+
+UINT64 app_detect_physical_memory_extent(AppContext *ctx, UINT64 base) {
+  return app_detect_memory(ctx, base, TRUE);
 }

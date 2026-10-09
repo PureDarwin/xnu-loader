@@ -78,6 +78,7 @@ set(SOURCES
   src/main.c
   src/app.c
   src/boot.c
+  src/logo.c
   src/console.c
   src/devtree.c
   src/fdt_board.c
