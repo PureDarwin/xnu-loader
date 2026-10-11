@@ -243,6 +243,7 @@ typedef struct boot_video_info {
 
 EFI_STATUS boot_fill_video(AppContext *ctx, boot_args *args);
 void boot_draw_logo(boot_args *args);
+VOID boot_save_panic_log(AppContext *ctx);
 BOOLEAN boot_cmdline_has_flag(const CHAR8 *cmdline, const CHAR8 *flag);
 #if defined(__aarch64__) || defined(__riscv)
 EFI_STATUS arm64_boot_fill_video(AppContext *ctx, arm64_boot_args *args);

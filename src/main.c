@@ -461,6 +461,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   boot_keys_apply(&ctx, &cmdline, &cmdline_owned);
   if (!boot_cmdline_has_flag(cmdline, (const CHAR8 *)"-v"))
     log_screen_quiet();
+  boot_save_panic_log(&ctx);
 
   log_info(L"XNU EFI loader start\r\n");
 
@@ -561,7 +562,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   }
 
 #if !defined(__aarch64__)
-  /* x86: the boot-info block lives at a fixed low address (0x2800000);
+  /* x86: the boot-info block lives at a fixed low address (0x3000000);
    * reserve it before the staging allocation can land on it. On arm64 the
    * block is carved out of the staging region itself, after it exists. */
   status = ReserveBootInfoGuard(&ctx, &bootinfo_guard_base, &bootinfo_guard_pages);
