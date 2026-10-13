@@ -89,12 +89,89 @@ VOID file_free(AppContext *ctx, FileBuffer *buf) {
   buf->size = 0;
 }
 
+// the directory this loader was started from, e.g. \EFI\PureDarwin\, from its file path node
+static BOOLEAN loader_dir(EFI_LOADED_IMAGE *li, CHAR16 *out, UINTN max)
+{
+  EFI_DEVICE_PATH *dp = li ? li->FilePath : NULL;
+  UINTN n = 0, cut = 0;
+
+  while (dp && !(dp->Type == END_DEVICE_PATH_TYPE)) {
+    UINTN len = (UINTN)dp->Length[0] | ((UINTN)dp->Length[1] << 8);
+    if (len < 4) break;
+    if (dp->Type == MEDIA_DEVICE_PATH && dp->SubType == MEDIA_FILEPATH_DP) {
+      CONST CHAR16 *name = ((FILEPATH_DEVICE_PATH *)dp)->PathName;
+      for (UINTN i = 0; name[i] && n + 1 < max; i++) {
+        out[n] = name[i] == L'/' ? L'\\' : name[i];
+        if (out[n] == L'\\') cut = n + 1;
+        n++;
+      }
+    }
+    dp = (EFI_DEVICE_PATH *)((UINT8 *)dp + len);
+  }
+  out[cut] = 0;
+  return cut > 1;
+}
+
+static BOOLEAN str_prefix(CONST CHAR16 *s, CONST CHAR16 *pre, UINTN *len)
+{
+  UINTN i = 0;
+  for (; pre[i]; i++) {
+    CHAR16 a = s[i], b = pre[i];
+    if (a >= L'a' && a <= L'z') a -= 32;
+    if (b >= L'a' && b <= L'z') b -= 32;
+    if (a != b) return FALSE;
+  }
+  *len = i;
+  return TRUE;
+}
+
+static EFI_STATUS read_from_volume(AppContext *ctx, EFI_HANDLE h, CONST CHAR16 *path, FileBuffer *out_buf)
+{
+  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = NULL;
+  EFI_FILE_PROTOCOL *root = NULL;
+  EFI_STATUS st;
+
+  st = uefi_call_wrapper(ctx->bs->HandleProtocol, 3, h, &gEfiSimpleFileSystemProtocolGuid, (VOID **)&fs);
+  if (EFI_ERROR(st)) return st;
+  st = uefi_call_wrapper(fs->OpenVolume, 2, fs, &root);
+  if (EFI_ERROR(st)) return st;
+  st = file_read_all(ctx, root, path, out_buf);
+  uefi_call_wrapper(root->Close, 1, root);
+  return st;
+}
+
 EFI_STATUS file_read_all_from_any_volume(
     AppContext *ctx,
     CONST CHAR16 *path,
     FileBuffer *out_buf,
     EFI_HANDLE *out_handle)
 {
+  // a loader installed beside another system's, e.g. \EFI\PureDarwin\BOOTX64.EFI, keeps its kernel and
+  // boot-args.txt in its own directory, so \EFI\BOOT\ files are looked for there first
+  {
+    EFI_LOADED_IMAGE *li = NULL;
+    CHAR16 dir[128], own[192];
+    UINTN pre = 0;
+
+    if (path && out_buf && str_prefix(path, L"\\EFI\\BOOT\\", &pre) &&
+        !EFI_ERROR(app_get_loaded_image(ctx, &li)) && li && li->DeviceHandle &&
+        loader_dir(li, dir, 128)) {
+      UINTN dpre = 0;
+      if (!(str_prefix(dir, L"\\EFI\\BOOT\\", &dpre) && dir[dpre] == 0)) {
+        UINTN n = 0;
+        for (UINTN i = 0; dir[i] && n + 1 < 192; i++) own[n++] = dir[i];
+        for (UINTN i = pre; path[i] && n + 1 < 192; i++) own[n++] = path[i];
+        own[n] = 0;
+        out_buf->data = NULL;
+        out_buf->size = 0;
+        if (!EFI_ERROR(read_from_volume(ctx, li->DeviceHandle, own, out_buf))) {
+          if (out_handle) *out_handle = li->DeviceHandle;
+          return EFI_SUCCESS;
+        }
+      }
+    }
+  }
+
   EFI_STATUS status;
   EFI_HANDLE *handles = NULL;
   UINTN handle_count = 0;
@@ -119,6 +196,22 @@ EFI_STATUS file_read_all_from_any_volume(
       &handles);
   if (EFI_ERROR(status))
     return status;
+
+  // the volume this loader was started from goes first, so a second install's
+  // kernel and root are not picked up from whichever disk the firmware lists first
+  {
+    EFI_LOADED_IMAGE *li = NULL;
+
+    if (!EFI_ERROR(app_get_loaded_image(ctx, &li)) && li && li->DeviceHandle) {
+      for (i = 1; i < handle_count; i++) {
+        if (handles[i] == li->DeviceHandle) {
+          handles[i] = handles[0];
+          handles[0] = li->DeviceHandle;
+          break;
+        }
+      }
+    }
+  }
 
   for (i = 0; i < handle_count; i++) {
     EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = NULL;

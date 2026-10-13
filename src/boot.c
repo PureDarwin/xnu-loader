@@ -761,14 +761,11 @@ EFI_STATUS boot_fill_video(
    * masks the low two bits before ml_io_map_unmappable()). */
   args->Video.v_baseAddr = vi.base_addr | 1ULL;
 
-  /* VideoV1 (the struct XNU reads at boot_args+1048): base addr is 32-bit.
-   * XNU's Boot_Video.v_baseAddr is 32-bit, so a framebuffer above 4GB cannot
-   * be described, warn (some discrete GPUs place the FB high, but Macs and
-   * most laptop iGPUs keep it below 4GB). */
+  // the kernel reads the 64-bit Video above, VideoV1 is only for old kernels and can't hold a high framebuffer
   if (vi.base_addr > 0xFFFFFFFFULL)
-    log_error(L"boot_fill_video: WARNING framebuffer 0x%lx > 4GB, truncated\r\n",
-              vi.base_addr);
-  args->VideoV1.v_baseAddr = (UINT32)vi.base_addr;
+    log_info(L"boot_fill_video: framebuffer 0x%lx is above 4GB, VideoV1 left empty\r\n",
+             vi.base_addr);
+  args->VideoV1.v_baseAddr = vi.base_addr > 0xFFFFFFFFULL ? 0 : (UINT32)vi.base_addr;
   args->VideoV1.v_display  = (UINT32)vi.display;
   args->VideoV1.v_rowBytes = (UINT32)vi.row_bytes;
   args->VideoV1.v_width    = (UINT32)vi.width;
@@ -897,6 +894,10 @@ static VOID boot_sort_memory_map(UINT8 *map, UINTN map_sz, UINTN desc_sz) {
   }
 }
 
+#if defined(PD_ARCH_X86)
+VOID fb_stripe(UINT32 row, UINT32 colour);
+#endif
+
 EFI_STATUS exit_boot_services_retry(
     AppContext *ctx,
     EFI_HANDLE image,
@@ -969,6 +970,9 @@ EFI_STATUS exit_boot_services_retry(
     if (status == EFI_SUCCESS) {
       serial_reinit();
       serial_mark((CONST CHAR8 *)"ExitBootServices returned SUCCESS");
+#if defined(PD_ARCH_X86)
+      fb_stripe(4, 0xffffffff);
+#endif
       #if defined(XNU_LOADER_PLATFORM_SC8280XP)
         /* arm64 XNU never calls EFI runtime services, so the packing and 
         * SetVirtualAddressMap below serve nothing here. On the X13s the handoff
@@ -981,6 +985,9 @@ EFI_STATUS exit_boot_services_retry(
       UINTN rmap_sz  = state->memory_map_size;
 
       boot_sort_memory_map(rmap, rmap_sz, rdesc_sz);
+#if defined(PD_ARCH_X86)
+      fb_stripe(7, 0xffff8000);
+#endif
 
       /*
        * Pack base = 2MB-aligned first VA above the kernel image, then EXTEND
@@ -1025,18 +1032,44 @@ EFI_STATUS exit_boot_services_retry(
 
       /* Grow ksize so physfree covers the packed runtime region (2MB-rounded). */
       UINT64 new_kend = (va_cursor + 0x1FFFFFULL) & ~0x1FFFFFULL;
+#if defined(PD_ARCH_X86)
+      // physfree also covers the boot-info block above the window, as it did when the block sat below it
+      if (new_kend < ((XNU_BOOTINFO_END + 0x1FFFFFULL) & ~0x1FFFFFULL))
+        new_kend = (XNU_BOOTINFO_END + 0x1FFFFFULL) & ~0x1FFFFFULL;
+#endif
       state->args->ksize = (UINT32)(new_kend - kaddr);
 
       serial_trace((CONST CHAR8 *)"SVAM va_base   ", va_base);
       serial_trace((CONST CHAR8 *)"SVAM va_cursor ", va_cursor);
       serial_trace((CONST CHAR8 *)"SVAM new_kend  ", new_kend);
       serial_trace((CONST CHAR8 *)"SVAM ksize     ", (UINT64)state->args->ksize);
-      if (va_cursor > 0x3E800000ULL) {
-        serial_trace((CONST CHAR8 *)"FATAL runtime VA window passes NKPT edge 0x3E800000, cursor ",
+      // some firmware never returns from SetVirtualAddressMap with the window at 0x4200000, so it stays
+      // at 0x3200000 and a window that would reach the boot-info block goes without runtime services
+      if (va_cursor > 0x3E800000ULL || va_cursor > XNU_BOOTINFO_BASE) {
+        // the runtime regions do not fit below the kernel's early page tables, as on boards whose firmware
+        // marks large device windows runtime. the kernel runs without runtime services then, as Linux's
+        // efi=noruntime: nothing is marked runtime for it to map, and the copied runtime table fails its signature
+        serial_trace((CONST CHAR8 *)"runtime VA window passes NKPT edge 0x3E800000, no runtime services, cursor ",
                      va_cursor);
-        for (;;) { }
+#if defined(PD_ARCH_X86)
+        fb_stripe(8, 0xffff00ff);
+#endif
+        for (UINTN roff = 0; roff + rdesc_sz <= rmap_sz; roff += rdesc_sz)
+          ((EFI_MEMORY_DESCRIPTOR *)(rmap + roff))->Attribute &= ~EFI_MEMORY_RUNTIME;
+        if (state->rt_table_phys)
+          ((EFI_RUNTIME_SERVICES *)(UINTN)state->rt_table_phys)->Hdr.Signature = 0;
+        state->args->ksize = (UINT32)(((XNU_BOOTINFO_END + 0x1FFFFFULL) & ~0x1FFFFFULL) - kaddr);
+        if (state->args) {
+          state->args->efiRuntimeServicesPageStart = 0;
+          state->args->efiRuntimeServicesPageCount = 0;
+          state->args->efiRuntimeServicesVirtualPageStart = 0;
+        }
+        return EFI_SUCCESS;
       }
       serial_mark((CONST CHAR8 *)"calling SetVirtualAddressMap");
+#if defined(PD_ARCH_X86)
+      fb_stripe(5, 0xff00ffff);
+#endif
 
       // through the wrapper like every other firmware call: a direct call passes the sysv registers
       // and the firmware rejects what it finds in the ms ones
@@ -1058,6 +1091,9 @@ EFI_STATUS exit_boot_services_retry(
 
       serial_reinit();
       serial_trace((CONST CHAR8 *)"SetVirtualAddressMap returned ", (UINT64)svam);
+#if defined(PD_ARCH_X86)
+      fb_stripe(6, 0xff0000ff);
+#endif
 
       /* Update boot_args: virtual page start only.
        * efiSystemTable was already set to the conventional-memory copy

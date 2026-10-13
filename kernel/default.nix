@@ -38,7 +38,7 @@ stdenv.mkDerivation {
       $CC -c "$source" -o "$object" $common $includes
       objects="$objects $object"
     done
-    for source in src/main.c src/app.c src/boot.c src/console.c src/devtree.c \
+    for source in src/main.c src/app.c src/boot.c src/logo.c src/panic.c src/console.c src/devtree.c \
       src/fileio.c src/jump.S src/lowmem.c src/macho.c src/serial.c; do
       object="build/src-$(basename "$source").o"
       $CC -c "$source" -o "$object" $common -maccumulate-outgoing-args -mno-avx \

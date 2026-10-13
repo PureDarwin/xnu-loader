@@ -25,15 +25,15 @@
  * XNU_RT_VA_BASE; ksize is inflated so physfree covers everything.
  *
  * Layout (phys):
- *   [0x100000, ~0x28bc000)   kernel image (fileset KC extends this far)
- *   [0x3000000, 0x3020000)   boot-info block (boot_args/tables/DT/memmap)
- *   [0x3200000, va_cursor)   runtime-services VA pack; physfree = round_up(va_cursor)
+ *   [0x100000, ~0x3100000)   kernel image (fileset KC extends this far)
+ *   [0x4000000, 0x4020000)   boot-info block (boot_args/tables/DT/memmap)
+ *   [0x3200000, va_cursor)   runtime-services VA pack, below the boot-info block; physfree = round_up(va_cursor)
  */
 #if defined(__aarch64__) || defined(__riscv)
 extern EFI_PHYSICAL_ADDRESS g_xnu_bootinfo_base;
 #define XNU_BOOTINFO_BASE       g_xnu_bootinfo_base
 #else
-#define XNU_BOOTINFO_BASE       0x3000000ULL   /* 2MB-aligned, above KC image  */
+#define XNU_BOOTINFO_BASE       0x4000000ULL   /* 2MB-aligned, above KC image  */
 #endif
 #if defined(__riscv)
 // riscv64 xnu runs on 4k pages

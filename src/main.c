@@ -10,6 +10,22 @@
 
 static VOID   *g_jump_entry;
 static UINT64  g_jump_args;
+
+#if defined(PD_ARCH_X86)
+// a stripe along the bottom of the screen for each step after the firmware is gone, the only
+// sign of progress on a machine without a serial port. row 0 is the lowest
+static UINT64 g_fb_base;
+static UINT32 g_fb_pitch, g_fb_w, g_fb_h;
+
+VOID fb_stripe(UINT32 row, UINT32 colour)
+{
+  if (!g_fb_base || g_fb_h < 16 * (row + 2)) return;
+  for (UINT32 y = g_fb_h - 16 * (row + 1); y < g_fb_h - 16 * row - 4; y++) {
+    volatile UINT32 *line = (volatile UINT32 *)(UINTN)(g_fb_base + (UINT64)y * g_fb_pitch);
+    for (UINT32 x = 0; x < g_fb_w; x++) line[x] = colour;
+  }
+}
+#endif
 static VOID   *g_jump_stack;
 static UINT64  g_copy_src;
 static UINT64  g_copy_dst;
@@ -205,9 +221,15 @@ static VOID finish_boot_and_jump(VOID *unused) {
    * we jump to is whatever was already there. */
   if (dst64[0] != src64[0] || dst64[words - 1] != src64[words - 1]) {
     serial_mark((CONST CHAR8 *)"FATAL kernel copy did not land");
+#if defined(PD_ARCH_X86)
+    fb_stripe(3, 0xffff00ff);
+#endif
     for (;;) { }
   }
   serial_mark((CONST CHAR8 *)"copy verified");
+#if defined(PD_ARCH_X86)
+  fb_stripe(2, 0xff00ff00);
+#endif
   serial_mark((CONST CHAR8 *)"jumping to kernel");
 
   jump_to_xnu(g_jump_entry, g_jump_args, g_jump_stack);
@@ -562,7 +584,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   }
 
 #if !defined(__aarch64__)
-  /* x86: the boot-info block lives at a fixed low address (0x3000000);
+  /* x86: the boot-info block lives at a fixed low address (0x4000000);
    * reserve it before the staging allocation can land on it. On arm64 the
    * block is carved out of the staging region itself, after it exists. */
   status = ReserveBootInfoGuard(&ctx, &bootinfo_guard_base, &bootinfo_guard_pages);
@@ -839,6 +861,16 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
 #if !defined(__aarch64__) && !defined(__riscv)
   // last thing before the handoff, so no later log line lands on the boot screen
   boot_draw_logo(boot_state.args);
+#if defined(PD_ARCH_X86)
+  // the stripes are a verbose boot's, a normal boot keeps the logo clean
+  if (boot_state.args->Video.v_depth == 32 &&
+      boot_cmdline_has_flag((const CHAR8 *)boot_state.args->CommandLine, (const CHAR8 *)"-v")) {
+    g_fb_base = boot_state.args->Video.v_baseAddr & ~3ULL;
+    g_fb_pitch = boot_state.args->Video.v_rowBytes;
+    g_fb_w = boot_state.args->Video.v_width;
+    g_fb_h = boot_state.args->Video.v_height;
+  }
+#endif
 #endif
 
   /* No logging after this point */
@@ -849,6 +881,9 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   }
 
   serial_mark((CONST CHAR8 *)"exit_boot_services returned");
+#if defined(PD_ARCH_X86)
+  fb_stripe(0, 0xffff0000);
+#endif
 
 #if defined(PD_ARCH_X86)
   /* Copy staged kernel image to its SLID physical base (0x100000 + kslide).
@@ -1006,6 +1041,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   if (phys_real + load_result.image_size > XNU_BOOTINFO_BASE) {
     serial_trace((CONST CHAR8 *)"FATAL kernel overruns bootinfo at ",
                  XNU_BOOTINFO_BASE);
+    fb_stripe(3, 0xffff00ff);
     for (;;) { }
   }
 
@@ -1021,6 +1057,7 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   }
 
   /* Do the copy from a stack we own, clear of the destination. */
+  fb_stripe(1, 0xffffff00);
   pd_call_on_stack(stack_top, finish_boot_and_jump, NULL);
 #else
   /* Kernel image with its trust-cache page, boot-info block, and the ramdisk */
@@ -1030,6 +1067,9 @@ EFI_STATUS efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *st) {
   arm64_clean_to_poc(ctx.ramdisk_phys, ctx.ramdisk_size);
   __asm__ volatile("ic iallu; dsb ish; isb" : : : "memory");
   serial_mark((CONST CHAR8 *)"jumping to kernel");
+#if defined(PD_ARCH_X86)
+  fb_stripe(2, 0xff00ff00);
+#endif
   jump_to_xnu(g_jump_entry, g_jump_args, g_jump_stack);
 #endif
 }
