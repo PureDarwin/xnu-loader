@@ -138,25 +138,30 @@ static VOID load_trustcache(AppContext *ctx) {
 }
 #endif
 
+// read straight into the pages the kernel will use, a second copy of a live-media ramdisk would not fit below 4GB
 static EFI_STATUS load_ramdisk(AppContext *ctx) {
-  EFI_FILE_PROTOCOL *root = NULL;
-  FileBuffer image = {0};
+  EFI_FILE_PROTOCOL *root = NULL, *file = NULL;
   LowMemBuffer storage = {0};
+  UINTN size = 0;
   EFI_STATUS status;
 
   status = app_open_self_volume(ctx, &root);
   if (!EFI_ERROR(status)) {
-    status = file_read_all(ctx, root, L"\\ramdisk.img", &image);
+    status = file_open(root, L"\\ramdisk.img", EFI_FILE_MODE_READ, 0, &file);
     uefi_call_wrapper(root->Close, 1, root);
   }
+  if (!EFI_ERROR(status))
+    status = file_get_size(file, &size);
 
   if (EFI_ERROR(status)) {
+    if (file)
+      uefi_call_wrapper(file->Close, 1, file);
     log_info(L"no ramdisk.img found (%r); continuing without RAMDisk\r\n", status);
     return EFI_SUCCESS;
   }
 
-  if (image.size == 0) {
-    file_free(ctx, &image);
+  if (size == 0) {
+    uefi_call_wrapper(file->Close, 1, file);
     log_info(L"ramdisk.img is empty; continuing without RAMDisk\r\n");
     return EFI_SUCCESS;
   }
@@ -165,7 +170,7 @@ static EFI_STATUS load_ramdisk(AppContext *ctx) {
   // arm64 xnu hands everything above topOfKernelData to the vm, so keep the ramdisk
   // right after the boot-info block where topOfKernelData can cover it like iboot does
   {
-    UINTN pages = (image.size + EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT;
+    UINTN pages = (size + EFI_PAGE_SIZE - 1) >> EFI_PAGE_SHIFT;
     for (EFI_PHYSICAL_ADDRESS at = XNU_BOOTINFO_END;
          at < XNU_BOOTINFO_END + 64ULL * XNU_L2_BLOCK_SIZE;
          at = (at + XNU_L2_BLOCK_SIZE) & ~(XNU_L2_BLOCK_SIZE - 1)) {
@@ -174,25 +179,37 @@ static EFI_STATUS load_ramdisk(AppContext *ctx) {
               AllocateAddress, EfiLoaderData, pages, &try_at))) {
         storage.ptr = (VOID *)(UINTN)try_at;
         storage.phys = try_at;
-        storage.size = image.size;
+        storage.size = size;
         storage.pages = pages;
         break;
       }
     }
   }
   status = storage.ptr ? EFI_SUCCESS
-                       : lowmem_alloc_pages(ctx, image.size, EfiLoaderData, &storage);
+                       : lowmem_alloc_pages(ctx, size, EfiLoaderData, &storage);
 #else
-  status = lowmem_alloc_pages(ctx, image.size, EfiLoaderData, &storage);
+  status = lowmem_alloc_pages(ctx, size, EfiLoaderData, &storage);
 #endif
   if (EFI_ERROR(status)) {
-    file_free(ctx, &image);
-    log_error(L"failed to allocate RAMDisk pages: %r\r\n", status);
+    uefi_call_wrapper(file->Close, 1, file);
+    log_error(L"failed to allocate %lu bytes of RAMDisk pages: %r\r\n", (UINT64)size, status);
     return status;
   }
 
-  CopyMem(storage.ptr, image.data, image.size);
-  file_free(ctx, &image);
+  // in 16MB pieces, some firmware fails one read of a whole large file
+  for (UINTN done = 0; done < size;) {
+    UINTN chunk = size - done > 0x1000000 ? 0x1000000 : size - done;
+    status = uefi_call_wrapper(file->Read, 3, file, &chunk, (UINT8 *)storage.ptr + done);
+    if (EFI_ERROR(status) || chunk == 0) {
+      uefi_call_wrapper(file->Close, 1, file);
+      lowmem_free(ctx, &storage);
+      log_error(L"reading ramdisk.img failed at %lu of %lu: %r\r\n", (UINT64)done, (UINT64)size, status);
+      return EFI_ERROR(status) ? status : EFI_END_OF_FILE;
+    }
+    done += chunk;
+  }
+  uefi_call_wrapper(file->Close, 1, file);
+
   ctx->ramdisk_phys = storage.phys;
   ctx->ramdisk_size = (UINT64)(storage.pages << EFI_PAGE_SHIFT);
   log_info(L"loaded ramdisk.img RAMDisk phys=0x%lx size=0x%lx\r\n",
