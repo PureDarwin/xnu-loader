@@ -8,6 +8,7 @@ typedef enum {
   FDT_UART_NONE = 0,
   FDT_UART_PL011,
   FDT_UART_16550,
+  FDT_UART_MSM,     // qualcomm uartdm (msm8916 and friends), tx only
 } FdtUartKind;
 
 typedef struct {
@@ -26,6 +27,8 @@ typedef struct {
   UINT32 uart_clock, uart_baud;   // clock 0: take it from the divisor firmware left
 
   UINT32 psci_method;             // 0 unknown, 1 hvc, 2 smc
+
+  UINT32 timer_virt_intid;        // the virtual timer's INTID from /timer, 0 when the tree has none
 
   UINT32 gic_version;             // 2 or 3, 0 when there is none
   UINT64 gicd_base, gicd_size;

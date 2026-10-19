@@ -3,6 +3,7 @@
 #include "app.h"
 #include "boot.h"
 #include "platform.h"
+#include "ramlog.h"
 #include <efiprot.h>
 
 /* One NVRAM bank. 0x2000 is the conventional CHRP size and leaves room for the
@@ -1868,16 +1869,31 @@ EFI_STATUS dt_build(
     UINT64 ranges[3] = { 0, g_board.soc_base, g_board.soc_size };
     dt_prop(ctx, armio, "ranges", ranges, sizeof(ranges));
   }
-  if (g_board.uart_kind != FDT_UART_NONE) {
+#if defined(XNU_LOADER_RAMLOG)
+  /* a board built with a ram log has no uart anyone can reach: the log is XNU's console */
+  BOOLEAN xnu_console = TRUE;
+#else
+  BOOLEAN xnu_console = g_board.uart_kind != FDT_UART_NONE;
+#endif
+  if (xnu_console) {
     /* xnu 12377's serial_init picks a driver by matching "compatible" on the
      * node named by /defaults serial-device, so the node needs both that
      * string and a phandle to be reachable at all. Every 16550 goes to
      * pe_serial.c's DesignWare driver, with its layout and clock spelled out. */
     DeviceTreeNode *uart0 = dt_create_node(ctx);
     UINT64 uart_reg[2] = { g_board.uart_base - g_board.soc_base, g_board.uart_size };
+#if defined(XNU_LOADER_RAMLOG)
+    uart_reg[0] = XNU_LOADER_RAMLOG - g_board.soc_base;
+    uart_reg[1] = RAMLOG_TOTAL;
+#endif
     dt_prop_str(ctx, uart0, "name", "uart0");
     dt_prop_u32(ctx, uart0, "AAPL,phandle", XNU_LOADER_UART0_PHANDLE);
     dt_prop(ctx, uart0, "reg", uart_reg, sizeof(uart_reg));
+#if defined(XNU_LOADER_RAMLOG)
+    if (TRUE) {
+      dt_prop_str(ctx, uart0, "compatible", "pd,ramlog");
+    } else
+#endif
     if (g_board.uart_kind == FDT_UART_PL011) {
       dt_prop_str(ctx, uart0, "compatible", "arm,pl011");
     } else {
@@ -1899,6 +1915,9 @@ EFI_STATUS dt_build(
     dt_prop_str(ctx, gic, "name", "gic");
     dt_prop_str(ctx, gic, "compatible", g_board.gic_version == 3 ? "arm,gic-v3" : "arm,gic-400");
     dt_prop(ctx, gic, "reg", gic_reg, sizeof(gic_reg));
+    /* the virtual timer's INTID when the board's /timer gives one (27 is xnu's default) */
+    if (g_board.timer_virt_intid)
+      dt_prop_u32(ctx, gic, "timer-ppi", g_board.timer_virt_intid);
 #if defined(XNU_LOADER_PLATFORM_SC8280XP)
     /* the controller for device interrupts (PDArmGICSPI) */
     dt_prop(ctx, gic, "interrupt-controller", NULL, 0);
@@ -1907,9 +1926,27 @@ EFI_STATUS dt_build(
 #endif
     dt_add_child(ctx, armio, gic);
   }
-  log_info(L"DT: board uart 0x%lx gic%u 0x%lx/0x%lx arm-io 0x%lx+0x%lx%s\r\n",
+#if defined(XNU_LOADER_HANG_WDT)
+  {
+    /* the qualcomm apss watchdog the entry stub armed, for xnu to pet (osfmk/arm64/sleh.c):
+     * reg in the arm-io window, "pd,bark-intid" the bark's GIC INTID. Not "interrupts": IOKit
+     * would map that through the tree, and with no interrupt controller above (arm-io has no
+     * #interrupt-cells) IODTMapInterrupts steps by zero cells and never returns */
+    DeviceTreeNode *wdt = dt_create_node(ctx);
+    UINT64 wdt_reg[2] = { XNU_LOADER_HANG_WDT - g_board.soc_base, 0x1000 };
+    dt_prop_str(ctx, wdt, "name", "wdt");
+    dt_prop_str(ctx, wdt, "compatible", "qcom,kpss-wdt");
+    dt_prop(ctx, wdt, "reg", wdt_reg, sizeof(wdt_reg));
+#if defined(XNU_LOADER_HANG_WDT_BARK)
+    dt_prop_u32(ctx, wdt, "pd,bark-intid", XNU_LOADER_HANG_WDT_BARK);
+#endif
+    dt_add_child(ctx, armio, wdt);
+  }
+#endif
+  log_info(L"DT: board uart 0x%lx gic%u 0x%lx/0x%lx timer INTID %u arm-io 0x%lx+0x%lx%s\r\n",
            g_board.uart_base, g_board.gic_version, g_board.gicd_base, g_board.gic2_base,
-           g_board.soc_base, g_board.soc_size, g_board.from_fdt ? L" (from fdt)" : L"");
+           g_board.timer_virt_intid, g_board.soc_base, g_board.soc_size,
+           g_board.from_fdt ? L" (from fdt)" : L"");
 #else
   dt_prop_str(ctx, armio, "device_type", "bcm2837-io");
   {
@@ -1951,8 +1988,10 @@ EFI_STATUS dt_build(
 #if defined(__aarch64__) && defined(XNU_LOADER_PLATFORM_GENERIC)
   /* A real board's enabled devices come over from its tree, so the platform
    * expert can publish nubs for them. QEMU virt keeps the tree it always had. */
+#if !defined(XNU_LOADER_NO_FDT_IMPORT)
   if (g_board.from_fdt && !g_board.is_qemu_virt)
     dt_import_fdt(ctx, root, chosen);
+#endif
 #endif
 #endif
   dt_add_child(ctx, root, chosen);
@@ -2017,8 +2056,12 @@ EFI_STATUS dt_build(
     if (g_board.is_qemu_virt || !g_board.from_fdt)
       dt_prop_u32(ctx, defaults, "vmm-present", 1);
     /* Without this serial_init() returns early and the kernel is silent. */
+#if defined(XNU_LOADER_RAMLOG)
+    dt_prop_u32(ctx, defaults, "serial-device", XNU_LOADER_UART0_PHANDLE);
+#else
     if (g_board.uart_kind != FDT_UART_NONE)
       dt_prop_u32(ctx, defaults, "serial-device", XNU_LOADER_UART0_PHANDLE);
+#endif
 #else
     dt_prop_u32(ctx, defaults, "vmm-present", 1);
 #endif

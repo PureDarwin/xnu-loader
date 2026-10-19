@@ -1,5 +1,6 @@
 #include "efi_emulation.h"
 #include "serial.h"
+#include "platform.h"
 
 #if defined(__x86_64__)
 /* Frame pushed by exception_common, lowest address first. */
@@ -81,7 +82,7 @@ void efiemu_arm64_exception(UINT64 slot, UINT64 *regs) {
   report("  x1   ", regs[1]);
   report("  lr   ", regs[30]);
   for (;;)
-    __asm__ volatile("msr daifset, #0xf; wfi");
+    __asm__ volatile("msr daifset, #0xf; " XNU_LOADER_WAIT);
 }
 #elif defined(__riscv)
 extern const UINT8 efiemu_riscv64_trap[];

@@ -7,6 +7,18 @@
   # generic boards: a 4k-page kernel, and a UART for the progress marks before the tree is read
 , kernel4k ? false
 , markUart ? null
+  # boards with no reachable UART: a console in DRAM that survives a warm reset (include/ramlog.h),
+  # and a qualcomm apss watchdog armed at entry so a hang ends in that reset
+, ramlog ? null
+, hangWdt ? null
+  # bring-up only: PSCI reset right after this progress mark (a character, see include/ramlog.h)
+, resetAt ? null
+  # boards whose cores never come back from WFI outside their vendor kernel (include/platform.h)
+, noWfi ? false
+  # the watchdog bark's GIC INTID, for xnu to take as a panic (/arm-io/wdt "interrupts")
+, hangWdtBark ? null
+  # bring-up only: leave the board's own fdt nodes out of the tree xnu gets
+, noFdtImport ? false
 }:
 
 assert platform == "bcm2837" || platform == "generic" || platform == "qemuvirt" || platform == "sun50i" || platform == "sg2002";
@@ -29,6 +41,8 @@ stdenv.mkDerivation {
     includes="$includes -I${gnu-efi}/include/efi/protocol"
     defines="-DEFI_FUNCTION_WRAPPER -DCONFIG_aarch64 -DCONFIG_LOADER_aarch64 -DXNU_LOADER_PLATFORM_${lib.toUpper platform} -DLEGACY_BIOS"
     defines="$defines ${lib.optionalString kernel4k "-DXNU_LOADER_KERNEL_4K"} ${lib.optionalString (markUart != null) "-DXNU_LOADER_MARK_UART=${markUart}"}"
+    defines="$defines ${lib.optionalString (ramlog != null) "-DXNU_LOADER_RAMLOG=${ramlog}ULL"} ${lib.optionalString (hangWdt != null) "-DXNU_LOADER_HANG_WDT=${hangWdt}ULL"} ${lib.optionalString (resetAt != null) "-DXNU_LOADER_RESET_AT=mark_${resetAt}"}"
+    defines="$defines ${lib.optionalString noWfi "-DXNU_LOADER_NO_WFI"} ${lib.optionalString (hangWdtBark != null) "-DXNU_LOADER_HANG_WDT_BARK=${hangWdtBark}"} ${lib.optionalString noFdtImport "-DXNU_LOADER_NO_FDT_IMPORT"}"
 
     objects=""
     for source in kernel/entry/linux-arm64.S efi-emulation/exceptions-arm64.S src/jump.S; do
@@ -42,11 +56,12 @@ stdenv.mkDerivation {
     # Runs with the MMU off, where unaligned accesses fault
     $CC -c kernel/arm64.c -o build/kernel-arm64.c.o $common -mstrict-align $defines $includes
     $CC -c src/fdt_board.c -o build/src-fdt_board.c.o $common -mstrict-align $defines $includes
-    objects="$objects build/kernel-arm64.c.o build/src-fdt_board.c.o"
+    $CC -c src/ramlog.c -o build/src-ramlog.c.o $common -mstrict-align $defines $includes
+    objects="$objects build/kernel-arm64.c.o build/src-fdt_board.c.o build/src-ramlog.c.o"
     for source in kernel/cpio.c efi-emulation/exceptions.c efi-emulation/firmware.c \
       efi-emulation/modfs.c efi-emulation/storage.c \
       src/main.c src/app.c src/boot.c src/logo.c src/panic.c src/console.c src/devtree.c src/devtree-fdt.c src/fileio.c \
-      src/lowmem.c src/macho.c src/serial.c; do
+      src/lowmem.c src/macho.c src/serial.c src/inflate.c; do
       object="build/$(basename "$(dirname "$source")")-$(basename "$source").o"
       $CC -c "$source" -o "$object" $common $defines $includes
       objects="$objects $object"

@@ -39,7 +39,7 @@ stdenv.mkDerivation {
       objects="$objects $object"
     done
     for source in src/main.c src/app.c src/boot.c src/logo.c src/panic.c src/console.c src/devtree.c \
-      src/fileio.c src/jump.S src/lowmem.c src/macho.c src/serial.c; do
+      src/fileio.c src/jump.S src/lowmem.c src/macho.c src/serial.c src/inflate.c; do
       object="build/src-$(basename "$source").o"
       $CC -c "$source" -o "$object" $common -maccumulate-outgoing-args -mno-avx \
         -funsigned-char -DLEGACY_BIOS -DCONFIG_x86_64 $includes

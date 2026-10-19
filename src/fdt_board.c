@@ -162,10 +162,13 @@ static CONST struct {
   { "allwinner,sun6i-a31-uart", FDT_UART_16550, 2, 4 },
   { "ns16550a",                 FDT_UART_16550, 0, 1 },
   { "ns16550",                  FDT_UART_16550, 0, 1 },
+  { "qcom,msm-uartdm-v1.4",     FDT_UART_MSM,   0, 4 },
+  { "qcom,msm-uartdm",          FDT_UART_MSM,   0, 4 },
 };
 
 static CONST CHAR8 *gic3_compat[] = { "arm,gic-v3" };
-static CONST CHAR8 *gic2_compat[] = { "arm,gic-400", "arm,cortex-a15-gic", "arm,cortex-a9-gic", "arm,gic-v2" };
+static CONST CHAR8 *gic2_compat[] = { "arm,gic-400", "arm,cortex-a15-gic", "arm,cortex-a9-gic", "arm,gic-v2",
+                                      "qcom,msm-qgic2" };
 
 typedef struct {
   UINT32 addr_cells, size_cells;   // for this node's children
@@ -180,6 +183,8 @@ typedef struct {
   BOOLEAN disabled;
   BOOLEAN has_shift, has_width;
   UINT32 shift, width, clock, speed;
+  CONST UINT8 *interrupts;
+  UINT32 interrupts_len;
 } Level;
 
 typedef struct {
@@ -388,6 +393,13 @@ static VOID node_done(Level *lv, UINT32 depth, CONST CHAR8 *path, CONST CHAR8 *c
   if (compat_has(node->compat, node->compat_len, "pci-host-ecam-generic"))
     g_board.has_pci_ecam = TRUE;
 
+  // arm,armv8-timer: secure, non-secure, virtual, hypervisor PPIs as (type, number, flags)
+  if (!g_board.timer_virt_intid && node->interrupts && node->interrupts_len >= 36 &&
+      (compat_has(node->compat, node->compat_len, "arm,armv8-timer") ||
+       compat_has(node->compat, node->compat_len, "arm,armv7-timer")) &&
+      be32(node->interrupts + 24) == 1)
+    g_board.timer_virt_intid = be32(node->interrupts + 28) + 16;
+
   if (!*have_uart && console && path_is(path, node->path_len, console)) {
     for (UINT32 i = 0; i < sizeof(uart_table) / sizeof(uart_table[0]); ++i) {
       if (!compat_has(node->compat, node->compat_len, uart_table[i].compat))
@@ -534,6 +546,9 @@ BOOLEAN fdt_board_parse(CONST VOID *blob) {
         l->clock = be32(v);
       } else if (str_eq(pname, "current-speed") && len == 4) {
         l->speed = be32(v);
+      } else if (str_eq(pname, "interrupts")) {
+        l->interrupts = v;
+        l->interrupts_len = len;
       }
     } else if (tok == TOK_NOP) {
       continue;

@@ -48,5 +48,9 @@ efiemu_arm64_vector_common:
   mov x1, sp
   bl efiemu_arm64_exception
 1:
+#if defined(XNU_LOADER_NO_WFI)
+  wfe
+#else
   wfi
+#endif
   b 1b

@@ -4,6 +4,17 @@
 #if defined(__aarch64__)
 
 /*
+ * The instruction for "wait here until something happens". Some boards never come back
+ * from WFI outside their vendor kernel (msm8916 under lk2nd: the core is gone and not even
+ * the watchdog can reset it), so XNU_LOADER_NO_WFI waits with WFE instead.
+ */
+#if defined(XNU_LOADER_NO_WFI)
+#define XNU_LOADER_WAIT "wfe"
+#else
+#define XNU_LOADER_WAIT "wfi"
+#endif
+
+/*
  * Two kinds of arm64 target. BCM2837 is described by its own code (VideoCore
  * mailbox, no usable DTB at the loader). Everything else is a generic board read
  * from the flattened device tree the firmware passes (fdt_board.c).

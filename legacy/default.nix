@@ -39,7 +39,7 @@ stdenv.mkDerivation {
     done
     loader_objects=""
     for source in src/main.c src/app.c src/boot.c src/logo.c src/panic.c src/console.c src/devtree.c \
-      src/fileio.c src/jump.S src/lowmem.c src/macho.c src/serial.c; do
+      src/fileio.c src/jump.S src/lowmem.c src/macho.c src/serial.c src/inflate.c; do
       object="build/$(basename "$source").o"
       $CC -c "$source" -o "$object" -m64 -ffreestanding -fno-stack-protector \
         -fno-pic -mno-red-zone -mgeneral-regs-only -maccumulate-outgoing-args -mno-avx \

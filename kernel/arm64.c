@@ -4,6 +4,7 @@
 #include "efi_emulation.h"
 #include "serial.h"
 #include "platform.h"
+#include "ramlog.h"
 
 #define FDT_MAGIC 0xd00dfeedU
 #define FDT_BEGIN_NODE 1
@@ -20,8 +21,8 @@ struct range {
   UINT64 base, size;
 };
 
-static struct range ram[16], reserved[MAX_RESERVED], released[4];
-static UINT32 nram, nreserved, nreleased;
+static struct range ram[16], reserved[MAX_RESERVED], released[4], nomap[MAX_RESERVED];
+static UINT32 nram, nreserved, nreleased, nnomap;
 static UINT64 fdt_initrd_start, fdt_initrd_end;
 
 /* Simple-framebuffer node from u-boot, committed at the node end */
@@ -44,6 +45,41 @@ static UINT64 cells(CONST UINT8 *p, UINT32 n) {
     v = v << 32 | be32(p + 4 * i);
   return v;
 }
+
+#if defined(XNU_LOADER_HANG_WDT)
+/* A qualcomm apss watchdog (qcom,kpss-wdt layout) armed at its longest, so a hang
+ * anywhere from here into early XNU ends in a warm reset and the RAM log can be
+ * read. 20-bit counters on the 32.768 kHz sleep clock: 0xfffff is about 32 s. */
+#define WDT_RST       0x04
+#define WDT_EN        0x08
+#define WDT_BARK_TIME 0x10
+#define WDT_BITE_TIME 0x14
+
+static void hang_wdt_arm(void) {
+  volatile UINT32 *wdt = (volatile UINT32 *)(UINTN)XNU_LOADER_HANG_WDT;
+  wdt[WDT_EN / 4] = 0;
+  wdt[WDT_RST / 4] = 1;
+  wdt[WDT_BARK_TIME / 4] = 0xfffff;
+  wdt[WDT_BITE_TIME / 4] = 0xfffff;
+  wdt[WDT_EN / 4] = 1;
+  __asm__ volatile("dsb sy" : : : "memory");
+}
+#endif
+
+static void psci_reset(void);
+
+#if defined(XNU_LOADER_RAMLOG)
+/* bring-up bisection: -DXNU_LOADER_RESET_AT=mark_M resets right after mark M */
+#if defined(XNU_LOADER_RESET_AT)
+#define RESET_AT_STR2(x) #x
+#define RESET_AT_STR(x) RESET_AT_STR2(x)
+#define MARK(c) do { ramlog_mark(c); if ((c) == RESET_AT_STR(XNU_LOADER_RESET_AT)[5]) psci_reset(); } while (0)
+#else
+#define MARK(c) ramlog_mark(c)
+#endif
+#else
+#define MARK(c) ((void)0)
+#endif
 
 static BOOLEAN str_eq(CONST CHAR8 *a, CONST CHAR8 *b) {
   while (*a && *a == *b) {
@@ -100,6 +136,21 @@ static void add_reserved(UINT64 base, UINT64 size) {
   }
 }
 
+/* A reserved-memory node marked no-map must never be mapped cacheable: on Qualcomm
+ * parts a speculative fetch into a TrustZone or modem carve-out is an XPU violation,
+ * and TZ goes down with it, taking PSCI and the watchdog bite along. The whole 2 MiB
+ * blocks it touches are kept out of the cacheable map and out of usable memory. */
+#define NOMAP_ALIGN (1ULL << 21)
+
+static void add_nomap(UINT64 base, UINT64 size) {
+  if (size && nnomap < MAX_RESERVED) {
+    UINT64 b = base & ~(NOMAP_ALIGN - 1), e = (base + size + NOMAP_ALIGN - 1) & ~(NOMAP_ALIGN - 1);
+    nomap[nnomap].base = b;
+    nomap[nnomap++].size = e - b;
+    add_reserved(b, e - b);
+  }
+}
+
 static void log_ranges(CONST CHAR8 *what, CONST struct range *r, UINT32 n) {
   for (UINT32 i = 0; i < n; ++i) {
     efiemu_debug_string("xnu-loader kernel: ");
@@ -119,6 +170,9 @@ static void parse_fdt(UINT64 fdt) {
   CONST UINT8 *rsv = h + be32(h + 16);
   UINT32 addr_cells = 2, size_cells = 1, rsv_addr = 2, rsv_size = 1;
   UINT32 depth = 0;
+  CONST UINT8 *resmem_reg = NULL;
+  UINT32 resmem_reg_len = 0;
+  BOOLEAN resmem_nomap = FALSE;
   /* What the node at depth 1 is */
   enum { N_OTHER, N_MEMORY, N_CHOSEN, N_PSCI, N_RESMEM } kind = N_OTHER;
 
@@ -148,6 +202,20 @@ static void parse_fdt(UINT64 fdt) {
                : node_is(name, "reserved-memory") ? N_RESMEM
                                                  : N_OTHER;
     } else if (tok == FDT_END_NODE) {
+      if (depth == 3 && kind == N_RESMEM && resmem_reg) {
+        // reg and no-map can come in either order, so a carve-out is taken at its end
+        UINT32 stride = 4 * (rsv_addr + rsv_size);
+        for (UINT32 o = 0; o + stride <= resmem_reg_len; o += stride) {
+          UINT64 b = cells(resmem_reg + o, rsv_addr), sz = cells(resmem_reg + o + 4 * rsv_addr, rsv_size);
+          add_reserved(b, sz);
+          if (resmem_nomap)
+            add_nomap(b, sz);
+        }
+      }
+      if (depth == 3) {
+        resmem_reg = NULL;
+        resmem_nomap = FALSE;
+      }
       if (depth == 2) {
         commit_simplefb();
         kind = N_OTHER;
@@ -211,9 +279,10 @@ static void parse_fdt(UINT64 fdt) {
         else if (str_eq(pname, "#size-cells"))
           rsv_size = be32(v);
       } else if (depth == 3 && kind == N_RESMEM && str_eq(pname, "reg")) {
-        UINT32 stride = 4 * (rsv_addr + rsv_size);
-        for (UINT32 o = 0; o + stride <= len; o += stride)
-          add_reserved(cells(v + o, rsv_addr), cells(v + o + 4 * rsv_addr, rsv_size));
+        resmem_reg = v;
+        resmem_reg_len = len;
+      } else if (depth == 3 && kind == N_RESMEM && str_eq(pname, "no-map")) {
+        resmem_nomap = TRUE;
       }
     } else if (tok == FDT_NOP) {
       continue;
@@ -221,6 +290,16 @@ static void parse_fdt(UINT64 fdt) {
       break;
     }
   }
+
+#if defined(XNU_LOADER_RAMLOG)
+  // the log must outlive the loader: nothing after it may take those pages
+  add_reserved(XNU_LOADER_RAMLOG, RAMLOG_TOTAL);
+#endif
+
+  // the boot loader's initrd is read as modules long after the allocator starts handing out RAM
+  if (fdt_initrd_end > fdt_initrd_start)
+    add_reserved(fdt_initrd_start & ~0xfffULL,
+                 ((fdt_initrd_end + 0xfffULL) & ~0xfffULL) - (fdt_initrd_start & ~0xfffULL));
 
   // a reservation the script released goes only on an exact match
   for (UINT32 i = 0; i < nreserved;) {
@@ -291,6 +370,18 @@ static BOOLEAN touches_ram(UINT64 b, UINT64 e) {
   return FALSE;
 }
 
+static BOOLEAN touches_nomap(UINT64 b, UINT64 e) {
+  for (UINT32 r = 0; r < nnomap; ++r)
+    if (b < nomap[r].base + nomap[r].size && e > nomap[r].base)
+      return TRUE;
+  return FALSE;
+}
+
+/* cacheable: all RAM, and none of it a no-map carve-out */
+static BOOLEAN is_normal(UINT64 b, UINT64 e) {
+  return is_ram(b, e) && !touches_nomap(b, e);
+}
+
 static UINT64 block(UINT64 pa, BOOLEAN normal) {
   return pa | PT_BLOCK | PT_AF |
          (normal ? PT_ATTR(1) | PT_SH_INNER : PT_ATTR(2) | PT_XN);
@@ -300,15 +391,15 @@ static void arm64_enable_mmu(void) {
   UINT32 used = 0;
   for (UINT64 g = 0; g < 512; ++g) {
     UINT64 gb = g << 30;
-    if (touches_ram(gb, gb + (1ULL << 30)) && !is_ram(gb, gb + (1ULL << 30)) && used < 8) {
+    if (touches_ram(gb, gb + (1ULL << 30)) && !is_normal(gb, gb + (1ULL << 30)) && used < 8) {
       UINT64 *t = l2[used++];
       for (UINT64 i = 0; i < 512; ++i) {
         UINT64 pa = gb + (i << 21);
-        t[i] = block(pa, is_ram(pa, pa + (1ULL << 21)));
+        t[i] = block(pa, is_normal(pa, pa + (1ULL << 21)));
       }
       l1[g] = (UINT64)(UINTN)t | PT_TABLE;
     } else {
-      l1[g] = block(gb, touches_ram(gb, gb + (1ULL << 30)));
+      l1[g] = block(gb, touches_ram(gb, gb + (1ULL << 30)) && !touches_nomap(gb, gb + (1ULL << 30)));
     }
   }
   UINT64 mmfr0, ips;
@@ -347,6 +438,13 @@ static void arm64_enable_mmu(void) {
 }
 
 void kernel_arm64_main(UINT64 fdt) {
+#if defined(XNU_LOADER_HANG_WDT)
+  hang_wdt_arm();
+#endif
+#if defined(XNU_LOADER_RAMLOG)
+  MARK('C');
+  ramlog_init();
+#endif
   // the console comes from the tree, so read the board before the first message
   fdt_board_parse((CONST VOID *)(UINTN)fdt);
   serial_init();
@@ -355,34 +453,66 @@ void kernel_arm64_main(UINT64 fdt) {
   if (be32((CONST UINT8 *)(UINTN)fdt) != FDT_MAGIC) {
     serial_puts8((CONST CHAR8 *)"xnu-loader kernel: no device tree in x0\n");
     for (;;)
-      __asm__ volatile("wfi");
+      __asm__ volatile(XNU_LOADER_WAIT);
   }
   parse_fdt(fdt);
   serial_puts8((CONST CHAR8 *)"xnu-loader kernel: device tree parsed, enabling the MMU\n");
+  MARK('F');
   arm64_enable_mmu();
+  MARK('M');
   serial_reinit();
   efiemu_debug_string("xnu-loader kernel: arm64 Image entry\n");
   log_ranges("ram", ram, nram);
   log_ranges("reserved", reserved, nreserved);
+  log_ranges("no-map", nomap, nnomap);
 
-  UINT64 initrd = fdt_initrd_start;
-  UINT64 initrd_size = fdt_initrd_end > fdt_initrd_start ? fdt_initrd_end - fdt_initrd_start : 0;
+  /* Modules come from the built-in cpio and the boot loader's initrd, in that
+   * order: an lk2nd boot image carries the kernel collection in the first and
+   * the ramdisk in the second, neither slot holding both */
+  UINT64 fdt_initrd_size = fdt_initrd_end > fdt_initrd_start ? fdt_initrd_end - fdt_initrd_start : 0;
+  BOOLEAN have_initrd = FALSE;
   if (embedded_initrd_end != embedded_initrd_start) {
-    initrd = (UINT64)(UINTN)embedded_initrd_start;
-    initrd_size = (UINT64)(embedded_initrd_end - embedded_initrd_start);
     efiemu_debug_string("xnu-loader kernel: using the built-in initrd\n");
+    kernel_parse_cpio(&boot_info, (UINT64)(UINTN)embedded_initrd_start,
+                      (UINT64)(embedded_initrd_end - embedded_initrd_start));
+    have_initrd = TRUE;
   }
-  if (initrd && initrd_size)
-    kernel_parse_cpio(&boot_info, initrd, initrd_size);
-  else
+  if (fdt_initrd_start && fdt_initrd_size) {
+    efiemu_debug_string("xnu-loader kernel: using the boot loader's initrd at ");
+    efiemu_debug_hex(fdt_initrd_start);
+    efiemu_debug_string("\n");
+    kernel_parse_cpio(&boot_info, fdt_initrd_start, fdt_initrd_size);
+    have_initrd = TRUE;
+  }
+  if (!have_initrd)
     efiemu_debug_string("xnu-loader kernel: no initrd\n");
+  MARK('I');
   build_memory_map();
   if (cmdline[0])
     boot_info.cmdline = cmdline;
   if (boot_info.memory_count == 0) {
     efiemu_debug_string("xnu-loader kernel: device tree has no memory\n");
     for (;;)
-      __asm__ volatile("wfi");
+      __asm__ volatile(XNU_LOADER_WAIT);
   }
+  MARK('E');
   efiemu_main(&boot_info);
+#if defined(XNU_LOADER_HANG_WDT)
+  /* nothing was booted: on a board with no console a reset beats a hang, and
+   * the ram log says why */
+  MARK('X');
+  efiemu_debug_string("xnu-loader kernel: nothing booted, resetting\n");
+  psci_reset();
+#endif
+}
+
+/* PSCI SYSTEM_RESET through the tree's conduit, smc when the tree has not been read */
+static void psci_reset(void) {
+  register UINT64 x0 __asm__("x0") = 0x84000009ULL;
+  if (efiemu_psci_conduit == 1)
+    __asm__ volatile("hvc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+  else
+    __asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
+  for (;;)
+    __asm__ volatile(XNU_LOADER_WAIT);
 }

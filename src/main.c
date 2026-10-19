@@ -3,6 +3,7 @@
 #include "boot.h"
 #include "console.h"
 #include "fileio.h"
+#include "inflate.h"
 #include "macho.h"
 #include "jump.h"
 #include "serial.h"
@@ -138,30 +139,82 @@ static VOID load_trustcache(AppContext *ctx) {
 }
 #endif
 
-// read straight into the pages the kernel will use, a second copy of a live-media ramdisk would not fit below 4GB
+// in 16MB pieces, some firmware fails one read of a whole large file
+static EFI_STATUS read_all(EFI_FILE_PROTOCOL *file, UINT8 *dst, UINTN size, UINTN *done_out) {
+  EFI_STATUS status = EFI_SUCCESS;
+  UINTN done = 0;
+  while (done < size) {
+    UINTN chunk = size - done > 0x1000000 ? 0x1000000 : size - done;
+    status = uefi_call_wrapper(file->Read, 3, file, &chunk, dst + done);
+    if (EFI_ERROR(status) || chunk == 0)
+      break;
+    done += chunk;
+  }
+  *done_out = done;
+  if (done == size)
+    return EFI_SUCCESS;
+  return EFI_ERROR(status) ? status : EFI_END_OF_FILE;
+}
+
+#if defined(XNU_LOADER_HANG_WDT)
+// a long inflate under the entry stub's watchdog (kernel/arm64.c): restart its count
+static VOID ramdisk_inflate_tick(VOID) {
+  *(volatile UINT32 *)(UINTN)(XNU_LOADER_HANG_WDT + 0x04) = 1;   // WDT_RST, identity mapped
+}
+#define RAMDISK_INFLATE_TICK ramdisk_inflate_tick
+#else
+#define RAMDISK_INFLATE_TICK NULL
+#endif
+
+// read straight into the pages the kernel will use, a second copy of a live-media ramdisk would not fit below 4GB.
+// ramdisk.img.gz is the same image gzipped, for a boot path that can only carry a small one (an lk2nd boot image)
 static EFI_STATUS load_ramdisk(AppContext *ctx) {
   EFI_FILE_PROTOCOL *root = NULL, *file = NULL;
   LowMemBuffer storage = {0};
-  UINTN size = 0;
+  UINTN size = 0, packed_size = 0;
+  UINT8 *packed = NULL;
+  BOOLEAN gz = FALSE;
   EFI_STATUS status;
 
   status = app_open_self_volume(ctx, &root);
   if (!EFI_ERROR(status)) {
     status = file_open(root, L"\\ramdisk.img", EFI_FILE_MODE_READ, 0, &file);
+    if (EFI_ERROR(status)) {
+      gz = !EFI_ERROR(file_open(root, L"\\ramdisk.img.gz", EFI_FILE_MODE_READ, 0, &file));
+      if (gz)
+        status = EFI_SUCCESS;
+    }
     uefi_call_wrapper(root->Close, 1, root);
   }
   if (!EFI_ERROR(status))
     status = file_get_size(file, &size);
+  if (!EFI_ERROR(status) && gz && size) {
+    // the compressed copy only lives until it is inflated into the ramdisk pages
+    packed_size = size;
+    status = uefi_call_wrapper(ctx->bs->AllocatePool, 3, EfiLoaderData, packed_size, (VOID **)&packed);
+    if (!EFI_ERROR(status)) {
+      UINTN got = 0;
+      status = read_all(file, packed, packed_size, &got);
+    }
+    size = EFI_ERROR(status) ? 0 : gzip_size(packed, packed_size);
+    if (!EFI_ERROR(status) && size == 0)
+      log_error(L"ramdisk.img.gz is not a gzip stream\r\n");
+    log_info(L"ramdisk.img.gz: %lu bytes, %lu inflated\r\n", (UINT64)packed_size, (UINT64)size);
+  }
 
   if (EFI_ERROR(status)) {
     if (file)
       uefi_call_wrapper(file->Close, 1, file);
+    if (packed)
+      uefi_call_wrapper(ctx->bs->FreePool, 1, packed);
     log_info(L"no ramdisk.img found (%r); continuing without RAMDisk\r\n", status);
     return EFI_SUCCESS;
   }
 
   if (size == 0) {
     uefi_call_wrapper(file->Close, 1, file);
+    if (packed)
+      uefi_call_wrapper(ctx->bs->FreePool, 1, packed);
     log_info(L"ramdisk.img is empty; continuing without RAMDisk\r\n");
     return EFI_SUCCESS;
   }
@@ -192,23 +245,31 @@ static EFI_STATUS load_ramdisk(AppContext *ctx) {
 #endif
   if (EFI_ERROR(status)) {
     uefi_call_wrapper(file->Close, 1, file);
+    if (packed)
+      uefi_call_wrapper(ctx->bs->FreePool, 1, packed);
     log_error(L"failed to allocate %lu bytes of RAMDisk pages: %r\r\n", (UINT64)size, status);
     return status;
   }
 
-  // in 16MB pieces, some firmware fails one read of a whole large file
-  for (UINTN done = 0; done < size;) {
-    UINTN chunk = size - done > 0x1000000 ? 0x1000000 : size - done;
-    status = uefi_call_wrapper(file->Read, 3, file, &chunk, (UINT8 *)storage.ptr + done);
-    if (EFI_ERROR(status) || chunk == 0) {
-      uefi_call_wrapper(file->Close, 1, file);
+  if (gz) {
+    UINTN out = gzip_inflate(packed, packed_size, (UINT8 *)storage.ptr, size, RAMDISK_INFLATE_TICK);
+    uefi_call_wrapper(ctx->bs->FreePool, 1, packed);
+    uefi_call_wrapper(file->Close, 1, file);
+    if (out != size) {
+      lowmem_free(ctx, &storage);
+      log_error(L"ramdisk.img.gz: inflated %lu of %lu bytes, corrupt stream\r\n", (UINT64)out, (UINT64)size);
+      return EFI_COMPROMISED_DATA;
+    }
+  } else {
+    UINTN done = 0;
+    status = read_all(file, (UINT8 *)storage.ptr, size, &done);
+    uefi_call_wrapper(file->Close, 1, file);
+    if (EFI_ERROR(status)) {
       lowmem_free(ctx, &storage);
       log_error(L"reading ramdisk.img failed at %lu of %lu: %r\r\n", (UINT64)done, (UINT64)size, status);
-      return EFI_ERROR(status) ? status : EFI_END_OF_FILE;
+      return status;
     }
-    done += chunk;
   }
-  uefi_call_wrapper(file->Close, 1, file);
 
   ctx->ramdisk_phys = storage.phys;
   ctx->ramdisk_size = (UINT64)(storage.pages << EFI_PAGE_SHIFT);

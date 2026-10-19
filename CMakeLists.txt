@@ -89,6 +89,7 @@ set(SOURCES
   src/lowmem.c
   src/macho.c
   src/serial.c
+  src/inflate.c
 )
 
 add_library(loader_objs OBJECT ${SOURCES})

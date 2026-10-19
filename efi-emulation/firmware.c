@@ -3,6 +3,7 @@
 #include "efi_emulation.h"
 #include "serial.h"
 #include <efilib.h>
+#include "platform.h"
 #if defined(__riscv)
 #include "riscv_efi_boot.h"
 #endif
@@ -60,7 +61,7 @@ static void io_out8(UINT16 port, UINT8 v) {
 #define efiemu_halt() __asm__ volatile("cli; hlt")
 #elif defined(__aarch64__)
 UINT32 efiemu_psci_conduit;
-#define efiemu_halt() __asm__ volatile("msr daifset, #0xf; wfi")
+#define efiemu_halt() __asm__ volatile("msr daifset, #0xf; " XNU_LOADER_WAIT)
 
 static UINT64 psci_call(UINT64 fn) {
   register UINT64 x0 __asm__("x0") = fn;
@@ -1351,6 +1352,10 @@ void efiemu_main(EfiEmuBootInfo *info) {
   EFI_STATUS status = efi_main(LOADER_HANDLE, &system_table);
   debug_string("efi-emulation: loader returned\n");
   (void)status;
+#if defined(XNU_LOADER_HANG_WDT)
+  /* a board with no console resets from its entry code instead (kernel/arm64.c) */
+  return;
+#endif
   for (;;)
     efiemu_halt();
 }

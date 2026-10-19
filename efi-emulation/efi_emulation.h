@@ -71,7 +71,12 @@ extern UINT64 efiemu_riscv_hartid;
 extern UINT64 efiemu_riscv_timebase;
 #endif
 
+#if defined(XNU_LOADER_HANG_WDT)
+/* returns when nothing was booted, so the entry code can reset the board */
+void efiemu_main(EfiEmuBootInfo *info);
+#else
 void efiemu_main(EfiEmuBootInfo *info) __attribute__((noreturn));
+#endif
 
 /* Module-backed volume (preferred) and the FAT32/ATA disk fallback. */
 EFI_STATUS efiemu_modfs_init(EfiEmuBootInfo *info);

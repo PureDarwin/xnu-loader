@@ -57,7 +57,7 @@ stdenvNoCC.mkDerivation {
     for source in kernel/riscv64.c kernel/cpio.c efi-emulation/exceptions.c efi-emulation/firmware.c \
       efi-emulation/modfs.c efi-emulation/storage.c \
       src/riscv64.c src/app.c src/boot.c src/console.c src/devtree.c src/devtree-fdt.c \
-      src/fileio.c src/logo.c src/lowmem.c src/macho.c src/serial.c; do
+      src/fileio.c src/logo.c src/lowmem.c src/macho.c src/serial.c src/inflate.c; do
       object="build/$(basename "$(dirname "$source")")-$(basename "$source").o"
       $cc -c "$source" -o "$object" $common $defines $includes
       objects="$objects $object"

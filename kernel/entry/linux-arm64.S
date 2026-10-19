@@ -10,14 +10,35 @@
 #elif defined(XNU_LOADER_PLATFORM_SG2002)
 #define MARK_UART 0x04140000
 #endif
+/* With a RAM log the marks also land in DRAM (include/ramlog.h): the last one
+ * written says how far the entry got, read back after the reset. */
+#if defined(XNU_LOADER_RAMLOG)
+#define RAMLOG_MARKS (XNU_LOADER_RAMLOG + 8 * 0x10000)
+.macro ram_mark c
+  ldr x9, =RAMLOG_MARKS
+  mov w10, #\c
+  mov x11, #8
+99:
+  str w10, [x9]
+  add x9, x9, #0x1000
+  subs x11, x11, #1
+  b.ne 99b
+  dsb sy
+.endm
+#else
+.macro ram_mark c
+.endm
+#endif
 #if defined(MARK_UART)
 .macro mark c
   ldr x9, =MARK_UART
   mov w10, #\c
   str w10, [x9]
+  ram_mark \c
 .endm
 #else
 .macro mark c
+  ram_mark \c
 .endm
 #endif
 
@@ -37,6 +58,19 @@ _start:
 
 primary_entry:
   mov x19, x0
+#if defined(XNU_LOADER_HANG_WDT)
+  /* first, so a fault anywhere after here ends in a warm reset (see kernel/arm64.c) */
+  ldr x9, =XNU_LOADER_HANG_WDT
+  str wzr, [x9, #0x08]            /* WDT_EN */
+  mov w10, #1
+  str w10, [x9, #0x04]            /* WDT_RST */
+  mov w10, #0xfffff
+  str w10, [x9, #0x10]            /* WDT_BARK_TIME */
+  str w10, [x9, #0x14]            /* WDT_BITE_TIME */
+  mov w10, #1
+  str w10, [x9, #0x08]            /* WDT_EN */
+  dsb sy
+#endif
   mark 'P'
   msr daifset, #0xf
   mrs x0, CurrentEL
@@ -98,6 +132,7 @@ at_el1:
   str xzr, [x0], #8
   b 2b
 3:
+  mark 'B'
   /* Linked at 0: every R_AARCH64_RELATIVE slot gets the load address added */
   adr x0, _start
   adrp x1, __rela_start
@@ -119,7 +154,11 @@ at_el1:
   mov x0, x19
   bl kernel_arm64_main
 6:
+#if defined(XNU_LOADER_NO_WFI)
+  wfe
+#else
   wfi
+#endif
   b 6b
 
 .ltorg

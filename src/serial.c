@@ -1,5 +1,6 @@
 #include "serial.h"
 #include "platform.h"
+#include "ramlog.h"
 
 static BOOLEAN serial_ready = FALSE;
 
@@ -173,9 +174,45 @@ VOID serial_reinit(VOID) {
   serial_ready = g_board.uart_kind != FDT_UART_NONE;
 }
 
+/* qualcomm uartdm, as Linux's msm_serial drives it in dm mode: firmware left it
+ * running, and a transfer is a count in NCF_TX followed by words into the tx fifo */
+#define MSM_UART_SR          0xa4
+#define MSM_UART_SR_TXRDY    (1U << 2)
+#define MSM_UART_SR_TXEMT    (1U << 3)
+#define MSM_UART_CR          0xa8
+#define MSM_UART_CR_RESET_TX_READY (3U << 8)
+#define MSM_UART_ISR         0xb4
+#define MSM_UART_ISR_TX_READY (1U << 7)
+#define MSM_UART_NCF_TX      0x40
+#define MSM_UART_TF          0x100
+
+static VOID uart_msm_putc(CHAR8 c) {
+  UINT32 spins = 0;
+
+  /* the previous transfer is done when the shifter is empty or tx-ready latched */
+  while ((uart_rd(MSM_UART_SR) & MSM_UART_SR_TXEMT) == 0 &&
+         (uart_rd(MSM_UART_ISR) & MSM_UART_ISR_TX_READY) == 0) {
+    if (++spins >= 100000u)
+      return;
+  }
+  uart_wr(MSM_UART_CR, MSM_UART_CR_RESET_TX_READY);
+  uart_wr(MSM_UART_NCF_TX, 1);
+  (VOID)uart_rd(MSM_UART_NCF_TX);
+  spins = 0;
+  while ((uart_rd(MSM_UART_SR) & MSM_UART_SR_TXRDY) == 0) {
+    if (++spins >= 100000u)
+      return;
+  }
+  uart_wr(MSM_UART_TF, (UINT32)(UINT8)c);
+}
+
 static VOID serial_putc(CHAR8 c) {
   UINT32 spins = 0;
 
+  if (g_board.uart_kind == FDT_UART_MSM) {
+    uart_msm_putc(c);
+    return;
+  }
   if (g_board.uart_kind == FDT_UART_PL011) {
     while ((uart_rd(PL011_FR) & PL011_FR_TXFF) != 0) {
       if (++spins >= 100000u)
@@ -273,6 +310,10 @@ static VOID serial_putc(CHAR8 c) {
 #endif
 
 VOID serial_puts8(CONST CHAR8 *s) {
+#if defined(XNU_LOADER_RAMLOG)
+  for (CONST CHAR8 *p = s; *p; ++p)
+    ramlog_putc(*p);
+#endif
   if (!serial_ready)
     return;
   /* Debug strings end lines with a bare \n: terminals need the \r too. */
@@ -284,6 +325,10 @@ VOID serial_puts8(CONST CHAR8 *s) {
 }
 
 VOID serial_put16(CONST CHAR16 *s) {
+#if defined(XNU_LOADER_RAMLOG)
+  for (CONST CHAR16 *p = s; *p; ++p)
+    ramlog_putc((*p > 0x7F) ? (CHAR8)'?' : (CHAR8)*p);
+#endif
   if (!serial_ready)
     return;
   /* Log format strings already carry explicit \r\n, so pass bytes straight

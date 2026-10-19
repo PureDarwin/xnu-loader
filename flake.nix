@@ -53,6 +53,16 @@
         platform = "generic";
         markUart = "0x02500000";
       };
+      # msm8916 boards booted by lk2nd (the uz801 4g stick): no reachable uart, so the console is
+      # a ram log at 0x9c000000 read back after the apss watchdog or a psci reset
+      kernel-arm64-msm8916 = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./kernel/arm64.nix {
+        platform = "generic";
+        kernel4k = true;
+        ramlog = "0x9c000000";
+        hangWdt = "0x0b017000";
+        hangWdtBark = "35";   # SPI 3
+        noWfi = true;
+      };
       # the loader as a riscv64 linux Image (opensbi, u-boot booti, qemu -kernel), clang and lld
       kernel-riscv64 = pkgs.callPackage ./kernel/riscv64.nix {
         compilerRt = pkgs.pkgsCross.riscv64.llvmPackages.compiler-rt;
