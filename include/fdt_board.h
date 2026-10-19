@@ -24,6 +24,7 @@ typedef struct {
   FdtUartKind uart_kind;
   UINT64 uart_base, uart_size;
   UINT32 uart_shift, uart_width;
+  BOOLEAN uart_dw;                // designware: USR at 0x7c, busy-detect on LCR writes
   UINT32 uart_clock, uart_baud;   // clock 0: take it from the divisor firmware left
 
   UINT32 psci_method;             // 0 unknown, 1 hvc, 2 smc

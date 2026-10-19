@@ -115,6 +115,7 @@ VOID fdt_board_defaults(VOID) {
   g_board.uart_size = 0x400;
   g_board.uart_shift = 2;
   g_board.uart_width = 4;
+  g_board.uart_dw = TRUE;
   g_board.uart_clock = 24000000;
   g_board.gic_version = 2;
   g_board.gicd_base = 0x03021000ULL;
@@ -131,6 +132,7 @@ VOID fdt_board_defaults(VOID) {
   g_board.uart_size = 0x100;
   g_board.uart_shift = 2;
   g_board.uart_width = 4;
+  g_board.uart_dw = TRUE;
   g_board.uart_clock = 25000000;
   g_board.gic_version = 2;
   g_board.gicd_base = 0x01F01000ULL;
@@ -155,15 +157,16 @@ static CONST struct {
   CONST CHAR8 *compat;
   FdtUartKind kind;
   UINT32 shift, width;
+  BOOLEAN dw;
 } uart_table[] = {
-  { "arm,pl011",                FDT_UART_PL011, 0, 4 },
-  { "snps,dw-apb-uart",         FDT_UART_16550, 2, 4 },
-  { "allwinner,uart-v100",      FDT_UART_16550, 2, 4 },
-  { "allwinner,sun6i-a31-uart", FDT_UART_16550, 2, 4 },
-  { "ns16550a",                 FDT_UART_16550, 0, 1 },
-  { "ns16550",                  FDT_UART_16550, 0, 1 },
-  { "qcom,msm-uartdm-v1.4",     FDT_UART_MSM,   0, 4 },
-  { "qcom,msm-uartdm",          FDT_UART_MSM,   0, 4 },
+  { "arm,pl011",                FDT_UART_PL011, 0, 4, FALSE },
+  { "snps,dw-apb-uart",         FDT_UART_16550, 2, 4, TRUE },
+  { "allwinner,uart-v100",      FDT_UART_16550, 2, 4, TRUE },
+  { "allwinner,sun6i-a31-uart", FDT_UART_16550, 2, 4, TRUE },
+  { "ns16550a",                 FDT_UART_16550, 0, 1, FALSE },
+  { "ns16550",                  FDT_UART_16550, 0, 1, FALSE },
+  { "qcom,msm-uartdm-v1.4",     FDT_UART_MSM,   0, 4, FALSE },
+  { "qcom,msm-uartdm",          FDT_UART_MSM,   0, 4, FALSE },
 };
 
 static CONST CHAR8 *gic3_compat[] = { "arm,gic-v3" };
@@ -411,6 +414,7 @@ static VOID node_done(Level *lv, UINT32 depth, CONST CHAR8 *path, CONST CHAR8 *c
       g_board.uart_size = size ? size : 0x1000;
       g_board.uart_shift = node->has_shift ? node->shift : uart_table[i].shift;
       g_board.uart_width = node->has_width ? node->width : uart_table[i].width;
+      g_board.uart_dw = uart_table[i].dw;
       g_board.uart_clock = node->clock;
       if (node->speed)
         g_board.uart_baud = node->speed;

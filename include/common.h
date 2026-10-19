@@ -58,8 +58,9 @@ extern EFI_PHYSICAL_ADDRESS g_xnu_bootinfo_base;
  * XNU_ARM64_BOOTARGS_PHYS and XNU_TRUSTCACHE_PHYS keep their addresses. */
 #if defined(__aarch64__)
 // a board's own devices come over from its fdt, so arm64 puts the tree after the memory map
-#define XNU_DEVTREE_PHYS        (XNU_BOOTINFO_BASE + 0x20000) /* 64 pages     */
-#define XNU_DEVTREE_PAGES       64
+// 1 MB: tegra210's l4t tree (800 nodes) flattens to about 540 KB
+#define XNU_DEVTREE_PHYS        (XNU_BOOTINFO_BASE + 0x20000) /* 256 pages    */
+#define XNU_DEVTREE_PAGES       256
 #else
 #define XNU_DEVTREE_PHYS        (XNU_BOOTINFO_BASE + 0x06000) /* 8 pages      */
 #if defined(__riscv)
@@ -75,7 +76,7 @@ extern EFI_PHYSICAL_ADDRESS g_xnu_bootinfo_base;
 #define XNU_TRUSTCACHE_PHYS     (XNU_BOOTINFO_BASE + 0x05000) /* 1 page       */
 #define XNU_MEMMAP_PHYS         (XNU_BOOTINFO_BASE + 0x10000) /* up to 16 pg  */
 #if defined(__aarch64__)
-#define XNU_BOOTINFO_END        (XNU_BOOTINFO_BASE + 0x60000) /* 384KB block  */
+#define XNU_BOOTINFO_END        (XNU_BOOTINFO_BASE + 0x120000) /* 1.1MB block */
 #else
 #define XNU_BOOTINFO_END        (XNU_BOOTINFO_BASE + 0x20000) /* 128KB block  */
 #endif

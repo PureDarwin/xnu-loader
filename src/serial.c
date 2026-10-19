@@ -125,7 +125,7 @@ static VOID uart_wr(UINT32 reg, UINT32 v) {
 }
 
 static BOOLEAN uart_is_dw(VOID) {
-  return g_board.uart_shift == 2 && g_board.uart_width == 4;
+  return g_board.uart_dw;
 }
 
 static VOID uart_drain(VOID) {
