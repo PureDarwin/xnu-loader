@@ -159,7 +159,11 @@ static EFI_STATUS read_all(EFI_FILE_PROTOCOL *file, UINT8 *dst, UINTN size, UINT
 #if defined(XNU_LOADER_HANG_WDT)
 // a long inflate under the entry stub's watchdog (kernel/arm64.c): restart its count
 static VOID ramdisk_inflate_tick(VOID) {
+#if defined(XNU_LOADER_HANG_WDT_TEGRA)
+  *(volatile UINT32 *)(UINTN)(XNU_LOADER_HANG_WDT + 0x108) = 1;   // WDT0_CMD start restarts the count
+#else
   *(volatile UINT32 *)(UINTN)(XNU_LOADER_HANG_WDT + 0x04) = 1;   // WDT_RST, identity mapped
+#endif
 }
 #define RAMDISK_INFLATE_TICK ramdisk_inflate_tick
 #else

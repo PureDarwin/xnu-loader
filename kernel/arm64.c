@@ -46,7 +46,45 @@ static UINT64 cells(CONST UINT8 *p, UINT32 n) {
   return v;
 }
 
-#if defined(XNU_LOADER_HANG_WDT)
+#if defined(XNU_LOADER_HANG_WDT) && defined(XNU_LOADER_HANG_WDT_TEGRA)
+// tegra210 WDT0 on TMR5 as Linux tegra_wdt drives it: 1 MHz ticks, reset on the 4th expiry,
+// so a 250 ms period counts seconds. PMC_SCRATCH0 bit 1 first makes the reset land in RCM
+#define TEGRA_TMR5_PTV       0x60
+#define TEGRA_WDT0_CFG       0x100
+#define TEGRA_WDT0_CMD       0x108
+#define TEGRA_WDT0_UNLOCK    0x10c
+#define TEGRA_PMC_SCRATCH0   0x50
+
+static void hang_wdt_arm(void) {
+  volatile UINT32 *tmr = (volatile UINT32 *)(UINTN)XNU_LOADER_HANG_WDT;
+#if defined(XNU_LOADER_HANG_WDT_RCM_SIP)
+  // a secure pmc ignores normal-world writes, the firmware's SiP call does them (read 0xaa, write 0xbb)
+  {
+    register UINT64 x0 __asm__("x0") = 0xc2fffe00ULL;
+    register UINT64 x1 __asm__("x1") = 0xaa;
+    register UINT64 x2 __asm__("x2") = TEGRA_PMC_SCRATCH0;
+    register UINT64 x3 __asm__("x3") = 0;
+    __asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "memory");
+    UINT64 scratch = x0 == 0 ? x1 : 0;
+    x0 = 0xc2fffe00ULL;
+    x1 = 0xbb;
+    x2 = TEGRA_PMC_SCRATCH0;
+    x3 = scratch | (1U << 1);
+    __asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "memory");
+  }
+#elif defined(XNU_LOADER_HANG_WDT_RCM)
+  volatile UINT32 *pmc = (volatile UINT32 *)(UINTN)XNU_LOADER_HANG_WDT_RCM;
+  pmc[TEGRA_PMC_SCRATCH0 / 4] |= 1U << 1;
+#endif
+  tmr[TEGRA_WDT0_UNLOCK / 4] = 0xc45a;
+  tmr[TEGRA_WDT0_CMD / 4] = 1U << 1;
+  tmr[TEGRA_TMR5_PTV / 4] = (1U << 31) | (1U << 30) | (1000000U / 4);
+  // SYS_RST_EN (bit 14) keeps the scratch bit, the PMC2CAR reset would clear it and boot the emmc
+  tmr[TEGRA_WDT0_CFG / 4] = 5 | (XNU_LOADER_HANG_WDT_SECONDS << 4) | (1U << 14);
+  tmr[TEGRA_WDT0_CMD / 4] = 1U << 0;
+  __asm__ volatile("dsb sy" : : : "memory");
+}
+#elif defined(XNU_LOADER_HANG_WDT)
 /* A qualcomm apss watchdog (qcom,kpss-wdt layout) armed at its longest, so a hang
  * anywhere from here into early XNU ends in a warm reset and the RAM log can be
  * read. 20-bit counters on the 32.768 kHz sleep clock: 0xfffff is about 32 s. */

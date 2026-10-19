@@ -163,6 +163,10 @@ static CONST struct {
   { "snps,dw-apb-uart",         FDT_UART_16550, 2, 4, TRUE },
   { "allwinner,uart-v100",      FDT_UART_16550, 2, 4, TRUE },
   { "allwinner,sun6i-a31-uart", FDT_UART_16550, 2, 4, TRUE },
+  // tegra's uart is 0x40 wide, a designware USR read at 0x7c lands in the next, gated uart and stalls
+  { "nvidia,tegra20-uart",      FDT_UART_16550, 2, 4, FALSE },
+  { "nvidia,tegra210-uart",     FDT_UART_16550, 2, 4, FALSE },
+  { "nvidia,tegra114-hsuart",   FDT_UART_16550, 2, 4, FALSE },
   { "ns16550a",                 FDT_UART_16550, 0, 1, FALSE },
   { "ns16550",                  FDT_UART_16550, 0, 1, FALSE },
   { "qcom,msm-uartdm-v1.4",     FDT_UART_MSM,   0, 4, FALSE },

@@ -58,7 +58,7 @@ _start:
 
 primary_entry:
   mov x19, x0
-#if defined(XNU_LOADER_HANG_WDT)
+#if defined(XNU_LOADER_HANG_WDT) && !defined(XNU_LOADER_HANG_WDT_TEGRA)
   /* first, so a fault anywhere after here ends in a warm reset (see kernel/arm64.c) */
   ldr x9, =XNU_LOADER_HANG_WDT
   str wzr, [x9, #0x08]            /* WDT_EN */

@@ -19,6 +19,13 @@
 , hangWdtBark ? null
   # bring-up only: leave the board's own fdt nodes out of the tree xnu gets
 , noFdtImport ? false
+  # hangWdt kind: "qcom" (apss wdt base) or "tegra" (tegra210 timer block base, WDT0 on TMR5)
+, hangWdtKind ? "qcom"
+, hangWdtSeconds ? 120
+  # tegra: the PMC base, to set the force-recovery scratch bit so the watchdog reset lands in RCM
+, hangWdtRcm ? null
+  # tegra with a secure pmc: set that bit through the firmware's SiP call instead
+, hangWdtRcmSip ? false
 }:
 
 assert platform == "bcm2837" || platform == "generic" || platform == "qemuvirt" || platform == "sun50i" || platform == "sg2002";
@@ -43,6 +50,7 @@ stdenv.mkDerivation {
     defines="$defines ${lib.optionalString kernel4k "-DXNU_LOADER_KERNEL_4K"} ${lib.optionalString (markUart != null) "-DXNU_LOADER_MARK_UART=${markUart}"}"
     defines="$defines ${lib.optionalString (ramlog != null) "-DXNU_LOADER_RAMLOG=${ramlog}ULL"} ${lib.optionalString (hangWdt != null) "-DXNU_LOADER_HANG_WDT=${hangWdt}ULL"} ${lib.optionalString (resetAt != null) "-DXNU_LOADER_RESET_AT=mark_${resetAt}"}"
     defines="$defines ${lib.optionalString noWfi "-DXNU_LOADER_NO_WFI"} ${lib.optionalString (hangWdtBark != null) "-DXNU_LOADER_HANG_WDT_BARK=${hangWdtBark}"} ${lib.optionalString noFdtImport "-DXNU_LOADER_NO_FDT_IMPORT"}"
+    defines="$defines ${lib.optionalString (hangWdtKind == "tegra") "-DXNU_LOADER_HANG_WDT_TEGRA -DXNU_LOADER_HANG_WDT_SECONDS=${toString hangWdtSeconds}U"} ${lib.optionalString (hangWdtRcm != null) "-DXNU_LOADER_HANG_WDT_RCM=${hangWdtRcm}ULL"} ${lib.optionalString hangWdtRcmSip "-DXNU_LOADER_HANG_WDT_RCM_SIP"}"
 
     objects=""
     for source in kernel/entry/linux-arm64.S efi-emulation/exceptions-arm64.S src/jump.S; do

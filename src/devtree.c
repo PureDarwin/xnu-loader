@@ -1926,7 +1926,7 @@ EFI_STATUS dt_build(
 #endif
     dt_add_child(ctx, armio, gic);
   }
-#if defined(XNU_LOADER_HANG_WDT)
+#if defined(XNU_LOADER_HANG_WDT) && !defined(XNU_LOADER_HANG_WDT_TEGRA)
   {
     /* the qualcomm apss watchdog the entry stub armed, for xnu to pet (osfmk/arm64/sleh.c):
      * reg in the arm-io window, "pd,bark-intid" the bark's GIC INTID. Not "interrupts": IOKit

@@ -63,6 +63,24 @@
         hangWdtBark = "35";   # SPI 3
         noWfi = true;
       };
+      # jetson tx1 (tegra210): marks on uarta, ram log below where mainline u-boot relocates itself
+      kernel-arm64-tx1 = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./kernel/arm64.nix {
+        platform = "generic";
+        kernel4k = true;
+        markUart = "0x70006000";
+        ramlog = "0xf0000000";
+      };
+      # the same for rcm-loaded u-boot: a hang ends in a WDT0 reset into RCM, where the ram log is read
+      kernel-arm64-tx1-wdt = pkgs.pkgsCross.aarch64-multiplatform.callPackage ./kernel/arm64.nix {
+        platform = "generic";
+        kernel4k = true;
+        markUart = "0x70006000";
+        ramlog = "0xf0000000";
+        hangWdt = "0x60005000";
+        hangWdtKind = "tegra";
+        hangWdtSeconds = 120;
+        hangWdtRcmSip = true;
+      };
       # the loader as a riscv64 linux Image (opensbi, u-boot booti, qemu -kernel), clang and lld
       kernel-riscv64 = pkgs.callPackage ./kernel/riscv64.nix {
         compilerRt = pkgs.pkgsCross.riscv64.llvmPackages.compiler-rt;
