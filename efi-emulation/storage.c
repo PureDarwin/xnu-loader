@@ -226,12 +226,6 @@ static UINT32 next_cluster(UINT32 c) {
 static void short_name(CONST CHAR16 *component, UINTN len, CHAR8 out[11]) {
   for (UINTN i = 0; i < 11; ++i)
     out[i] = ' ';
-  /* Stable aliases installed by the image builder for names that need LFNs. */
-  if (len == 13) {
-    CONST CHAR16 alias[] = L"BOOTARGS.TXT";
-    component = alias;
-    len = 12;
-  }
   UINTN at = 0, ext = 8;
   for (UINTN i = 0; i < len; ++i) {
     CHAR16 c = component[i];
@@ -247,11 +241,22 @@ static void short_name(CONST CHAR16 *component, UINTN len, CHAR8 out[11]) {
   }
 }
 
+// an LFN entry holds 13 UCS-2 characters at these byte offsets
+static CONST UINT8 lfn_offsets[13] = {1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30};
+
+static CHAR16 fold(CHAR16 c) {
+  return (c >= 'a' && c <= 'z') ? (CHAR16)(c - 32) : c;
+}
+
 static EFI_STATUS find_entry(UINT32 dir_cluster, CONST CHAR16 *name, UINTN len,
                              UINT32 *cluster, UINT32 *size, BOOLEAN *directory) {
   CHAR8 wanted[11];
   short_name(name, len, wanted);
   UINT8 sec[512];
+  // the long name gathered from the LFN entries in front of the current short entry
+  CHAR16 lfn[256];
+  UINTN lfn_len = 0;
+  BOOLEAN lfn_valid = FALSE;
   for (UINT32 c = dir_cluster; c >= 2 && c < 0x0ffffff8; c = next_cluster(c)) {
     for (UINTN s = 0; s < bpb.sectors_cluster; ++s) {
       EFI_STATUS st = disk_read(cluster_lba(c) + s, sec);
@@ -261,12 +266,44 @@ static EFI_STATUS find_entry(UINT32 dir_cluster, CONST CHAR16 *name, UINTN len,
         UINT8 *e = sec + off;
         if (e[0] == 0)
           return EFI_NOT_FOUND;
-        if (e[0] == 0xe5 || e[11] == 0x0f || (e[11] & 8))
+        if (e[0] == 0xe5) {
+          lfn_valid = FALSE;
           continue;
-        BOOLEAN match = TRUE;
-        for (UINTN i = 0; i < 11; ++i)
-          if ((CHAR8)e[i] != wanted[i])
+        }
+        if (e[11] == 0x0f) {
+          UINTN seq = e[0] & 0x1f;
+          if (e[0] & 0x40) {
+            lfn_len = 0;
+            lfn_valid = seq >= 1 && seq * 13 <= 255;
+          }
+          if (!lfn_valid || seq < 1)
+            continue;
+          for (UINTN i = 0; i < 13; ++i) {
+            CHAR16 ch = *(UINT16 *)(e + lfn_offsets[i]);
+            UINTN at = (seq - 1) * 13 + i;
+            if (ch == 0 || ch == 0xffff)
+              break;
+            lfn[at] = ch;
+            if (at + 1 > lfn_len)
+              lfn_len = at + 1;
+          }
+          continue;
+        }
+        if (e[11] & 8) {
+          lfn_valid = FALSE;
+          continue;
+        }
+        BOOLEAN match = lfn_valid && lfn_len == len;
+        for (UINTN i = 0; match && i < len; ++i)
+          if (fold(lfn[i]) != fold(name[i]))
             match = FALSE;
+        if (!match) {
+          match = TRUE;
+          for (UINTN i = 0; i < 11; ++i)
+            if ((CHAR8)e[i] != wanted[i])
+              match = FALSE;
+        }
+        lfn_valid = FALSE;
         if (!match)
           continue;
         *cluster = ((UINT32) * (UINT16 *)(e + 20) << 16) | *(UINT16 *)(e + 26);

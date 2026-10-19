@@ -17,8 +17,8 @@ nix build .#legacy-boot
 ```
 
 Consumers should override `kernel` with an x86-64 XNU Mach-O. An optional
-`bootArgs` file is installed under the stable `BOOTARGS.TXT` short alias used
-by the read-only FAT implementation.
+`bootArgs` file is installed as `EFI/BOOT/boot-args.txt`. The read-only FAT
+implementation matches long file names.
 
 The initial hardware backend targets SeaBIOS and legacy-compatible primary
 IDE disks. It supports E820 memory, ACPI RSDP and SMBIOS discovery, FAT32 file

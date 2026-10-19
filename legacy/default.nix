@@ -81,8 +81,7 @@ stdenv.mkDerivation {
       mcopy -i build/legacy-boot.img@@1M ${kernel} ::EFI/BOOT/KERNEL
     ''}
     ${lib.optionalString (bootArgs != null) ''
-      cp ${bootArgs} build/BOOTARGS.TXT
-      mcopy -i build/legacy-boot.img@@1M build/BOOTARGS.TXT ::EFI/BOOT/BOOTARGS.TXT
+      mcopy -i build/legacy-boot.img@@1M ${bootArgs} ::EFI/BOOT/boot-args.txt
     ''}
     runHook postBuild
   '';
