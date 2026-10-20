@@ -857,6 +857,39 @@ static EFI_STATUS EFIAPI bs_crc32(VOID *data, UINTN size, UINT32 *out) {
   *out = ~crc;
   return EFI_SUCCESS;
 }
+
+/* The spec's semantics within config_tables: a matching GUID is replaced, or
+ * removed for a NULL table, and a new one appended while there is room */
+static EFI_STATUS EFIAPI bs_install_config_table(EFI_GUID *guid, VOID *table) {
+  if (!guid)
+    return EFI_INVALID_PARAMETER;
+  UINTN n = system_table.NumberOfTableEntries;
+  for (UINTN i = 0; i < n; ++i) {
+    if (CompareMem(&config_tables[i].VendorGuid, guid, sizeof(EFI_GUID)))
+      continue;
+    if (table) {
+      // replace
+      config_tables[i].VendorTable = table;
+    } else {
+      // remove
+      for (; i + 1 < n; ++i)
+        config_tables[i] = config_tables[i + 1];
+      system_table.NumberOfTableEntries = n - 1;
+    }
+    return EFI_SUCCESS;
+  }
+  if (!table)
+    return EFI_NOT_FOUND;
+  if (n >= sizeof(config_tables) / sizeof(config_tables[0]))
+    return EFI_OUT_OF_RESOURCES;
+  // append
+  config_tables[n].VendorGuid = *guid;
+  config_tables[n].VendorTable = table;
+  system_table.NumberOfTableEntries = n + 1;
+  system_table.ConfigurationTable = config_tables;
+  return EFI_SUCCESS;
+}
+
 static EFI_STATUS EFIAPI rt_set_virtual(UINTN map_size, UINTN desc_size,
                                         UINT32 version,
                                         EFI_MEMORY_DESCRIPTOR *map) {
@@ -1275,6 +1308,7 @@ void efiemu_main(EfiEmuBootInfo *info) {
   boot_services.ExitBootServices = bs_exit;
   boot_services.Stall = bs_stall;
   boot_services.CalculateCrc32 = bs_crc32;
+  boot_services.InstallConfigurationTable = bs_install_config_table;
   SetMem(&runtime_services, sizeof(runtime_services), 0);
   runtime_services.Hdr.Signature = EFI_RUNTIME_SERVICES_SIGNATURE;
   runtime_services.Hdr.Revision = EFI_RUNTIME_SERVICES_REVISION;
