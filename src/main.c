@@ -18,9 +18,12 @@ static UINT64  g_jump_args;
 static UINT64 g_fb_base;
 static UINT32 g_fb_pitch, g_fb_w, g_fb_h;
 
+// off for now, the stripes cover console text on real hardware
+#define PD_FB_STRIPES 0
+
 VOID fb_stripe(UINT32 row, UINT32 colour)
 {
-  if (!g_fb_base || g_fb_h < 16 * (row + 2)) return;
+  if (!PD_FB_STRIPES || !g_fb_base || g_fb_h < 16 * (row + 2)) return;
   for (UINT32 y = g_fb_h - 16 * (row + 1); y < g_fb_h - 16 * row - 4; y++) {
     volatile UINT32 *line = (volatile UINT32 *)(UINTN)(g_fb_base + (UINT64)y * g_fb_pitch);
     for (UINT32 x = 0; x < g_fb_w; x++) line[x] = colour;

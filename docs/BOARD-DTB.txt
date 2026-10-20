@@ -1,0 +1,55 @@
+Board device trees built by Nix, 20 October 2026
+
+
+What this is
+
+xnu-loader, since commit d5ecd5d, loads EFI/BOOT/board.dtb in place of the device tree the firmware hands over, when that file is there. This file says how PureDarwin builds that board.dtb and what has to ship with it, so the next board can be added the same way.
+
+The function is nix/pkgs/boot/linux-dtb.nix in pd-drm-wine, and nix/linux-dtb.nix in xnu-loader. It takes a Linux source tarball and one dts path below arch/arm64/boot/dts, runs the C preprocessor with the same include paths as the kernel's own dtc_cpp_flags, then runs dtc from nixpkgs and writes board.dtb.
+
+Linux dts files are GPL-2.0 in most cases, so they never enter the PureDarwin tree. They are read from the kernel.org tarball at build time. In pd-drm-wine the pin is linux614Src in flake.nix, the Linux 6.14 tarball the nouveau port already uses. Reuse it unless a board needs a newer kernel, and then add a second fetchurl next to it.
+
+linux-dtb.nix itself is MIT OR BSD-2-Clause OR BSD-3-Clause OR GPL-2.0-only, so the property changes it makes can go into a blob under any of those licences.
+
+
+What ships with the blob
+
+The output holds board.dtb, a SOURCE note and a licenses folder.
+
+SOURCE names the Linux version, the dts path, and the tarball URL and hash for the corresponding source. It then lists every file the preprocessor read, with its SPDX line. That list comes from the cpp dependency output, so it is right for each board. If any properties were changed after dtc, SOURCE lists them next. The last line is the SHA-256 of the board.dtb that ships, taken after the fixups.
+
+The licenses folder always holds COPYING and the GPL-2.0 text. It also holds the text of every other licence an SPDX line names, such as MIT, BSD-2-Clause or BSD-3-Clause, taken from LICENSES in the kernel tree. Nothing has to be added by hand for a BSD board.
+
+An image that installs the tree puts board.dtb in EFI/BOOT, and SOURCE and licenses in EFI/BOOT/board-dtb. The ramdisk targets put them next to the netboot files instead. Never ship the dtb without that folder.
+
+
+Adding another board
+
+First find the dts in the kernel tree, for example qcom/sc8280xp-lenovo-thinkpad-x13s.dts.
+
+Then check the SPDX line of the dts and of every file it includes. The build lists them all in SOURCE, so build once and read it. GPL-2.0, dual licences, BSD and MIT are all fine to ship as a binary with their texts. A file without an SPDX line needs a closer look before it ships.
+
+Then add one call to flake.nix next to dtbTegra210P2371_2180, and expose it as a package, for example dtb-sc8280xp-x13s:
+
+  dtbMyBoard = pkgs.callPackage ./nix/pkgs/boot/linux-dtb.nix {
+    linuxSrc = linux614Src;
+    dts = "qcom/sc8280xp-lenovo-thinkpad-x13s.dts";
+  };
+
+Pass extraIncludes only if the dts needs a directory the kernel's own flags do not cover.
+
+Last, enable it per image by giving image.nix boardDtb = dtbMyBoard, usually through an override of the board's existing target. The argument is null by default, and then nothing changes.
+
+
+Changing properties
+
+Some trees need a property changed before PureDarwin can use them. The fixups argument takes a list of node, property and value, and runs fdtput on board.dtb after dtc. Every change is listed at the end of SOURCE. Keep the list short, and only change what the board really needs.
+
+
+The TX1
+
+The tree is .#dtb-tegra210-p2371-2180. In Linux 6.14 its gpu@57000000 node has the clocks, resets, iommus and vdd-supply nouveau needs, but its status is disabled. Only the Nano's tree turns the GPU on. The flake sets it to okay with one fixup.
+
+The TX1 targets keep the tree off for now. .#ramdisk-arm64-tegra210 and .#ramdisk-arm64-tegra210-sd are unchanged. .#ramdisk-arm64-tegra210-mainline-dtb and .#ramdisk-arm64-tegra210-sd-mainline-dtb carry it for testing.
+
+cboot fixes up its own L4T device tree at boot. It fills in the memory node, the carveouts (the GPU and secure carveouts among them) and some chosen properties. A replaced tree loses all of those fixups, so the mainline variant may see the wrong amount of memory or run over memory that firmware still owns. Check the memory map early in the first boot before trusting it.
