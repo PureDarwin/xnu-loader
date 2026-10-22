@@ -31,6 +31,44 @@
         arch = "aarch64";
         platform = "sc8280xp";
       };
+      # the x13s tree for EFI/BOOT/board.dtb (docs/BOARD-DTB.txt). 0x7ff00002 is the loader's
+      # /arm-io/gic, one interrupt cell, the GIC INTID
+      dtb-sc8280xp-x13s = let
+        tlmm = "/soc@0/pinctrl@f100000";
+        qup2 = "/soc@0/geniqup@8c0000";
+        i2c21 = "${qup2}/i2c@894000";
+        i2c4 = "/soc@0/geniqup@9c0000/i2c@990000";      # touchscreen
+        i2c11 = "/soc@0/geniqup@ac0000/i2c@a8c000";     # pm8008
+        usb2 = "/soc@0/usb@a4f8800/usb@a400000";        # the multiport controller's core
+        usb0 = "/soc@0/usb@a6f8800/usb@a600000";
+        usb1 = "/soc@0/usb@a8f8800/usb@a800000";
+      in pkgs.callPackage ./nix/linux-dtb.nix {
+        linuxSrc = pkgs.fetchurl {
+          url = "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.9.tar.xz";
+          hash = "sha256-tMXfvlGjZKbH8DhpIA+IyOH3dANTkAXxS3/GvJG42Lo=";
+        };
+        dts = "qcom/sc8280xp-lenovo-thinkpad-x13s.dts";
+        fixups = [
+          # PDQcomTLMM counts pins from ngpios, the tree says it with gpio-ranges
+          { node = tlmm; prop = "ngpios"; type = "u"; value = "230"; }
+          { node = tlmm; prop = "interrupt-parent"; type = "x"; value = "0x7ff00002"; }
+          { node = tlmm; prop = "interrupts"; type = "u"; value = "240"; }        # SPI 208
+          { node = i2c21; prop = "interrupt-parent"; type = "x"; value = "0x7ff00002"; }
+          { node = i2c21; prop = "interrupts"; type = "u"; value = "619"; }       # SPI 587
+          { node = i2c4; prop = "interrupt-parent"; type = "x"; value = "0x7ff00002"; }
+          { node = i2c4; prop = "interrupts"; type = "u"; value = "637"; }        # SPI 605
+          { node = i2c11; prop = "interrupt-parent"; type = "x"; value = "0x7ff00002"; }
+          { node = i2c11; prop = "interrupts"; type = "u"; value = "388"; }       # SPI 356
+          { node = usb2; prop = "interrupt-parent"; type = "x"; value = "0x7ff00002"; }
+          { node = usb2; prop = "interrupts"; type = "u"; value = "165"; }        # SPI 133
+          { node = usb0; prop = "interrupt-parent"; type = "x"; value = "0x7ff00002"; }
+          { node = usb0; prop = "interrupts"; type = "u"; value = "835"; }        # SPI 803
+          { node = usb1; prop = "interrupt-parent"; type = "x"; value = "0x7ff00002"; }
+          { node = usb1; prop = "interrupts"; type = "u"; value = "842"; }        # SPI 810
+          # probing pcie3a (the wwan slot) reset the machine right after its root port was read
+          { node = "/soc@0/pcie@1c10000"; prop = "status"; value = "disabled"; }
+        ];
+      };
       ia32 = pkgs.pkgsi686Linux.callPackage ./. {
         arch = "x86_64";
         loaderArch = "ia32";
